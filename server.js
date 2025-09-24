@@ -184,43 +184,54 @@ io.on('connection', (socket) => {
 
     // Tu código de 'audio_message' (3)
     socket.on('audio_message', (audioMessageData) => {
-        try {
-            const userInfo = users.get(socket.id);
-            if (!userInfo) {
-                console.error('Error: Usuario no encontrado para el socket:', socket.id);
+    try {
+        const userInfo = users.get(socket.id);
+        if (!userInfo) {
+            console.error('Error: Usuario no encontrado para el socket:', socket.id);
+            return;
+        }
+
+        // 1. Obtener la cadena Base64 (ahora llamada audioData)
+        const audioBase64 = audioMessageData.audioData;
+
+        // 2. 🔥 CAMBIO CRÍTICO: Decodificar la cadena Base64 a un Buffer de bytes
+        // El segundo argumento 'base64' le dice a Node.js cómo interpretar la cadena.
+        const audioBuffer = Buffer.from(audioBase64, 'base64');
+        
+        // 3. Definir el nombre del archivo y la ruta
+        // Asegúrate de que el formato (ej: .mp3, .ogg) coincida con lo que tu cliente Android graba.
+        const filename = `audio_${Date.now()}.mp3`; 
+        const filePath = path.join(audioDir, filename);
+
+        // 4. Escribir el Buffer decodificado al sistema de archivos
+        // Usamos audioBuffer en lugar de audioBytes
+        fs.writeFile(filePath, audioBuffer, (err) => {
+            if (err) {
+                console.error('Error al guardar el archivo de audio:', err);
                 return;
             }
+            console.log(`✅ Archivo de audio guardado: ${filePath}`);
 
-            const audioBytes = audioMessageData.audioData;
-            const filename = `audio_${Date.now()}.mp3`;
-            const filePath = path.join(audioDir, filename);
+            const audioUrl = `/uploads/audio/${filename}`;
             
-            fs.writeFile(filePath, Buffer.from(audioBytes), (err) => {
-                if (err) {
-                    console.error('Error al guardar el archivo de audio:', err);
-                    return;
-                }
-                console.log(`✅ Archivo de audio guardado: ${filePath}`);
+            const finalMessage = {
+                id: socket.id + '-' + Date.now(),
+                // Se envía la URL, el cliente Android la usará para reproducir
+                audioUrl: audioUrl, 
+                username: userInfo.userName,
+                userId: userInfo.id,
+                timestamp: Date.now(),
+                roomId: userInfo.room
+            };
 
-                const audioUrl = `/uploads/audio/${filename}`;
-                
-                const finalMessage = {
-                    id: socket.id + '-' + Date.now(),
-                    audioUrl: audioUrl,
-                    username: userInfo.userName,
-                    userId: userInfo.id,
-                    timestamp: Date.now(),
-                    roomId: userInfo.room
-                };
+            io.to(userInfo.room).emit('new_message', finalMessage);
+            console.log(`🎙️ [${userInfo.room}] ${userInfo.userName} envió un audio.`);
+        });
 
-                io.to(userInfo.room).emit('new_message', finalMessage);
-                console.log(`🎙️ [${userInfo.room}] ${userInfo.userName} envió un audio.`);
-            });
-
-        } catch (error) {
-            console.error('Error en audio_message:', error);
-        }
-    });
+    } catch (error) {
+        console.error('Error en audio_message:', error);
+    }
+});
 
     // Tu código de señalización WebRTC (4, 5, 6, 7)
 
