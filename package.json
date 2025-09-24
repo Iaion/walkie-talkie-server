@@ -1,0 +1,23 @@
+{
+  "name": "a2intento-server",
+  "version": "1.0.0",
+  "description": "Servidor Socket.IO para la app de comunicación A2Intento",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "socket.io": "^4.7.2",
+    "cors": "^2.8.5"
+  },
+  "keywords": [
+    "socket.io",
+    "webrtc",
+    "chat",
+    "express"
+  ],
+  "author": "Tu nombre",
+  "license": "MIT"
+}
