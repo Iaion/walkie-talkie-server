@@ -66,7 +66,7 @@ app.get('/health', (req, res) => {
     });
 });
 
-app.listen(PORT, () => {
+server.listen(PORT, () => {
     console.log(`Servidor de chat ejecutándose en el puerto ${PORT}`);
 });
 
