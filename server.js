@@ -186,11 +186,9 @@ io.on('connection', (socket) => {
         resumable: false
       });
 
-      // Obtener la URL pública para el audio
-      const [url] = await file.getSignedUrl({
-        action: 'read',
-        expires: '03-09-2491',
-      });
+      // ✅ CORRECCIÓN: Hacer el archivo público y obtener la URL de acceso directo
+      await file.makePublic();
+      const url = file.publicUrl();
 
       const audioMessage = {
         id: uuidv4(),
