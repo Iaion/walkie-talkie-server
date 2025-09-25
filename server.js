@@ -6,10 +6,16 @@ const { Server } = require('socket.io');
 const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
-const os = require('os'); // ✅ CORRECCIÓN 1: Necesitas 'os' para la función getLocalIP
+const os = require('os'); 
+const { Buffer } = require('buffer'); // ✅ NUEVO: Importar Buffer para manejar datos binarios
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+// ✅ CAMBIO CRÍTICO: Obtener la URL del entorno de Railway o usar localhost para desarrollo.
+// Utiliza process.env.RAILWAY_STATIC_URL o una similar para producción.
+const SERVER_BASE_URL = process.env.RAILWAY_STATIC_URL || `http://localhost:${PORT}`;
+
 
 // Middleware
 app.use(cors({
@@ -20,7 +26,7 @@ app.use(cors({
 app.use(express.json());
 
 // Crear servidor HTTP con Express
-const httpServer = http.createServer(app); // ✅ CORRECTO: La variable se llama httpServer
+const httpServer = http.createServer(app);
 
 // Configuración mejorada de Socket.IO con CORS
 const io = new Server(httpServer, {
@@ -191,20 +197,12 @@ io.on('connection', (socket) => {
             return;
         }
 
-        // 1. Obtener la cadena Base64 (ahora llamada audioData)
         const audioBase64 = audioMessageData.audioData;
-
-        // 2. 🔥 CAMBIO CRÍTICO: Decodificar la cadena Base64 a un Buffer de bytes
-        // El segundo argumento 'base64' le dice a Node.js cómo interpretar la cadena.
         const audioBuffer = Buffer.from(audioBase64, 'base64');
         
-        // 3. Definir el nombre del archivo y la ruta
-        // Asegúrate de que el formato (ej: .mp3, .ogg) coincida con lo que tu cliente Android graba.
         const filename = `audio_${Date.now()}.mp3`; 
         const filePath = path.join(audioDir, filename);
 
-        // 4. Escribir el Buffer decodificado al sistema de archivos
-        // Usamos audioBuffer en lugar de audioBytes
         fs.writeFile(filePath, audioBuffer, (err) => {
             if (err) {
                 console.error('Error al guardar el archivo de audio:', err);
@@ -212,11 +210,11 @@ io.on('connection', (socket) => {
             }
             console.log(`✅ Archivo de audio guardado: ${filePath}`);
 
-            const audioUrl = `/uploads/audio/${filename}`;
+            // ✅ CORRECCIÓN CLAVE: Usar la URL base del servidor de Railway
+            const audioUrl = `${SERVER_BASE_URL}/uploads/audio/${filename}`;
             
             const finalMessage = {
                 id: socket.id + '-' + Date.now(),
-                // Se envía la URL, el cliente Android la usará para reproducir
                 audioUrl: audioUrl, 
                 username: userInfo.userName,
                 userId: userInfo.id,
@@ -309,9 +307,6 @@ process.on('SIGINT', () => {
     });
 });
 
-// ✅ CORRECCIÓN 3: Eliminado el '0.0.0.0' en Railway y usando solo el nombre de la variable 'httpServer'
-// ✅ CORRECCIÓN 4: He quitado la línea 'server.listen(PORT, ...)' repetida que causaba el error original.
-
 httpServer.listen(PORT, () => {
     console.log(`🚀 Servidor Express con Socket.IO ejecutándose en el puerto ${PORT}`);
     console.log(`📍 URL local: http://localhost:${PORT}`);
@@ -330,7 +325,6 @@ httpServer.listen(PORT, () => {
 
 // Función para obtener la IP local
 function getLocalIP() {
-    // ✅ Reemplazado 'require('os')' por la variable 'os' ya importada
     const interfaces = os.networkInterfaces(); 
     for (const interfaceName in interfaces) {
         const addresses = interfaces[interfaceName];
