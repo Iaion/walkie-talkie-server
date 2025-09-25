@@ -121,8 +121,8 @@ io.on('connection', (socket) => {
   });
 
   // ✅ Manejar unión a la sala general
-  socket.on('join_general_chat', (username) => {
-    const userId = connectedUsers.get(socket.id)?.id;
+  socket.on('join_general_chat', (userData) => {
+    const { userId, username } = JSON.parse(userData);
     if (!userId || !username) {
       console.error('❌ join_general_chat: Usuario o username no definidos.');
       return;
