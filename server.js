@@ -1,34 +1,43 @@
-// server.js - CÓDIGO CORREGIDO PARA RAILWAY
-
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
-const os = require('os'); 
-const { Buffer } = require('buffer'); // ✅ NUEVO: Importar Buffer para manejar datos binarios
+const os = require('os');
+const { Buffer } = require('buffer');
+const {
+    initializeApp,
+    applicationDefault,
+    getApps
+} = require('firebase-admin/app');
+const {
+    getStorage
+} = require('firebase-admin/storage');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ✅ CAMBIO CRÍTICO: Obtener la URL del entorno de Railway o usar localhost para desarrollo.
-// Utiliza process.env.RAILWAY_STATIC_URL o una similar para producción.
 const SERVER_BASE_URL = process.env.RAILWAY_STATIC_URL || `http://localhost:${PORT}`;
 
-
-// Middleware
+// ✅ Middleware
 app.use(cors({
-    origin: "*", 
+    origin: "*",
     methods: ["GET", "POST", "PUT", "DELETE"],
     credentials: true
 }));
 app.use(express.json());
 
-// Crear servidor HTTP con Express
-const httpServer = http.createServer(app);
+// ✅ Inicializar Firebase Admin SDK si no está inicializado
+if (!getApps().length) {
+    initializeApp({
+        credential: applicationDefault(),
+        storageBucket: process.env.FIREBASE_STORAGE_BUCKET
+    });
+}
+const storage = getStorage();
 
-// Configuración mejorada de Socket.IO con CORS
+const httpServer = http.createServer(app);
 const io = new Server(httpServer, {
     cors: {
         origin: "*",
@@ -38,21 +47,12 @@ const io = new Server(httpServer, {
     },
     allowEIO3: true,
     pingTimeout: 60000,
-    pingInterval: 25000
+    pingInterval: 25000,
+    maxHttpBufferSize: 1e8 // Aumenta el buffer a 100MB
 });
 
-// Almacenar usuarios conectados y salas
 const users = new Map();
 const roomUsers = new Map();
-
-// --- Manejo de Archivos Estáticos de Audio ---
-const audioDir = path.join(__dirname, 'uploads/audio');
-if (!fs.existsSync(audioDir)) {
-    fs.mkdirSync(audioDir, { recursive: true });
-}
-
-// ✅ CORRECCIÓN 2: Middleware para servir archivos de audio
-app.use('/uploads/audio', express.static(audioDir));
 
 // --- Rutas de Express para monitoreo y estado ---
 app.get('/', (req, res) => {
@@ -78,7 +78,7 @@ app.get('/health', (req, res) => {
 
 app.get('/users', (req, res) => {
     const room = req.query.room || 'general';
-    const roomUsersList = roomUsers.has(room) 
+    const roomUsersList = roomUsers.has(room)
         ? Array.from(roomUsers.get(room))
             .map(id => users.get(id))
             .filter(user => user !== undefined && user !== null)
@@ -91,7 +91,6 @@ app.get('/users', (req, res) => {
     });
 });
 
-// Endpoint para debugging de conexiones
 app.get('/debug', (req, res) => {
     res.json({
         totalSockets: io.engine.clientsCount,
@@ -111,19 +110,14 @@ app.get('/debug', (req, res) => {
 io.on('connection', (socket) => {
     console.log('✅ Usuario conectado:', socket.id);
     
-    // ... [Tu código de 'join_general_chat', 'send_message', 'audio_message', 
-    // y eventos WebRTC está correcto y lo omito aquí por brevedad] ...
-    
     socket.emit('connection_established', { 
         socketId: socket.id, 
         message: 'Conexión establecida correctamente',
         timestamp: new Date().toISOString()
     });
 
-    // Tu código de 'join_general_chat' (1)
     socket.on('join_general_chat', (userName) => {
         try {
-            // Almacenar información del usuario
             users.set(socket.id, {
                 userName: userName,
                 room: 'general',
@@ -164,7 +158,6 @@ io.on('connection', (socket) => {
         }
     });
 
-    // Tu código de 'send_message' (2)
     socket.on('send_message', (messageData) => {
         try {
             const userInfo = users.get(socket.id);
@@ -188,57 +181,50 @@ io.on('connection', (socket) => {
         }
     });
 
-    // Tu código de 'audio_message' (3)
-    socket.on('audio_message', (audioMessageData) => {
-    try {
-        const userInfo = users.get(socket.id);
-        if (!userInfo) {
-            console.error('Error: Usuario no encontrado para el socket:', socket.id);
-            return;
-        }
+    // ✅ Nuevo: Escuchar por mensajes de audio y subirlos a Firebase Storage
+    socket.on('audio_message', async (data) => {
+        try {
+            const {
+                roomId,
+                userId,
+                username,
+                audioData,
+                timestamp
+            } = data;
+            const filename = `audio_${Date.now()}.mp3`;
 
-        const audioBase64 = audioMessageData.audioData;
-        const audioBuffer = Buffer.from(audioBase64, 'base64');
-        
-        const filename = `audio_${Date.now()}.mp3`; 
-        const filePath = path.join(audioDir, filename);
+            const audioBuffer = Buffer.from(audioData, 'base64');
+            const file = storage.bucket().file(`uploads/audio/${filename}`);
 
-        fs.writeFile(filePath, audioBuffer, (err) => {
-            if (err) {
-                console.error('Error al guardar el archivo de audio:', err);
-                return;
-            }
-            console.log(`✅ Archivo de audio guardado: ${filePath}`);
+            await file.save(audioBuffer, {
+                metadata: {
+                    contentType: 'audio/mpeg',
+                },
+                public: true
+            });
 
-            // ✅ CORRECCIÓN CLAVE: Usar la URL base del servidor de Railway
-            const audioUrl = `${SERVER_BASE_URL}/uploads/audio/${filename}`;
+            const [publicUrl] = await file.getSignedUrl({
+              action: 'read',
+              expires: '03-09-2491'
+            });
             
-            const finalMessage = {
-                id: socket.id + '-' + Date.now(),
-                audioUrl: audioUrl, 
-                username: userInfo.userName,
-                userId: userInfo.id,
-                timestamp: Date.now(),
-                roomId: userInfo.room
+            console.log(`🎙️ [${roomId}] Audio subido a Firebase Storage: ${publicUrl}`);
+
+            const audioMessage = {
+                id: socket.id,
+                userId,
+                username,
+                roomId,
+                timestamp,
+                audioUrl: publicUrl
             };
+            io.to(roomId).emit('new_message', audioMessage);
 
-            io.to(userInfo.room).emit('new_message', finalMessage);
-            console.log(`🎙️ [${userInfo.room}] ${userInfo.userName} envió un audio.`);
-        });
-
-    } catch (error) {
-        console.error('Error en audio_message:', error);
-    }
-});
-
-    // Tu código de señalización WebRTC (4, 5, 6, 7)
-
-    // Tu código de ping/pong (8)
-    socket.on('ping', () => {
-        socket.emit('pong', { timestamp: Date.now() });
+        } catch (error) {
+            console.error('❌ Error al procesar el mensaje de audio:', error.message);
+        }
     });
 
-    // Tu código de desconexión (9)
     socket.on('disconnect', (reason) => {
         const userInfo = users.get(socket.id);
         if (userInfo) {
@@ -269,23 +255,20 @@ io.on('connection', (socket) => {
         }
     });
 
-    // Tu código de error de socket (10)
     socket.on('error', (error) => {
         console.error(`❌ Error en socket ${socket.id}:`, error);
     });
 });
 
-// Middleware para manejar rutas no encontradas
 app.use('*', (req, res) => {
     res.status(404).json({
         error: 'Ruta no encontrada',
         availableEndpoints: {
-            GET: ['/', '/health', '/users', '/debug', '/uploads/audio/*']
+            GET: ['/', '/health', '/users', '/debug']
         }
     });
 });
 
-// Manejo de errores global
 process.on('uncaughtException', (error) => {
     console.error('❌ Error no capturado:', error);
 });
@@ -294,7 +277,6 @@ process.on('unhandledRejection', (reason, promise) => {
     console.error('❌ Promesa rechazada no manejada:', reason);
 });
 
-// Manejar cierre graceful del servidor
 process.on('SIGINT', () => {
     console.log('\n🛑 Recibida señal SIGINT. Cerrando servidor...');
     
@@ -317,13 +299,11 @@ httpServer.listen(PORT, () => {
     console.log(`💬 Funcionalidades implementadas:`);
     console.log(`   - Chat en tiempo real`);
     console.log(`   - Lista de usuarios conectados`);
-    console.log(`   - WebRTC para llamadas de voz`);
     console.log(`   - Compartir audio`);
     console.log(`   - API REST para monitoreo`);
     console.log(`   - CORS configurado para desarrollo`);
 });
 
-// Función para obtener la IP local
 function getLocalIP() {
     const interfaces = os.networkInterfaces(); 
     for (const interfaceName in interfaces) {
