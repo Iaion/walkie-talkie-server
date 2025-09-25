@@ -101,11 +101,14 @@ io.on('connection', (socket) => {
     }
     connectedUsers.set(user.id, { ...user, socketId: socket.id });
 
-    // Guardar el usuario en Firestore si no existe
+    // ✅ CORRECCIÓN: Usamos .set() con merge: true para crear/actualizar el documento
     const userRef = db.collection(USERS_COLLECTION).doc(user.id);
-    const userDoc = await userRef.get();
-    if (!userDoc.exists) {
-      await userRef.set(user);
+    try {
+      await userRef.set(user, { merge: true });
+      console.log(`✅ Usuario ${user.username} guardado/actualizado en Firestore.`);
+    } catch (error) {
+      console.error('❌ Error al guardar usuario en Firestore:', error);
+      // Manejar el error de forma apropiada, sin detener el servidor
     }
     
     console.log(`👤 ${user.username} se ha conectado.`);
