@@ -54,22 +54,31 @@ const bucket = admin.storage().bucket();
 const USERS_COLLECTION = 'users';
 const MESSAGES_COLLECTION = 'messages';
 
-// ✅ Nuevas estructuras para la gestión de salas
-// ALMACENA: userId -> { id, username, socketId } (Mantiene la info única del usuario)
+// Estructuras para la gestión de salas
 const connectedUsers = new Map(); 
-// ✅ NUEVA ESTRUCTURA CRÍTICA: socketId -> userId (Permite mapear la desconexión al usuario)
 const socketToUserMap = new Map(); 
 
-const rooms = new Map(); // Mapa de roomId -> { name, users: Set(userId) }
+const rooms = new Map(); // Mapa de roomId -> { name, users: Set(userId), currentSpeaker: string | null }
 const userToRoomMap = new Map(); // Mapa de userId -> roomId
 
-// Inicializar la sala general
+// Inicializar Sala General
 const GENERAL_ROOM_ID = 'general';
 rooms.set(GENERAL_ROOM_ID, {
   id: GENERAL_ROOM_ID,
   name: 'Chat General',
   description: 'Sala de chat público',
   users: new Set(),
+  currentSpeaker: null, // No se usa en General, pero mantiene la estructura.
+});
+
+// ✅ Inicializar Sala Handy (PTT)
+const HANDY_ROOM_ID = 'handy';
+rooms.set(HANDY_ROOM_ID, {
+  id: HANDY_ROOM_ID,
+  name: 'Radio Handy (PTT)',
+  description: 'Simulación de radio VHF (Push-To-Talk)',
+  users: new Set(),
+  currentSpeaker: null, // CRÍTICO: Rastrea el userId que tiene el token para hablar.
 });
 
 // Middleware para el log de peticiones
@@ -91,7 +100,8 @@ app.get('/rooms', (req, res) => {
     name: room.name,
     description: room.description,
     userCount: room.users.size,
-    type: 'general'
+    type: room.id === GENERAL_ROOM_ID ? 'general' : 'ptt', // Diferenciar la sala PTT
+    currentSpeaker: room.currentSpeaker || null // Incluir el estado del hablante
   }));
   res.status(200).json(roomsArray);
 });
@@ -131,9 +141,30 @@ io.on('connection', (socket) => {
       name: room.name,
       description: room.description,
       userCount: room.users.size,
-      type: room.id === 'general' ? 'general' : 'private'
+      type: room.id === GENERAL_ROOM_ID ? 'general' : 'ptt',
+      currentSpeaker: room.currentSpeaker || null
     })));
   });
+
+  // ✅ Función auxiliar para manejar la salida de sala y limpieza de token
+  const leaveCurrentRoom = (userId, socket) => {
+    const prevRoomId = userToRoomMap.get(userId);
+    if (prevRoomId && rooms.has(prevRoomId)) {
+      const prevRoom = rooms.get(prevRoomId);
+      prevRoom.users.delete(userId);
+      socket.leave(prevRoomId);
+      
+      // Lógica de liberación de token PTT si estaba hablando
+      if (prevRoomId === HANDY_ROOM_ID && prevRoom.currentSpeaker === userId) {
+          prevRoom.currentSpeaker = null;
+          io.to(HANDY_ROOM_ID).emit('talk_token_released', { roomId: HANDY_ROOM_ID, currentSpeaker: null });
+          console.log(`🔇 Token PTT liberado por ${userId} al cambiar de sala.`);
+      }
+      
+      io.to(prevRoomId).emit('user-left-room', { roomId: prevRoomId, userCount: prevRoom.users.size });
+    }
+  };
+
 
   // ✅ Manejar unión a la sala general
   socket.on('join_general_chat', (userData) => {
@@ -143,13 +174,8 @@ io.on('connection', (socket) => {
       return;
     }
 
-    // Eliminar usuario de la sala anterior si existe
-    const prevRoomId = userToRoomMap.get(userId);
-    if (prevRoomId && rooms.has(prevRoomId)) {
-      rooms.get(prevRoomId).users.delete(userId);
-      socket.leave(prevRoomId);
-      io.to(prevRoomId).emit('user-left-room', { roomId: prevRoomId, userCount: rooms.get(prevRoomId).users.size });
-    }
+    // Eliminar usuario de la sala anterior y limpiar token
+    leaveCurrentRoom(userId, socket);
 
     // Unir a la sala general
     socket.join(GENERAL_ROOM_ID);
@@ -165,6 +191,89 @@ io.on('connection', (socket) => {
     // Notificar a la sala del cambio de conteo
     io.to(GENERAL_ROOM_ID).emit('user-joined-room', { roomId: GENERAL_ROOM_ID, userCount: rooms.get(GENERAL_ROOM_ID).users.size });
   });
+
+  // ✅ NUEVO: Manejar unión a la sala Handy (PTT)
+  socket.on('join_handy_chat', (userData) => {
+    const { userId, username } = JSON.parse(userData);
+    if (!userId || !username) {
+      console.error('❌ join_handy_chat: Usuario o username no definidos.');
+      return;
+    }
+
+    // Eliminar usuario de la sala anterior y limpiar token
+    leaveCurrentRoom(userId, socket);
+
+    // Unir a la sala handy
+    socket.join(HANDY_ROOM_ID);
+    rooms.get(HANDY_ROOM_ID).users.add(userId);
+    userToRoomMap.set(userId, HANDY_ROOM_ID);
+
+    console.log(`👤 ${username} se ha unido a la sala Handy (PTT).`);
+    socket.emit('join_success', { 
+        message: 'Te has unido a la sala Handy (PTT).', 
+        users: Array.from(rooms.get(HANDY_ROOM_ID).users),
+        currentSpeaker: rooms.get(HANDY_ROOM_ID).currentSpeaker // Enviar el estado del hablante
+    });
+    
+    io.to(HANDY_ROOM_ID).emit('user-joined-room', { roomId: HANDY_ROOM_ID, userCount: rooms.get(HANDY_ROOM_ID).users.size });
+  });
+
+
+// --- Lógica PTT (Token de Palabra) ---
+
+// ✅ NUEVO: Manejar solicitud del token de palabra (PTT Press)
+socket.on('request_talk_token', ({ userId, roomId }) => {
+    // Solo aplica a la sala PTT
+    if (roomId !== HANDY_ROOM_ID || !userId) return;
+
+    const room = rooms.get(roomId);
+    if (!room || !connectedUsers.has(userId)) return;
+
+    if (room.currentSpeaker === null) {
+        // Token concedido (Usuario empieza a hablar)
+        room.currentSpeaker = userId;
+        const username = connectedUsers.get(userId)?.username || userId;
+        console.log(`🎙️ ${username} ha tomado el token de palabra en ${roomId}.`);
+        
+        // Notificar a todos en la sala (incluido el emisor)
+        io.to(roomId).emit('talk_token_granted', { 
+            roomId, 
+            currentSpeaker: userId, 
+            username
+        });
+    } else if (room.currentSpeaker !== userId) {
+        // Token denegado (Alguien más está hablando)
+        console.log(`🚫 ${userId} intentó hablar, pero ${room.currentSpeaker} ya tiene el token.`);
+        socket.emit('talk_token_denied', { 
+            roomId, 
+            currentSpeaker: room.currentSpeaker 
+        });
+    }
+});
+
+// ✅ NUEVO: Manejar liberación del token de palabra (PTT Release)
+socket.on('release_talk_token', ({ userId, roomId }) => {
+    // Solo aplica a la sala PTT
+    if (roomId !== HANDY_ROOM_ID || !userId) return;
+
+    const room = rooms.get(roomId);
+    if (!room) return;
+
+    if (room.currentSpeaker === userId) {
+        // Token liberado
+        room.currentSpeaker = null;
+        console.log(`🔇 ${userId} ha liberado el token de palabra en ${roomId}.`);
+        
+        // Notificar a todos en la sala
+        io.to(roomId).emit('talk_token_released', { 
+            roomId, 
+            currentSpeaker: null 
+        });
+    }
+});
+
+// ----------------------------------------
+
 
   // ✅ Manejar el envío de mensajes de texto
   socket.on('send_message', async ({ userId, username, text, roomId }) => {
@@ -185,6 +294,20 @@ io.on('connection', (socket) => {
 
   // ✅ Manejar el envío de mensajes de audio (Base64)
   socket.on('audio_message', async ({ userId, username, audioData, roomId }) => {
+    // --- Lógica de PTT AÑADIDA: Bloquear si no tiene el token ---
+    if (roomId === HANDY_ROOM_ID) {
+        const room = rooms.get(roomId);
+        // Si es una sala Handy, verifica si el usuario tiene el token.
+        // El cliente debe liberar el token *después* de que este mensaje haya terminado de subir.
+        if (!room || room.currentSpeaker !== userId) {
+            console.warn(`⚠️ Rechazando audio de ${username} en sala PTT. No tienen el token.`);
+            // Informar al cliente que la transmisión fue abortada.
+            socket.emit('audio_transmission_failed', { message: 'No tienes el token de palabra (PTT).' });
+            return;
+        }
+    }
+    // --- FIN Lógica de PTT AÑADIDA ---
+
     try {
       console.log(`✅ Recibiendo mensaje de audio de ${username} para la sala ${roomId}`);
 
@@ -236,12 +359,8 @@ io.on('connection', (socket) => {
         
         // 2. Solo proceder si el socket ID que se desconecta es el último que se registró (para evitar desconexiones accidentales)
         if (user && user.socketId === socket.id) { 
-            // 3. Eliminar usuario de la sala actual
-            const prevRoomId = userToRoomMap.get(userId);
-            if (prevRoomId && rooms.has(prevRoomId)) {
-                rooms.get(prevRoomId).users.delete(userId);
-                io.to(prevRoomId).emit('user-left-room', { roomId: prevRoomId, userCount: rooms.get(prevRoomId).users.size });
-            }
+            // 3. Eliminar usuario de la sala actual y limpiar token
+            leaveCurrentRoom(userId, socket); // Reutilizar la función de limpieza
             
             // 4. Eliminar del mapa de usuarios conectados únicos
             connectedUsers.delete(userId);
@@ -273,8 +392,9 @@ server.listen(PORT, () => {
   console.log('🚪 Salas: http://localhost:8080/rooms');
   console.log('💬 Funcionalidades implementadas:');
   console.log('   - Chat en tiempo real');
-  console.log('   - Gestión de salas de chat');
+  console.log('   - Gestión de salas de chat (General y PTT)');
   console.log('   - Compartir audio (con Firebase Storage)');
+  console.log('   - Control PTT (Push-To-Talk) para Sala Handy');
   console.log('   - API REST para monitoreo');
   console.log('   - CORS configurado para desarrollo');
 });
