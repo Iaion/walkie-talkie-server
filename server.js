@@ -1,3 +1,5 @@
+// Servidor Node.js con Socket.IO, Firebase Firestore y Storage
+
 const express = require('express');
 const http = require('http');
 const socketIo = require('socket.io');
@@ -6,6 +8,7 @@ const path = require('path');
 const { Storage } = require('@google-cloud/storage');
 const { v4: uuidv4 } = require('uuid');
 const admin = require('firebase-admin');
+const { Buffer } = require('buffer'); // Importar Buffer para manejo de audio
 
 const app = express();
 const server = http.createServer(app);
@@ -52,7 +55,11 @@ const USERS_COLLECTION = 'users';
 const MESSAGES_COLLECTION = 'messages';
 
 // ✅ Nuevas estructuras para la gestión de salas
-const connectedUsers = new Map(); // Mapa de socket.id -> { id, username }
+// ALMACENA: userId -> { id, username, socketId } (Mantiene la info única del usuario)
+const connectedUsers = new Map(); 
+// ✅ NUEVA ESTRUCTURA CRÍTICA: socketId -> userId (Permite mapear la desconexión al usuario)
+const socketToUserMap = new Map(); 
+
 const rooms = new Map(); // Mapa de roomId -> { name, users: Set(userId) }
 const userToRoomMap = new Map(); // Mapa de userId -> roomId
 
@@ -74,6 +81,7 @@ app.use((req, res, next) => {
 // Rutas de la API REST
 app.get('/health', (req, res) => res.status(200).send('Servidor operativo.'));
 app.get('/users', (req, res) => {
+  // Solo devuelve usuarios que están marcados como "conectados"
   const usersArray = Array.from(connectedUsers.values());
   res.status(200).json(usersArray);
 });
@@ -99,20 +107,24 @@ io.on('connection', (socket) => {
       console.error('❌ Error: Datos de usuario no válidos.');
       return;
     }
-    connectedUsers.set(user.id, { ...user, socketId: socket.id });
 
-    // ✅ CORRECCIÓN: Usamos .set() con merge: true para crear/actualizar el documento
+    // 1. Mapear el socket actual al ID del usuario (CLAVE para la desconexión)
+    socketToUserMap.set(socket.id, user.id); 
+
+    // 2. Almacenar el usuario único (clave: user.id). Esto sobrescribe el socketId anterior si se reconecta.
+    connectedUsers.set(user.id, { ...user, socketId: socket.id, isOnline: true });
+    
+    // 3. Guardar en Firestore
     const userRef = db.collection(USERS_COLLECTION).doc(user.id);
     try {
       await userRef.set(user, { merge: true });
       console.log(`✅ Usuario ${user.username} guardado/actualizado en Firestore.`);
     } catch (error) {
       console.error('❌ Error al guardar usuario en Firestore:', error);
-      // Manejar el error de forma apropiada, sin detener el servidor
     }
     
     console.log(`👤 ${user.username} se ha conectado.`);
-    // Envía la lista de usuarios y salas al cliente
+    // 4. Envía la lista de usuarios y salas al cliente
     io.emit('user-list', Array.from(connectedUsers.values()));
     socket.emit('room-list', Array.from(rooms.values()).map(room => ({
       id: room.id,
@@ -145,7 +157,12 @@ io.on('connection', (socket) => {
     userToRoomMap.set(userId, GENERAL_ROOM_ID);
 
     console.log(`👤 ${username} se ha unido a la sala general.`);
-    socket.emit('join_success', { message: 'Te has unido a la sala general.', users: Array.from(rooms.get(GENERAL_ROOM_ID).users) });
+    // Enviar la lista de usuarios de la sala (solo IDs en este caso)
+    socket.emit('join_success', { 
+        message: 'Te has unido a la sala general.', 
+        users: Array.from(rooms.get(GENERAL_ROOM_ID).users) 
+    });
+    // Notificar a la sala del cambio de conteo
     io.to(GENERAL_ROOM_ID).emit('user-joined-room', { roomId: GENERAL_ROOM_ID, userCount: rooms.get(GENERAL_ROOM_ID).users.size });
   });
 
@@ -177,6 +194,7 @@ io.on('connection', (socket) => {
 
       // ✅ Decodificar la cadena Base64 a un buffer binario
       const audioDataBuffer = Buffer.from(audioData, 'base64');
+      // Usamos .m4a que es un formato común para AAC (codec de Android)
       const uniqueFileName = `audios/${roomId}/${userId}_${Date.now()}_${uuidv4()}.m4a`;
       const file = bucket.file(uniqueFileName);
 
@@ -210,21 +228,38 @@ io.on('connection', (socket) => {
 
   // ✅ Manejar la desconexión
   socket.on('disconnect', () => {
-    const user = connectedUsers.get(socket.id);
-    if (user) {
-      // Eliminar usuario de la sala actual
-      const prevRoomId = userToRoomMap.get(user.id);
-      if (prevRoomId && rooms.has(prevRoomId)) {
-        rooms.get(prevRoomId).users.delete(user.id);
-        io.to(prevRoomId).emit('user-left-room', { roomId: prevRoomId, userCount: rooms.get(prevRoomId).users.size });
-      }
-      
-      connectedUsers.delete(socket.id);
-      userToRoomMap.delete(user.id);
-      console.log(`❌ Usuario desconectado: ${user.username} (Razón: ${socket.reason})`);
-      io.emit('user-left', user);
+    // 1. Obtener el userId usando el nuevo mapa (CRÍTICO)
+    const userId = socketToUserMap.get(socket.id);
+    
+    if (userId) {
+        const user = connectedUsers.get(userId);
+        
+        // 2. Solo proceder si el socket ID que se desconecta es el último que se registró (para evitar desconexiones accidentales)
+        if (user && user.socketId === socket.id) { 
+            // 3. Eliminar usuario de la sala actual
+            const prevRoomId = userToRoomMap.get(userId);
+            if (prevRoomId && rooms.has(prevRoomId)) {
+                rooms.get(prevRoomId).users.delete(userId);
+                io.to(prevRoomId).emit('user-left-room', { roomId: prevRoomId, userCount: rooms.get(prevRoomId).users.size });
+            }
+            
+            // 4. Eliminar del mapa de usuarios conectados únicos
+            connectedUsers.delete(userId);
+            userToRoomMap.delete(userId);
+            
+            console.log(`❌ Usuario desconectado: ${user.username} (Razón: ${socket.reason})`);
+            
+            // 5. Emitir la lista actualizada de usuarios
+            io.emit('user-list', Array.from(connectedUsers.values()));
+        } else if (user) {
+            console.log(`⚠️ Socket secundario ${socket.id} de ${user.username} desconectado. El usuario sigue conectado.`);
+        }
+        
+        // 6. Eliminar el mapeo del socket
+        socketToUserMap.delete(socket.id);
+
     } else {
-      console.log(`❌ Usuario desconectado: ${socket.id} (Razón: ${socket.reason})`);
+      console.log(`❌ Usuario desconocido desconectado: ${socket.id} (Razón: ${socket.reason})`);
     }
   });
 });
@@ -239,7 +274,7 @@ server.listen(PORT, () => {
   console.log('💬 Funcionalidades implementadas:');
   console.log('   - Chat en tiempo real');
   console.log('   - Gestión de salas de chat');
-  console.log('   - Compartir audio (con Base64)');
+  console.log('   - Compartir audio (con Firebase Storage)');
   console.log('   - API REST para monitoreo');
   console.log('   - CORS configurado para desarrollo');
 });
