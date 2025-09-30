@@ -4,44 +4,47 @@ const express = require('express');
 const http = require('http');
 const socketIo = require('socket.io');
 const cors = require('cors');
+const path = require('path');
+const { Storage } = require('@google-cloud/storage');
 const { v4: uuidv4 } = require('uuid');
 const admin = require('firebase-admin');
-const { Buffer } = require('buffer'); // Manejo de audio
+const { Buffer } = require('buffer'); // Importar Buffer para manejo de audio
 
 const app = express();
 const server = http.createServer(app);
 const io = socketIo(server, {
   cors: {
-    origin: '*',
+    origin: '*', // Permite todas las solicitudes CORS
     methods: ['GET', 'POST'],
   },
   maxHttpBufferSize: 1e8, // 100 MB
 });
 
-// Configura CORS
+// Configura CORS para Express
 app.use(cors());
 
-// Variables de entorno requeridas
+// Verificar si las variables de entorno están configuradas
 if (!process.env.GOOGLE_APPLICATION_CREDENTIALS) {
-  console.error('❌ Falta GOOGLE_APPLICATION_CREDENTIALS');
+  console.error('❌ ERROR: La variable de entorno GOOGLE_APPLICATION_CREDENTIALS no está configurada.');
   process.exit(1);
 }
 if (!process.env.FIREBASE_STORAGE_BUCKET) {
-  console.error('❌ Falta FIREBASE_STORAGE_BUCKET');
+  console.error('❌ ERROR: La variable de entorno FIREBASE_STORAGE_BUCKET no está configurada.');
   process.exit(1);
 }
 
-// Inicializar Firebase
+// Inicializar Firebase Admin SDK con la variable de entorno JSON
 let serviceAccount;
 try {
   serviceAccount = JSON.parse(process.env.GOOGLE_APPLICATION_CREDENTIALS);
   admin.initializeApp({
     credential: admin.credential.cert(serviceAccount),
-    storageBucket: process.env.FIREBASE_STORAGE_BUCKET,
+    storageBucket: process.env.FIREBASE_STORAGE_BUCKET
   });
-  console.log('✅ Firebase Admin inicializado.');
+  console.log('✅ Firebase Admin SDK inicializado correctamente.');
 } catch (error) {
-  console.error('❌ Error al parsear credenciales Firebase:', error);
+  console.error('❌ ERROR: Error al parsear las credenciales de Firebase. Asegúrate de que el valor de la variable de entorno GOOGLE_APPLICATION_CREDENTIALS sea un JSON válido.');
+  console.error(error);
   process.exit(1);
 }
 
@@ -51,179 +54,288 @@ const bucket = admin.storage().bucket();
 const USERS_COLLECTION = 'users';
 const MESSAGES_COLLECTION = 'messages';
 
-// Gestión de usuarios y salas
+// Estructuras para la gestión de salas
 const connectedUsers = new Map(); 
 const socketToUserMap = new Map(); 
-const userToRoomMap = new Map(); 
 
-const rooms = new Map();
+const rooms = new Map(); // Mapa de roomId -> { name, users: Set(userId), currentSpeaker: string | null }
+const userToRoomMap = new Map(); // Mapa de userId -> roomId
+
+// Inicializar Sala General
 const GENERAL_ROOM_ID = 'general';
-const HANDY_ROOM_ID = 'handy';
-
 rooms.set(GENERAL_ROOM_ID, {
   id: GENERAL_ROOM_ID,
   name: 'Chat General',
   description: 'Sala de chat público',
   users: new Set(),
-  currentSpeaker: null,
+  currentSpeaker: null, // No se usa en General, pero mantiene la estructura.
 });
+
+// ✅ Inicializar Sala Handy (PTT)
+const HANDY_ROOM_ID = 'handy';
 rooms.set(HANDY_ROOM_ID, {
   id: HANDY_ROOM_ID,
   name: 'Radio Handy (PTT)',
-  description: 'Simulación PTT',
+  description: 'Simulación de radio VHF (Push-To-Talk)',
   users: new Set(),
-  currentSpeaker: null,
+  currentSpeaker: null, // CRÍTICO: Rastrea el userId que tiene el token para hablar.
 });
 
-// Middleware de log
-app.use((req, _, next) => {
+// Middleware para el log de peticiones
+app.use((req, res, next) => {
   console.log(`[${new Date().toISOString()}] ${req.method} ${req.url}`);
   next();
 });
 
-// Rutas REST
-app.get('/health', (_, res) => res.status(200).send('Servidor operativo.'));
-app.get('/users', (_, res) => res.status(200).json(Array.from(connectedUsers.values())));
-app.get('/rooms', (_, res) => {
-  res.status(200).json(Array.from(rooms.values()).map(room => ({
+// Rutas de la API REST
+app.get('/health', (req, res) => res.status(200).send('Servidor operativo.'));
+app.get('/users', (req, res) => {
+  // Solo devuelve usuarios que están marcados como "conectados"
+  const usersArray = Array.from(connectedUsers.values());
+  res.status(200).json(usersArray);
+});
+app.get('/rooms', (req, res) => {
+  const roomsArray = Array.from(rooms.values()).map(room => ({
     id: room.id,
     name: room.name,
     description: room.description,
     userCount: room.users.size,
-    type: room.id === GENERAL_ROOM_ID ? 'general' : 'ptt',
-    currentSpeaker: room.currentSpeaker || null,
-  })));
+    type: room.id === GENERAL_ROOM_ID ? 'general' : 'ptt', // Diferenciar la sala PTT
+    currentSpeaker: room.currentSpeaker || null // Incluir el estado del hablante
+  }));
+  res.status(200).json(roomsArray);
 });
 
-// WebSocket
+// WebSocket (Socket.IO)
 io.on('connection', (socket) => {
   console.log(`✅ Usuario conectado: ${socket.id}`);
 
-  socket.on('user-connected', async (user) => {
-    console.log('🎯 user-connected:', user);
-    if (!user?.id || !user?.username) return;
-
-    socketToUserMap.set(socket.id, user.id);
-    connectedUsers.set(user.id, { ...user, socketId: socket.id, isOnline: true });
-
-    try {
-      await db.collection(USERS_COLLECTION).doc(user.id).set(user, { merge: true });
-    } catch (err) {
-      console.error('❌ Error guardando usuario:', err);
+  // Manejar el evento de inicio de sesión
+  socket.on('user-connected', async (userData) => {
+    console.log('🎯 RECIBIENDO user-connected:', userData);
+    
+    // ✅ CORRECCIÓN: Socket.IO ya parsea automáticamente los JSON
+    const user = userData; // Ya es un objeto, no necesita JSON.parse()
+    
+    if (!user || !user.id || !user.username) {
+      console.error('❌ Error: Datos de usuario no válidos.');
+      return;
     }
 
+    // 1. Mapear el socket actual al ID del usuario (CLAVE para la desconexión)
+    socketToUserMap.set(socket.id, user.id); 
+
+    // 2. Almacenar el usuario único (clave: user.id). Esto sobrescribe el socketId anterior si se reconecta.
+    connectedUsers.set(user.id, { ...user, socketId: socket.id, isOnline: true });
+    
+    // 3. Guardar en Firestore
+    const userRef = db.collection(USERS_COLLECTION).doc(user.id);
+    try {
+      await userRef.set(user, { merge: true });
+      console.log(`✅ Usuario ${user.username} guardado/actualizado en Firestore.`);
+    } catch (error) {
+      console.error('❌ Error al guardar usuario en Firestore:', error);
+    }
+    
+    console.log(`👤 ${user.username} se ha conectado.`);
+    // 4. Envía la lista de usuarios y salas al cliente
     io.emit('user-list', Array.from(connectedUsers.values()));
-    socket.emit('room-list', Array.from(rooms.values()).map(r => ({
-      id: r.id,
-      name: r.name,
-      description: r.description,
-      userCount: r.users.size,
-      type: r.id === GENERAL_ROOM_ID ? 'general' : 'ptt',
-      currentSpeaker: r.currentSpeaker || null,
+    socket.emit('room-list', Array.from(rooms.values()).map(room => ({
+      id: room.id,
+      name: room.name,
+      description: room.description,
+      userCount: room.users.size,
+      type: room.id === GENERAL_ROOM_ID ? 'general' : 'ptt',
+      currentSpeaker: room.currentSpeaker || null
     })));
   });
 
-  // Función auxiliar
+  // ✅ Función auxiliar para manejar la salida de sala y limpieza de token
   const leaveCurrentRoom = (userId, socket) => {
     const prevRoomId = userToRoomMap.get(userId);
-    if (!prevRoomId || !rooms.has(prevRoomId)) return;
-
-    const prevRoom = rooms.get(prevRoomId);
-    prevRoom.users.delete(userId);
-    socket.leave(prevRoomId);
-
-    if (prevRoomId === HANDY_ROOM_ID && prevRoom.currentSpeaker === userId) {
-      prevRoom.currentSpeaker = null;
-      io.to(HANDY_ROOM_ID).emit('talk_token_released', { roomId: HANDY_ROOM_ID, currentSpeaker: null });
+    if (prevRoomId && rooms.has(prevRoomId)) {
+      const prevRoom = rooms.get(prevRoomId);
+      prevRoom.users.delete(userId);
+      socket.leave(prevRoomId);
+      
+      // Lógica de liberación de token PTT si estaba hablando
+      if (prevRoomId === HANDY_ROOM_ID && prevRoom.currentSpeaker === userId) {
+          prevRoom.currentSpeaker = null;
+          io.to(HANDY_ROOM_ID).emit('talk_token_released', { roomId: HANDY_ROOM_ID, currentSpeaker: null });
+          console.log(`🔇 Token PTT liberado por ${userId} al cambiar de sala.`);
+      }
+      
+      io.to(prevRoomId).emit('user-left-room', { roomId: prevRoomId, userCount: prevRoom.users.size });
     }
-
-    io.to(prevRoomId).emit('user-left-room', { roomId: prevRoomId, userCount: prevRoom.users.size });
   };
 
-  // --- join_general_chat ---
+  // ✅ CORREGIDO: En join_general_chat y join_handy_chat
   socket.on('join_general_chat', (userData) => {
+    console.log('🎯 RECIBIENDO join_general_chat:', userData);
+    
     const { userId, username } = userData;
-    if (!userId || !username) return;
+    
+    if (!userId || !username) {
+        console.error('❌ join_general_chat: Usuario o username no definidos.');
+        return;
+    }
 
+    // Eliminar usuario de la sala anterior y limpiar token
     leaveCurrentRoom(userId, socket);
 
+    // Unir a la sala general
     socket.join(GENERAL_ROOM_ID);
     rooms.get(GENERAL_ROOM_ID).users.add(userId);
     userToRoomMap.set(userId, GENERAL_ROOM_ID);
 
-    console.log(`👤 ${username} se unió a General.`);
-
-    const roomUsers = Array.from(rooms.get(GENERAL_ROOM_ID).users)
-      .map(id => connectedUsers.get(id))
-      .filter(Boolean);
-
-    socket.emit('join_success', {
-      message: 'Te uniste al chat General.',
-      users: roomUsers,
-      currentSpeaker: rooms.get(GENERAL_ROOM_ID).currentSpeaker,
+    console.log(`👤 ${username} se ha unido a la sala general.`);
+    
+    // ✅ CORREGIDO: Enviar usuarios COMPLETOS, no solo IDs
+    const roomUsers = Array.from(rooms.get(GENERAL_ROOM_ID).users).map(userId => {
+        const user = connectedUsers.get(userId);
+        return user ? {
+            id: user.id,
+            username: user.username,
+            isOnline: true,
+            status: "Online", 
+            presence: "Available"
+        } : null;
+    }).filter(user => user !== null);
+    
+    socket.emit('join_success', { 
+        message: 'Te has unido a la sala General.', 
+        users: roomUsers,  // ✅ AHORA objetos completos
+        currentSpeaker: rooms.get(GENERAL_ROOM_ID).currentSpeaker
     });
-
-    io.to(GENERAL_ROOM_ID).emit('user-joined-room', {
-      roomId: GENERAL_ROOM_ID,
-      userCount: rooms.get(GENERAL_ROOM_ID).users.size,
-    });
+    
+    // Notificar a la sala del cambio de conteo
+    io.to(GENERAL_ROOM_ID).emit('user-joined-room', { roomId: GENERAL_ROOM_ID, userCount: rooms.get(GENERAL_ROOM_ID).users.size });
+    
+    console.log(`✅ join_general_chat COMPLETADO para: ${username}`);
   });
 
-  // --- join_handy_chat ---
+  // ✅ Manejar unión a la sala Handy (PTT) - CORREGIDO
   socket.on('join_handy_chat', (userData) => {
+    console.log('🎯 RECIBIENDO join_handy_chat:', userData);
+    
+    // ✅ CORRECCIÓN: Usar directamente el objeto (Socket.IO ya lo parseó)
     const { userId, username } = userData;
-    if (!userId || !username) return;
+    
+    if (!userId || !username) {
+      console.error('❌ join_handy_chat: Usuario o username no definidos.');
+      return;
+    }
 
+    // Eliminar usuario de la sala anterior y limpiar token
     leaveCurrentRoom(userId, socket);
 
+    // Unir a la sala handy
     socket.join(HANDY_ROOM_ID);
     rooms.get(HANDY_ROOM_ID).users.add(userId);
     userToRoomMap.set(userId, HANDY_ROOM_ID);
 
-    console.log(`👤 ${username} se unió a Handy.`);
-
-    const roomUsers = Array.from(rooms.get(HANDY_ROOM_ID).users)
-      .map(id => connectedUsers.get(id))
-      .filter(Boolean);
-
-    socket.emit('join_success', {
-      message: 'Te uniste a Handy (PTT).',
-      users: roomUsers,
-      currentSpeaker: rooms.get(HANDY_ROOM_ID).currentSpeaker,
+    console.log(`👤 ${username} se ha unido a la sala Handy (PTT).`);
+    
+    // ✅ CORREGIDO: Enviar usuarios COMPLETOS, no solo IDs
+    const roomUsers = Array.from(rooms.get(HANDY_ROOM_ID).users).map(userId => {
+        const user = connectedUsers.get(userId);
+        return user ? {
+            id: user.id,
+            username: user.username,
+            isOnline: true,
+            status: "Online", 
+            presence: "Available"
+        } : null;
+    }).filter(user => user !== null);
+    
+    socket.emit('join_success', { 
+        message: 'Te has unido a la sala Handy (PTT).', 
+        users: roomUsers,  // ✅ AHORA objetos completos
+        currentSpeaker: rooms.get(HANDY_ROOM_ID).currentSpeaker
     });
-
-    io.to(HANDY_ROOM_ID).emit('user-joined-room', {
-      roomId: HANDY_ROOM_ID,
-      userCount: rooms.get(HANDY_ROOM_ID).users.size,
-    });
+    
+    io.to(HANDY_ROOM_ID).emit('user-joined-room', { roomId: HANDY_ROOM_ID, userCount: rooms.get(HANDY_ROOM_ID).users.size });
+    
+    console.log(`✅ join_handy_chat COMPLETADO para: ${username}`);
   });
 
-  // --- Token PTT ---
-  socket.on('request_talk_token', ({ userId, roomId }) => {
+  // --- Lógica PTT (Token de Palabra) ---
+
+  // ✅ NUEVO: Manejar solicitud del token de palabra (PTT Press)
+  socket.on('request_talk_token', (data) => {
+    console.log('🎯 RECIBIENDO request_talk_token:', data);
+    
+    const { userId, roomId } = data;
+    
+    // Solo aplica a la sala PTT
     if (roomId !== HANDY_ROOM_ID || !userId) return;
+
     const room = rooms.get(roomId);
     if (!room || !connectedUsers.has(userId)) return;
 
-    if (!room.currentSpeaker) {
-      room.currentSpeaker = userId;
-      io.to(roomId).emit('talk_token_granted', { roomId, currentSpeaker: userId });
+    if (room.currentSpeaker === null) {
+        // Token concedido (Usuario empieza a hablar)
+        room.currentSpeaker = userId;
+        const username = connectedUsers.get(userId)?.username || userId;
+        console.log(`🎙️ ${username} ha tomado el token de palabra en ${roomId}.`);
+        
+        // Notificar a todos en la sala (incluido el emisor)
+        io.to(roomId).emit('talk_token_granted', { 
+            roomId, 
+            currentSpeaker: userId, 
+            username
+        });
     } else if (room.currentSpeaker !== userId) {
-      socket.emit('talk_token_denied', { roomId, currentSpeaker: room.currentSpeaker });
+        // Token denegado (Alguien más está hablando)
+        console.log(`🚫 ${userId} intentó hablar, pero ${room.currentSpeaker} ya tiene el token.`);
+        socket.emit('talk_token_denied', { 
+            roomId, 
+            currentSpeaker: room.currentSpeaker 
+        });
     }
   });
 
-  socket.on('release_talk_token', ({ userId, roomId }) => {
+  // ✅ NUEVO: Manejar liberación del token de palabra (PTT Release)
+  socket.on('release_talk_token', (data) => {
+    console.log('🎯 RECIBIENDO release_talk_token:', data);
+    
+    const { userId, roomId } = data;
+    
+    // Solo aplica a la sala PTT
     if (roomId !== HANDY_ROOM_ID || !userId) return;
+
     const room = rooms.get(roomId);
-    if (room?.currentSpeaker === userId) {
-      room.currentSpeaker = null;
-      io.to(roomId).emit('talk_token_released', { roomId, currentSpeaker: null });
+    if (!room) return;
+
+    if (room.currentSpeaker === userId) {
+        // Token liberado
+        room.currentSpeaker = null;
+        console.log(`🔇 ${userId} ha liberado el token de palabra en ${roomId}.`);
+        
+        // Notificar a todos en la sala
+        io.to(roomId).emit('talk_token_released', { 
+            roomId, 
+            currentSpeaker: null 
+        });
     }
   });
 
-  // --- Mensajes ---
-  socket.on('send_message', async ({ userId, username, text, roomId }) => {
-    if (!text || !userId || !username || !roomId) return;
+  // ----------------------------------------
+
+  // ✅ Manejar el envío de mensajes de texto
+  socket.on('send_message', async (data) => {
+    console.log('🎯🎯🎯 RECIBIENDO send_message:', data);
+    
+    const { userId, username, text, roomId } = data;
+    
+    if (!text || !userId || !username || !roomId) {
+      console.error('❌ send_message: Datos incompletos');
+      console.error('   - userId:', userId);
+      console.error('   - username:', username);
+      console.error('   - text:', text);
+      console.error('   - roomId:', roomId);
+      return;
+    }
 
     const newMessage = {
       id: uuidv4(),
@@ -231,34 +343,66 @@ io.on('connection', (socket) => {
       username,
       text,
       roomId,
-      timestamp: admin.firestore.FieldValue.serverTimestamp(),
+      timestamp: admin.firestore.FieldValue.serverTimestamp()
     };
+
+    console.log('📝 CREANDO NUEVO MENSAJE:', newMessage);
 
     try {
       await db.collection(MESSAGES_COLLECTION).add(newMessage);
+      console.log('💾 Mensaje guardado en Firestore');
+      
+      console.log('📤📤📤 EMITIENDO new_message a sala:', roomId);
+      console.log('📦 Datos a emitir:', newMessage);
+      
       io.to(roomId).emit('new_message', newMessage);
-    } catch (err) {
-      console.error('❌ Error guardando mensaje:', err);
+      console.log('✅✅✅ new_message ENVIADO CORRECTAMENTE');
+      
+    } catch (error) {
+      console.error('❌❌❌ ERROR al guardar/emitir mensaje:', error);
     }
   });
 
-  socket.on('audio_message', async ({ userId, username, audioData, roomId }) => {
-    if (!audioData || !userId || !username || !roomId) return;
-
+  // ✅ Manejar el envío de mensajes de audio (Base64)
+  socket.on('audio_message', async (data) => {
+    console.log('🎯🎯🎯 RECIBIENDO audio_message:', data);
+    
+    const { userId, username, audioData, roomId } = data;
+    
+    // --- Lógica de PTT AÑADIDA: Bloquear si no tiene el token ---
     if (roomId === HANDY_ROOM_ID) {
-      const room = rooms.get(roomId);
-      if (!room || room.currentSpeaker !== userId) {
-        socket.emit('audio_transmission_failed', { message: 'No tienes el token PTT.' });
-        return;
-      }
+        const room = rooms.get(roomId);
+        // Si es una sala Handy, verifica si el usuario tiene el token.
+        // El cliente debe liberar el token *después* de que este mensaje haya terminado de subir.
+        if (!room || room.currentSpeaker !== userId) {
+            console.warn(`⚠️ Rechazando audio de ${username} en sala PTT. No tienen el token.`);
+            // Informar al cliente que la transmisión fue abortada.
+            socket.emit('audio_transmission_failed', { message: 'No tienes el token de palabra (PTT).' });
+            return;
+        }
     }
+    // --- FIN Lógica de PTT AÑADIDA ---
 
     try {
-      const buffer = Buffer.from(audioData, 'base64');
+      console.log(`✅ Recibiendo mensaje de audio de ${username} para la sala ${roomId}`);
+
+      if (!audioData || !userId || !username || !roomId) {
+        throw new Error('Datos de audio o de la sala no proporcionados.');
+      }
+
+      // ✅ Decodificar la cadena Base64 a un buffer binario
+      const audioDataBuffer = Buffer.from(audioData, 'base64');
+      // Usamos .m4a que es un formato común para AAC (codec de Android)
       const uniqueFileName = `audios/${roomId}/${userId}_${Date.now()}_${uuidv4()}.m4a`;
       const file = bucket.file(uniqueFileName);
 
-      await file.save(buffer, { contentType: 'audio/m4a', resumable: false });
+      // Subir el archivo de audio a Firebase Storage
+      await file.save(audioDataBuffer, {
+        contentType: 'audio/m4a',
+        resumable: false
+      });
+
+      // ✅ CORRECCIÓN: Hacer el archivo público y obtener la URL de acceso directo
       await file.makePublic();
       const url = file.publicUrl();
 
@@ -268,35 +412,70 @@ io.on('connection', (socket) => {
         username,
         audioUrl: url,
         roomId,
-        timestamp: admin.firestore.FieldValue.serverTimestamp(),
+        timestamp: admin.firestore.FieldValue.serverTimestamp()
       };
 
       await db.collection(MESSAGES_COLLECTION).add(audioMessage);
+      
+      console.log('📤📤📤 EMITIENDO new_message (audio) a sala:', roomId);
+      console.log('📦 Datos audio a emitir:', audioMessage);
+      
       io.to(roomId).emit('new_message', audioMessage);
-    } catch (err) {
-      console.error('❌ Error audio:', err);
+      console.log(`✅✅✅ Audio de ${username} subido y compartido. URL: ${url}`);
+    } catch (error) {
+      console.error('❌ Error al procesar el mensaje de audio:', error);
       socket.emit('audioUploadError', { message: 'Error al subir el audio.' });
     }
   });
 
-  // --- Desconexión ---
+  // ✅ Manejar la desconexión
   socket.on('disconnect', () => {
+    console.log(`🔴 Usuario desconectado: ${socket.id}`);
+    
+    // 1. Obtener el userId usando el nuevo mapa (CRÍTICO)
     const userId = socketToUserMap.get(socket.id);
+    
     if (userId) {
-      const user = connectedUsers.get(userId);
-      if (user?.socketId === socket.id) {
-        leaveCurrentRoom(userId, socket);
-        connectedUsers.delete(userId);
-        userToRoomMap.delete(userId);
-        io.emit('user-list', Array.from(connectedUsers.values()));
-      }
-      socketToUserMap.delete(socket.id);
+        const user = connectedUsers.get(userId);
+        
+        // 2. Solo proceder si el socket ID que se desconecta es el último que se registró (para evitar desconexiones accidentales)
+        if (user && user.socketId === socket.id) { 
+            // 3. Eliminar usuario de la sala actual y limpiar token
+            leaveCurrentRoom(userId, socket); // Reutilizar la función de limpieza
+            
+            // 4. Eliminar del mapa de usuarios conectados únicos
+            connectedUsers.delete(userId);
+            userToRoomMap.delete(userId);
+            
+            console.log(`❌ Usuario desconectado: ${user.username}`);
+            
+            // 5. Emitir la lista actualizada de usuarios
+            io.emit('user-list', Array.from(connectedUsers.values()));
+        } else if (user) {
+            console.log(`⚠️ Socket secundario ${socket.id} de ${user.username} desconectado. El usuario sigue conectado.`);
+        }
+        
+        // 6. Eliminar el mapeo del socket
+        socketToUserMap.delete(socket.id);
+
+    } else {
+      console.log(`❌ Usuario desconocido desconectado: ${socket.id}`);
     }
-    console.log(`🔴 Socket desconectado: ${socket.id}`);
   });
 });
 
 const PORT = process.env.PORT || 8080;
 server.listen(PORT, () => {
-  console.log(`🚀 Servidor en puerto ${PORT}`);
+  console.log(`🚀 Servidor Express con Socket.IO ejecutándose en el puerto ${PORT}`);
+  console.log('📍 URL local: http://localhost:8080');
+  console.log('📊 Estado: http://localhost:8080/health');
+  console.log('👥 Usuarios: http://localhost:8080/users');
+  console.log('🚪 Salas: http://localhost:8080/rooms');
+  console.log('💬 Funcionalidades implementadas:');
+  console.log('   - Chat en tiempo real');
+  console.log('   - Gestión de salas de chat (General y PTT)');
+  console.log('   - Compartir audio (con Firebase Storage)');
+  console.log('   - Control PTT (Push-To-Talk) para Sala Handy');
+  console.log('   - API REST para monitoreo');
+  console.log('   - CORS configurado para desarrollo');
 });
