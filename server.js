@@ -169,7 +169,7 @@ io.on('connection', (socket) => {
     }
   };
 
-  // ✅ CORREGIDO: En join_general_chat y join_handy_chat
+  // ✅ CORREGIDO: En join_general_chat - CON roomId EN LA RESPUESTA
   socket.on('join_general_chat', (userData) => {
     console.log('🎯 RECIBIENDO join_general_chat:', userData);
     
@@ -202,10 +202,13 @@ io.on('connection', (socket) => {
         } : null;
     }).filter(user => user !== null);
     
+    // ✅✅✅ CRÍTICO CORREGIDO: Agregar roomId a la respuesta
     socket.emit('join_success', { 
         message: 'Te has unido a la sala General.', 
-        users: roomUsers,  // ✅ AHORA objetos completos
-        currentSpeaker: rooms.get(GENERAL_ROOM_ID).currentSpeaker
+        roomId: GENERAL_ROOM_ID, // ✅ ESTE CAMPO FALTABA - AHORA SÍ ESTÁ
+        users: roomUsers,
+        currentSpeaker: rooms.get(GENERAL_ROOM_ID).currentSpeaker,
+        userCount: rooms.get(GENERAL_ROOM_ID).users.size
     });
     
     // Notificar a la sala del cambio de conteo
@@ -214,7 +217,7 @@ io.on('connection', (socket) => {
     console.log(`✅ join_general_chat COMPLETADO para: ${username}`);
   });
 
-  // ✅ Manejar unión a la sala Handy (PTT) - CORREGIDO
+  // ✅ CORREGIDO: Manejar unión a la sala Handy (PTT) - CON roomId EN LA RESPUESTA
   socket.on('join_handy_chat', (userData) => {
     console.log('🎯 RECIBIENDO join_handy_chat:', userData);
     
@@ -248,10 +251,13 @@ io.on('connection', (socket) => {
         } : null;
     }).filter(user => user !== null);
     
+    // ✅✅✅ CRÍTICO CORREGIDO: Agregar roomId a la respuesta
     socket.emit('join_success', { 
         message: 'Te has unido a la sala Handy (PTT).', 
-        users: roomUsers,  // ✅ AHORA objetos completos
-        currentSpeaker: rooms.get(HANDY_ROOM_ID).currentSpeaker
+        roomId: HANDY_ROOM_ID, // ✅ ESTE CAMPO FALTABA - AHORA SÍ ESTÁ
+        users: roomUsers,
+        currentSpeaker: rooms.get(HANDY_ROOM_ID).currentSpeaker,
+        userCount: rooms.get(HANDY_ROOM_ID).users.size
     });
     
     io.to(HANDY_ROOM_ID).emit('user-joined-room', { roomId: HANDY_ROOM_ID, userCount: rooms.get(HANDY_ROOM_ID).users.size });
