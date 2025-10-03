@@ -169,9 +169,9 @@ io.on('connection', (socket) => {
     }
   };
 
-  // ✅ CORREGIDO: En join_general_chat - CON roomId EN LA RESPUESTA
+  // ✅✅✅ CORREGIDO: join_general_chat - CON ENVÍO EXPLÍCITO DE join_success
   socket.on('join_general_chat', (userData) => {
-    console.log('🎯 RECIBIENDO join_general_chat:', userData);
+    console.log('🎯🎯🎯 RECIBIENDO join_general_chat:', userData);
     
     const { userId, username } = userData;
     
@@ -202,26 +202,38 @@ io.on('connection', (socket) => {
         } : null;
     }).filter(user => user !== null);
     
-    // ✅✅✅ CRÍTICO CORREGIDO: Agregar roomId a la respuesta
-    socket.emit('join_success', { 
+    // ✅✅✅ CRÍTICO CORREGIDO: ENVÍO EXPLÍCITO CON DEBUG
+    const joinSuccessData = { 
         message: 'Te has unido a la sala General.', 
-        roomId: GENERAL_ROOM_ID, // ✅ ESTE CAMPO FALTABA - AHORA SÍ ESTÁ
+        roomId: GENERAL_ROOM_ID,
         users: roomUsers,
         currentSpeaker: rooms.get(GENERAL_ROOM_ID).currentSpeaker,
         userCount: rooms.get(GENERAL_ROOM_ID).users.size
-    });
+    };
+    
+    console.log('📤📤📤 ENVIANDO join_success AL CLIENTE:');
+    console.log('   - Socket ID destino:', socket.id);
+    console.log('   - Usuario destino:', username);
+    console.log('   - Datos a enviar:', JSON.stringify(joinSuccessData, null, 2));
+    
+    // ✅✅✅ ENVIAR join_success EXPLÍCITAMENTE
+    socket.emit('join_success', joinSuccessData);
+    
+    console.log('✅✅✅ join_success ENVIADO EXITOSAMENTE');
     
     // Notificar a la sala del cambio de conteo
-    io.to(GENERAL_ROOM_ID).emit('user-joined-room', { roomId: GENERAL_ROOM_ID, userCount: rooms.get(GENERAL_ROOM_ID).users.size });
+    io.to(GENERAL_ROOM_ID).emit('user-joined-room', { 
+        roomId: GENERAL_ROOM_ID, 
+        userCount: rooms.get(GENERAL_ROOM_ID).users.size 
+    });
     
     console.log(`✅ join_general_chat COMPLETADO para: ${username}`);
   });
 
-  // ✅ CORREGIDO: Manejar unión a la sala Handy (PTT) - CON roomId EN LA RESPUESTA
+  // ✅✅✅ CORREGIDO: join_handy_chat - CON ENVÍO EXPLÍCITO DE join_success
   socket.on('join_handy_chat', (userData) => {
-    console.log('🎯 RECIBIENDO join_handy_chat:', userData);
+    console.log('🎯🎯🎯 RECIBIENDO join_handy_chat:', userData);
     
-    // ✅ CORRECCIÓN: Usar directamente el objeto (Socket.IO ya lo parseó)
     const { userId, username } = userData;
     
     if (!userId || !username) {
@@ -251,16 +263,29 @@ io.on('connection', (socket) => {
         } : null;
     }).filter(user => user !== null);
     
-    // ✅✅✅ CRÍTICO CORREGIDO: Agregar roomId a la respuesta
-    socket.emit('join_success', { 
+    // ✅✅✅ CRÍTICO CORREGIDO: ENVÍO EXPLÍCITO CON DEBUG
+    const joinSuccessData = { 
         message: 'Te has unido a la sala Handy (PTT).', 
-        roomId: HANDY_ROOM_ID, // ✅ ESTE CAMPO FALTABA - AHORA SÍ ESTÁ
+        roomId: HANDY_ROOM_ID,
         users: roomUsers,
         currentSpeaker: rooms.get(HANDY_ROOM_ID).currentSpeaker,
         userCount: rooms.get(HANDY_ROOM_ID).users.size
-    });
+    };
     
-    io.to(HANDY_ROOM_ID).emit('user-joined-room', { roomId: HANDY_ROOM_ID, userCount: rooms.get(HANDY_ROOM_ID).users.size });
+    console.log('📤📤📤 ENVIANDO join_success AL CLIENTE:');
+    console.log('   - Socket ID destino:', socket.id);
+    console.log('   - Usuario destino:', username);
+    console.log('   - Datos a enviar:', JSON.stringify(joinSuccessData, null, 2));
+    
+    // ✅✅✅ ENVIAR join_success EXPLÍCITAMENTE
+    socket.emit('join_success', joinSuccessData);
+    
+    console.log('✅✅✅ join_success ENVIADO EXITOSAMENTE');
+    
+    io.to(HANDY_ROOM_ID).emit('user-joined-room', { 
+        roomId: HANDY_ROOM_ID, 
+        userCount: rooms.get(HANDY_ROOM_ID).users.size 
+    });
     
     console.log(`✅ join_handy_chat COMPLETADO para: ${username}`);
   });
