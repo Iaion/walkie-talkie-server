@@ -290,6 +290,138 @@ io.on('connection', (socket) => {
     console.log(`✅ join_handy_chat COMPLETADO para: ${username}`);
   });
 
+  // ✅✅✅ NUEVO: Manejar join_room (compatible con Android)
+  socket.on('join_room', (data) => {
+    console.log('🎯🎯🎯 RECIBIENDO join_room:', data);
+    
+    const { room, userId, username } = data;
+    
+    if (!room || !userId || !username) {
+        console.error('❌ join_room: Datos incompletos');
+        console.error('   - room:', room);
+        console.error('   - userId:', userId);
+        console.error('   - username:', username);
+        socket.emit('join_error', { message: 'Datos de unión incompletos' });
+        return;
+    }
+
+    // Validar que la sala existe
+    if (!rooms.has(room)) {
+        console.error('❌ join_room: Sala no existe:', room);
+        socket.emit('join_error', { message: `La sala ${room} no existe` });
+        return;
+    }
+
+    console.log(`🔄 Uniendo usuario ${username} a sala: ${room}`);
+
+    // Eliminar usuario de la sala anterior y limpiar token
+    leaveCurrentRoom(userId, socket);
+
+    // Unir a la nueva sala
+    socket.join(room);
+    rooms.get(room).users.add(userId);
+    userToRoomMap.set(userId, room);
+
+    console.log(`👤 ${username} se ha unido a la sala ${room}.`);
+    
+    // Obtener usuarios completos de la sala
+    const roomUsers = Array.from(rooms.get(room).users).map(userId => {
+        const user = connectedUsers.get(userId);
+        return user ? {
+            id: user.id,
+            username: user.username,
+            isOnline: true,
+            status: "Online", 
+            presence: "Available"
+        } : null;
+    }).filter(user => user !== null);
+    
+    // ✅✅✅ ENVÍO EXPLÍCITO DE join_success
+    const joinSuccessData = { 
+        message: `Te has unido a la sala ${room}.`, 
+        room: room,
+        users: roomUsers,
+        currentSpeaker: rooms.get(room).currentSpeaker,
+        userCount: rooms.get(room).users.size
+    };
+    
+    console.log('📤📤📤 ENVIANDO join_success AL CLIENTE:');
+    console.log('   - Socket ID destino:', socket.id);
+    console.log('   - Usuario destino:', username);
+    console.log('   - Sala:', room);
+    console.log('   - Datos a enviar:', JSON.stringify(joinSuccessData, null, 2));
+    
+    // ✅✅✅ ENVIAR join_success EXPLÍCITAMENTE
+    socket.emit('join_success', joinSuccessData);
+    
+    console.log('✅✅✅ join_success ENVIADO EXITOSAMENTE');
+    
+    // Notificar a la sala del cambio de conteo
+    io.to(room).emit('user-joined-room', { 
+        roomId: room, 
+        userCount: rooms.get(room).users.size 
+    });
+    
+    console.log(`✅ join_room COMPLETADO para: ${username} en sala: ${room}`);
+  });
+
+  // ✅✅✅ NUEVO: Manejar get_rooms (compatible con Android)
+  socket.on('get_rooms', () => {
+    console.log('🎯 RECIBIENDO get_rooms de:', socket.id);
+    
+    const roomsArray = Array.from(rooms.values()).map(room => ({
+        id: room.id,
+        name: room.name,
+        description: room.description,
+        userCount: room.users.size,
+        type: room.id === GENERAL_ROOM_ID ? 'general' : 'ptt',
+        currentSpeaker: room.currentSpeaker || null
+    }));
+    
+    console.log('📤 Enviando room_list con salas:', roomsArray.length);
+    socket.emit('room_list', roomsArray);
+  });
+
+  // ✅✅✅ NUEVO: Manejar get_room_users (compatible con Android)
+  socket.on('get_room_users', (roomName) => {
+    console.log('🎯 RECIBIENDO get_room_users para sala:', roomName);
+    
+    if (!roomName || !rooms.has(roomName)) {
+        console.error('❌ get_room_users: Sala no existe:', roomName);
+        return;
+    }
+    
+    const roomUsers = Array.from(rooms.get(roomName).users).map(userId => {
+        const user = connectedUsers.get(userId);
+        return user ? {
+            id: user.id,
+            username: user.username,
+            isOnline: true,
+            status: "Online", 
+            presence: "Available"
+        } : null;
+    }).filter(user => user !== null);
+    
+    console.log('📤 Enviando users_list para sala:', roomName, '- Usuarios:', roomUsers.length);
+    socket.emit('users_list', roomUsers);
+  });
+
+  // ✅✅✅ NUEVO: Manejar get_all_users (compatible con Android)
+  socket.on('get_all_users', () => {
+    console.log('🎯 RECIBIENDO get_all_users de:', socket.id);
+    
+    const allUsers = Array.from(connectedUsers.values()).map(user => ({
+        id: user.id,
+        username: user.username,
+        isOnline: true,
+        status: "Online",
+        presence: "Available"
+    }));
+    
+    console.log('📤 Enviando connected_users - Total usuarios:', allUsers.length);
+    socket.emit('connected_users', allUsers);
+  });
+
   // --- Lógica PTT (Token de Palabra) ---
 
   // ✅ NUEVO: Manejar solicitud del token de palabra (PTT Press)
