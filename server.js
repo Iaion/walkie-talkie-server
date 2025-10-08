@@ -1,6 +1,8 @@
-// Servidor Node.js con Socket.IO, Firebase Firestore y Storage
-// 💬 Totalmente compatible con tu app Android (SocketRepository + ChatViewModel actual)
-// 🎨 Logs con colores y emojis para depuración detallada
+// ============================================================
+// 🌐 Servidor Node.js con Socket.IO, Firebase Firestore y Storage
+// 💬 Compatible con tu app Android (SocketRepository + ChatViewModel actual)
+// 🎨 Logs con colores y emojis para depuración
+// ============================================================
 
 const express = require("express");
 const http = require("http");
@@ -25,18 +27,16 @@ const app = express();
 const server = http.createServer(app);
 const io = socketIo(server, {
   cors: { origin: "*", methods: ["GET", "POST"] },
-  maxHttpBufferSize: 1e8,
+  maxHttpBufferSize: 1e8, // Permite audios grandes
 });
 
 app.use(cors());
+app.use(express.json());
 
-// -------------------------------
-// 🔥 Firebase init
-// -------------------------------
-if (
-  !process.env.GOOGLE_APPLICATION_CREDENTIALS ||
-  !process.env.FIREBASE_STORAGE_BUCKET
-) {
+// ============================================================
+// 🔥 Inicialización de Firebase
+// ============================================================
+if (!process.env.GOOGLE_APPLICATION_CREDENTIALS || !process.env.FIREBASE_STORAGE_BUCKET) {
   console.error(`${colors.red}❌ Falta configuración de Firebase${colors.reset}`);
   process.exit(1);
 }
@@ -59,61 +59,48 @@ const bucket = admin.storage().bucket();
 const USERS_COLLECTION = "users";
 const MESSAGES_COLLECTION = "messages";
 
-// -------------------------------
+// ============================================================
 // 📦 Estado en memoria
-// -------------------------------
-const connectedUsers = new Map(); // userId -> { id, username, email, socketId }
+// ============================================================
+const connectedUsers = new Map(); // userId -> { id, username, socketId }
 const socketToUserMap = new Map(); // socket.id -> userId
-const rooms = new Map(); // roomId -> { id, name, description, users:Set, type, isPrivate }
+const rooms = new Map(); // roomId -> { id, name, users:Set }
 const userToRoomMap = new Map(); // userId -> roomId
 
-// -------------------------------
+// ============================================================
 // 🚪 Salas base
-// -------------------------------
+// ============================================================
 const SALAS_ROOM_ID = "salas";
 const GENERAL_ROOM_ID = "general";
 const HANDY_ROOM_ID = "handy";
 
-rooms.set(SALAS_ROOM_ID, {
-  id: SALAS_ROOM_ID,
-  name: "Lobby de Salas",
-  description: "Pantalla de selección de salas",
-  users: new Set(),
-  type: "lobby",
-  isPrivate: false,
-});
+function createRoom(id, name, description, type) {
+  return {
+    id,
+    name,
+    description,
+    users: new Set(),
+    type,
+    isPrivate: false,
+  };
+}
 
-rooms.set(GENERAL_ROOM_ID, {
-  id: GENERAL_ROOM_ID,
-  name: "Chat General",
-  description: "Sala de chat público",
-  users: new Set(),
-  type: "general",
-  isPrivate: false,
-});
+rooms.set(SALAS_ROOM_ID, createRoom("salas", "Lobby de Salas", "Pantalla de selección de salas", "lobby"));
+rooms.set(GENERAL_ROOM_ID, createRoom("general", "Chat General", "Sala de chat público", "general"));
+rooms.set(HANDY_ROOM_ID, createRoom("handy", "Radio Handy (PTT)", "Simulación de radio PTT", "ptt"));
 
-rooms.set(HANDY_ROOM_ID, {
-  id: HANDY_ROOM_ID,
-  name: "Radio Handy (PTT)",
-  description: "Simulación de radio PTT",
-  users: new Set(),
-  type: "ptt",
-  isPrivate: false,
-});
-
-// -------------------------------
+// ============================================================
 // 🔧 Helpers
-// -------------------------------
+// ============================================================
 function serializeRoom(room) {
   return {
     id: room.id,
     name: room.name,
-    description: room.description || "",
-    userCount: room.users?.size || 0,
+    description: room.description,
+    userCount: room.users.size,
     maxUsers: 50,
     type: room.type,
     isPrivate: !!room.isPrivate,
-    currentSpeakerId: room.currentSpeaker || null,
   };
 }
 
@@ -124,27 +111,26 @@ function serializeRooms() {
 function getRoomUsers(roomId) {
   const room = rooms.get(roomId);
   if (!room) return [];
-  return Array.from(room.users)
-    .map((id) => connectedUsers.get(id))
-    .filter(Boolean);
+  return Array.from(room.users).map((id) => connectedUsers.get(id)).filter(Boolean);
 }
 
-// -------------------------------
+// ============================================================
 // 🌐 Endpoints REST
-// -------------------------------
-app.get("/health", (_, res) => res.status(200).send("Servidor operativo."));
+// ============================================================
+app.get("/health", (_, res) => res.status(200).send("Servidor operativo 🚀"));
 app.get("/users", (_, res) => res.json(Array.from(connectedUsers.values())));
 app.get("/rooms", (_, res) => res.json(serializeRooms()));
 
-// -------------------------------
-// 🔌 Conexión Socket.IO
-// -------------------------------
+// ============================================================
+// 🔌 Socket.IO
+// ============================================================
 io.on("connection", (socket) => {
   console.log(`${colors.cyan}✅ Nuevo socket conectado: ${socket.id}${colors.reset}`);
 
-  // 📥 Registro de usuario
+  // ============================================================
+  // 🧩 Usuario conectado
+  // ============================================================
   socket.on("user-connected", async (user) => {
-    console.log(`${colors.blue}📥 user-connected:${colors.reset}`, user);
     if (!user || !user.id || !user.username) {
       console.warn(`${colors.yellow}⚠️ Datos de usuario inválidos.${colors.reset}`);
       return;
@@ -156,21 +142,12 @@ io.on("connection", (socket) => {
     try {
       const userDoc = db.collection(USERS_COLLECTION).doc(user.id);
       const snapshot = await userDoc.get();
-
       if (snapshot.exists) {
-        await userDoc.update({
-          ...user,
-          isOnline: true,
-          lastLogin: Date.now(),
-        });
+        await userDoc.update({ ...user, isOnline: true, lastLogin: Date.now() });
       } else {
-        await userDoc.set({
-          ...user,
-          isOnline: true,
-          createdAt: Date.now(),
-        });
+        await userDoc.set({ ...user, isOnline: true, createdAt: Date.now() });
       }
-      console.log(`${colors.green}🔑 Usuario sincronizado en Firebase: ${user.username}${colors.reset}`);
+      console.log(`${colors.green}🔑 Usuario sincronizado: ${user.username}${colors.reset}`);
     } catch (error) {
       console.error(`${colors.red}❌ Error registrando usuario en Firebase:${colors.reset}`, error);
     }
@@ -179,22 +156,13 @@ io.on("connection", (socket) => {
     socket.emit("room_list", serializeRooms());
   });
 
-  // 🧩 Aux: salir de sala actual
-  const leaveCurrentRoom = (userId, socketInstance) => {
-    const prevRoomId = userToRoomMap.get(userId);
-    if (prevRoomId && rooms.has(prevRoomId)) {
-      const room = rooms.get(prevRoomId);
-      room.users.delete(userId);
-      socketInstance.leave(prevRoomId);
-      io.to(prevRoomId).emit("user-left-room", { roomId: prevRoomId, userCount: room.users.size });
-      console.log(`${colors.yellow}👋 ${userId} salió de ${prevRoomId}${colors.reset}`);
-    }
-  };
-
-  // 🟢 Unión de salas con ACK
+  // ============================================================
+  // 🚪 Unión de salas con ACK
+  // ============================================================
   socket.on("join_room", (data = {}, ack) => {
     const roomName = data.room || data.roomId;
     const { userId, username } = data;
+
     console.log(`${colors.magenta}📥 join_room:${colors.reset}`, data);
 
     if (!roomName || !userId || !username) {
@@ -214,7 +182,6 @@ io.on("connection", (socket) => {
     const room = rooms.get(roomName);
     const current = userToRoomMap.get(userId);
 
-    // Si ya está dentro
     if (current === roomName) {
       const msg = `ℹ️ ${username} ya estaba en ${roomName}`;
       socket.emit("room_joined", { roomId: roomName, username, userCount: room.users.size });
@@ -223,8 +190,15 @@ io.on("connection", (socket) => {
       return;
     }
 
-    // Salir de sala previa y unir
-    leaveCurrentRoom(userId, socket);
+    // Salir de sala anterior
+    const prevRoomId = userToRoomMap.get(userId);
+    if (prevRoomId && rooms.has(prevRoomId)) {
+      const prev = rooms.get(prevRoomId);
+      prev.users.delete(userId);
+      socket.leave(prevRoomId);
+      io.to(prevRoomId).emit("user-left-room", { roomId: prevRoomId, userCount: prev.users.size });
+    }
+
     socket.join(roomName);
     room.users.add(userId);
     userToRoomMap.set(userId, roomName);
@@ -234,17 +208,43 @@ io.on("connection", (socket) => {
     io.to(roomName).emit("user-joined-room", { roomId: roomName, userCount: users.length });
 
     console.log(`${colors.green}✅ ${username} se unió a ${roomName}${colors.reset}`);
+    if (ack) ack({ success: true, roomId: roomName, message: `Te has unido a ${roomName}` });
+  });
 
-    if (ack) {
-      ack({
-        success: true,
-        roomId: roomName,
-        message: `Te has unido correctamente a ${roomName}`,
-      });
+  // ============================================================
+  // 💬 Mensajes de texto
+  // ============================================================
+  socket.on("send_message", async (data = {}, ack) => {
+    const { userId, username, roomId, text } = data;
+    if (!userId || !username || !roomId || !text) {
+      if (ack) ack({ success: false, message: "Datos de mensaje inválidos" });
+      return;
+    }
+
+    const message = {
+      id: uuidv4(),
+      userId,
+      username,
+      roomId,
+      text,
+      timestamp: Date.now(),
+    };
+
+    try {
+      await db.collection(MESSAGES_COLLECTION).add(message);
+      io.to(roomId).emit("new_message", message);
+      if (ack) ack({ success: true, message: "Mensaje entregado" });
+      socket.emit("message_sent", message);
+      console.log(`${colors.green}💬 ${username} → [${roomId}] ${colors.reset}${text}`);
+    } catch (err) {
+      console.error(`${colors.red}❌ Error guardando mensaje:${colors.reset}`, err);
+      if (ack) ack({ success: false, message: "Error guardando mensaje" });
     }
   });
 
+  // ============================================================
   // 🎧 Mensajes de audio
+  // ============================================================
   socket.on("audio_message", async (data = {}) => {
     const { userId, username, audioData, roomId } = data;
     if (!audioData || !userId || !roomId) return;
@@ -261,8 +261,8 @@ io.on("connection", (socket) => {
         id: uuidv4(),
         userId,
         username,
-        audioUrl: url,
         roomId,
+        audioUrl: url,
         timestamp: Date.now(),
       };
 
@@ -274,23 +274,30 @@ io.on("connection", (socket) => {
     }
   });
 
+  // ============================================================
   // 🔴 Desconexión
+  // ============================================================
   socket.on("disconnect", () => {
     const userId = socketToUserMap.get(socket.id);
     if (userId) {
-      leaveCurrentRoom(userId, socket);
+      const prevRoom = userToRoomMap.get(userId);
+      if (prevRoom && rooms.has(prevRoom)) {
+        const r = rooms.get(prevRoom);
+        r.users.delete(userId);
+        io.to(prevRoom).emit("user-left-room", { roomId: prevRoom, userCount: r.users.size });
+      }
       connectedUsers.delete(userId);
       userToRoomMap.delete(userId);
       io.emit("connected_users", Array.from(connectedUsers.values()));
+      socketToUserMap.delete(socket.id);
     }
-    socketToUserMap.delete(socket.id);
     console.log(`${colors.red}🔴 Socket desconectado:${colors.reset} ${socket.id}`);
   });
 });
 
-// -------------------------------
+// ============================================================
 // 🚀 Iniciar servidor
-// -------------------------------
+// ============================================================
 const PORT = process.env.PORT || 8080;
 server.listen(PORT, () => {
   console.log(`${colors.green}🚀 Servidor corriendo en puerto ${PORT}${colors.reset}`);
