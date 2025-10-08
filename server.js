@@ -187,6 +187,63 @@ io.on('connection', (socket) => {
   };
 
   // 🏠 Unirse a sala (idempotente)
+  socket.on('join_room', (data = {}) => {
+    const roomName = data.room || data.roomId;
+    const { userId, username } = data;
+    console.log(`${colors.cyan}📥 join_room:${colors.reset}`, data);
+
+    if (!roomName || !userId || !username) {
+      socket.emit('join_error', { message: 'Datos de unión incompletos' });
+      return;
+    }
+    if (!rooms.has(roomName)) {
+      socket.emit('join_error', { message: `La sala ${roomName} no existe` });
+      return;
+    }
+
+    const current = userToRoomMap.get(userId);
+    if (current === roomName) {
+      // ✅ Ya está en la sala: confirmar igual para evitar timeouts del cliente
+      const room = rooms.get(roomName);
+      const users = getRoomUsers(roomName);
+      socket.emit('join_success', {
+        message: `Ya estabas en ${roomName}`,
+        room: roomName,
+        roomId: roomName,
+        users,
+        currentSpeaker: room.currentSpeaker,
+        userCount: users.length,
+      });
+      console.log(`${colors.yellow}ℹ️ ${username} ya estaba en ${roomName}${colors.reset}`);
+      return;
+    }
+
+    // Cambio real de sala
+    leaveCurrentRoom(userId, socket);
+    socket.join(roomName);
+    const room = rooms.get(roomName);
+    room.users.add(userId);
+    userToRoomMap.set(userId, roomName);
+
+    const users = getRoomUsers(roomName);
+
+    // ✅ Confirmación para el cliente Android
+    socket.emit('join_success', {
+      message: `Te has unido a ${roomName}`,
+      room: roomName,
+      roomId: roomName,
+      users,
+      currentSpeaker: room.currentSpeaker,
+      userCount: users.length,
+    });
+
+    // Broadcast de actualización de contador
+    io.to(roomName).emit('user-joined-room', { roomId: roomName, userCount: users.length });
+
+    console.log(`${colors.green}✅ ${username} se unió a ${roomName}${colors.reset}`);
+  });
+
+  // 🚪 Salir de sala (desde cliente)
   // 🏠 Unirse a sala (idempotente y compatible con Android)
 socket.on('join_room', (data = {}) => {
   const roomName = data.room || data.roomId;
@@ -253,68 +310,6 @@ socket.on('join_room', (data = {}) => {
   console.log(`${colors.green}✅ ${username} se unió a ${roomName}${colors.reset}`);
 });
 
-    const current = userToRoomMap.get(userId);
-    if (current === roomName) {
-      // ✅ Ya está en la sala: confirmar igual para evitar timeouts del cliente
-      const room = rooms.get(roomName);
-      const users = getRoomUsers(roomName);
-      socket.emit('join_success', {
-        message: `Ya estabas en ${roomName}`,
-        room: roomName,
-        roomId: roomName,
-        users,
-        currentSpeaker: room.currentSpeaker,
-        userCount: users.length,
-      });
-      console.log(`${colors.yellow}ℹ️ ${username} ya estaba en ${roomName}${colors.reset}`);
-      return;
-    }
-
-    // Cambio real de sala
-    leaveCurrentRoom(userId, socket);
-    socket.join(roomName);
-    const room = rooms.get(roomName);
-    room.users.add(userId);
-    userToRoomMap.set(userId, roomName);
-
-    const users = getRoomUsers(roomName);
-
-    // ✅ Confirmación para el cliente Android
-    socket.emit('join_success', {
-      message: `Te has unido a ${roomName}`,
-      room: roomName,
-      roomId: roomName,
-      users,
-      currentSpeaker: room.currentSpeaker,
-      userCount: users.length,
-    });
-
-    // Broadcast de actualización de contador
-    io.to(roomName).emit('user-joined-room', { roomId: roomName, userCount: users.length });
-
-    console.log(`${colors.green}✅ ${username} se unió a ${roomName}${colors.reset}`);
-  });
-
-  // 🚪 Salir de sala (desde cliente)
-  socket.on('leave_room', (data = {}) => {
-    const { roomId, userId, username } = data;
-    if (!userId) return;
-
-    const current = userToRoomMap.get(userId);
-    if (!current) return;
-
-    leaveCurrentRoom(userId, socket);
-
-    // Respuesta opcional al cliente
-    socket.emit('left_room', { roomId: current });
-    console.log(`${colors.yellow}👋 ${username || userId} pidió salir de ${current}${colors.reset}`);
-  });
-
-  // 📋 Solicitar salas
-  socket.on('get_rooms', () => {
-    console.log(`${colors.magenta}📋 get_rooms solicitado${colors.reset}`);
-    socket.emit('room_list', serializeRooms());
-  });
 
   // 👥 Lista de usuarios por sala — alias compatibles con Android
   socket.on('get_users', (data = {}) => {
@@ -323,7 +318,7 @@ socket.on('join_room', (data = {}) => {
     console.log(`${colors.magenta}👥 Enviando usuarios de sala (get_users):${colors.reset} ${roomId}`);
     socket.emit('users_list', users);
   });
-
+ 
 
 
   // (Compatibilidad) nombre anterior
