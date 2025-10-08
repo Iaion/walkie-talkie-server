@@ -12,7 +12,7 @@ const { v4: uuidv4 } = require("uuid");
 const admin = require("firebase-admin");
 const { Buffer } = require("buffer");
 
-// 🎨 Colores ANSI para logs
+// 🎨 Colores ANSI
 const colors = {
   reset: "\x1b[0m",
   cyan: "\x1b[36m",
@@ -35,7 +35,7 @@ app.use(cors());
 app.use(express.json());
 
 // ============================================================
-// 🔥 Inicialización de Firebase
+// 🔥 Firebase
 // ============================================================
 if (!process.env.GOOGLE_APPLICATION_CREDENTIALS || !process.env.FIREBASE_STORAGE_BUCKET) {
   console.error(`${colors.red}❌ Falta configuración de Firebase${colors.reset}`);
@@ -71,17 +71,13 @@ const userToRoomMap = new Map();
 // ============================================================
 // 🚪 Salas base
 // ============================================================
-const SALAS_ROOM_ID = "salas";
-const GENERAL_ROOM_ID = "general";
-const HANDY_ROOM_ID = "handy";
-
 function createRoom(id, name, description, type) {
   return { id, name, description, users: new Set(), type, isPrivate: false };
 }
 
-rooms.set(SALAS_ROOM_ID, createRoom("salas", "Lobby de Salas", "Pantalla de selección de salas", "lobby"));
-rooms.set(GENERAL_ROOM_ID, createRoom("general", "Chat General", "Sala de chat público", "general"));
-rooms.set(HANDY_ROOM_ID, createRoom("handy", "Radio Handy (PTT)", "Simulación de radio PTT", "ptt"));
+rooms.set("salas", createRoom("salas", "Lobby de Salas", "Pantalla principal", "lobby"));
+rooms.set("general", createRoom("general", "Chat General", "Sala pública", "general"));
+rooms.set("handy", createRoom("handy", "Radio Handy (PTT)", "Simulación de radio", "ptt"));
 
 // ============================================================
 // 🔧 Helpers
@@ -97,11 +93,9 @@ function serializeRoom(room) {
     isPrivate: !!room.isPrivate,
   };
 }
-
 function serializeRooms() {
   return Array.from(rooms.values()).map(serializeRoom);
 }
-
 function getRoomUsers(roomId) {
   const room = rooms.get(roomId);
   if (!room) return [];
@@ -124,11 +118,12 @@ io.on("connection", (socket) => {
   // ============================================================
   // 🧩 Usuario conectado
   // ============================================================
-  socket.on("user-connected", async (user) => {
+  socket.on("user-connected", async (user, ack) => {
     console.log(`${colors.blue}📥 user-connected:${colors.reset}`, user);
     if (!user || !user.id || !user.username) {
-      console.warn(`${colors.yellow}⚠️ Datos de usuario inválidos.${colors.reset}`);
-      return;
+      const msg = "⚠️ Datos de usuario inválidos";
+      console.warn(`${colors.yellow}${msg}${colors.reset}`);
+      return ack?.({ success: false, message: msg });
     }
 
     socketToUserMap.set(socket.id, user.id);
@@ -149,26 +144,25 @@ io.on("connection", (socket) => {
 
     io.emit("connected_users", Array.from(connectedUsers.values()));
     socket.emit("room_list", serializeRooms());
+    ack?.({ success: true });
   });
 
   // ============================================================
   // 🚪 Unión de salas
   // ============================================================
   socket.on("join_room", (data = {}, ack) => {
-    const roomName = data.room || data.roomId;
+    const roomName = data.room || data.roomId || "salas";
     const { userId, username } = data;
     console.log(`${colors.magenta}📥 join_room:${colors.reset}`, data);
 
     if (!roomName || !userId || !username) {
       const msg = "❌ Datos de unión incompletos";
-      console.warn(`${colors.red}${msg}${colors.reset}`);
       socket.emit("join_error", { message: msg });
       return ack?.({ success: false, message: msg });
     }
 
     if (!rooms.has(roomName)) {
       const msg = `❌ Sala ${roomName} no existe`;
-      console.warn(`${colors.red}${msg}${colors.reset}`);
       socket.emit("join_error", { message: msg });
       return ack?.({ success: false, message: msg });
     }
@@ -183,7 +177,7 @@ io.on("connection", (socket) => {
       return ack?.({ success: true, roomId: roomName, message: msg });
     }
 
-    // Salir de sala anterior
+    // 👋 Salir de sala anterior
     const prevRoomId = userToRoomMap.get(userId);
     if (prevRoomId && rooms.has(prevRoomId)) {
       const prev = rooms.get(prevRoomId);
@@ -193,6 +187,7 @@ io.on("connection", (socket) => {
       console.log(`${colors.gray}👋 ${username} salió de ${prevRoomId}${colors.reset}`);
     }
 
+    // 🚪 Unirse a nueva sala
     socket.join(roomName);
     room.users.add(userId);
     userToRoomMap.set(userId, roomName);
@@ -214,7 +209,6 @@ io.on("connection", (socket) => {
 
     if (!userId || !username || !roomId || !text) {
       const msg = "❌ Datos de mensaje inválidos";
-      console.warn(`${colors.red}${msg}${colors.reset}`);
       return ack?.({ success: false, message: msg });
     }
 
@@ -236,8 +230,8 @@ io.on("connection", (socket) => {
   // 🎧 Mensajes de audio
   // ============================================================
   socket.on("audio_message", async (data = {}, ack) => {
-    console.log(`${colors.blue}🎧 audio_message:${colors.reset}`, data?.roomId);
     const { userId, username, audioData, roomId } = data;
+    console.log(`${colors.blue}🎧 audio_message:${colors.reset}`, roomId);
     if (!audioData || !userId || !roomId) {
       return ack?.({ success: false, message: "Datos de audio inválidos" });
     }
@@ -262,12 +256,28 @@ io.on("connection", (socket) => {
       await db.collection(MESSAGES_COLLECTION).add(audioMsg);
       io.to(roomId).emit("new_message", audioMsg);
       socket.emit("message_sent", audioMsg);
-      console.log(`${colors.green}🎤 Audio de ${username} en [${roomId}] guardado en Firebase${colors.reset}`);
-      ack?.({ success: true, message: "Audio enviado correctamente" });
+      console.log(`${colors.green}🎤 Audio de ${username} en [${roomId}] guardado.${colors.reset}`);
+      ack?.({ success: true, message: "Audio enviado correctamente", audioUrl: url });
     } catch (err) {
       console.error(`${colors.red}❌ Error subiendo audio:${colors.reset}`, err);
       ack?.({ success: false, message: "Error subiendo audio" });
     }
+  });
+
+  // ============================================================
+  // 📋 Solicitudes de datos
+  // ============================================================
+  socket.on("get_rooms", (_, ack) => {
+    const list = serializeRooms();
+    socket.emit("room_list", list);
+    ack?.({ success: true, rooms: list });
+  });
+
+  socket.on("get_users", (data = {}, ack) => {
+    const { roomId } = data;
+    const users = getRoomUsers(roomId || "general");
+    socket.emit("connected_users", users);
+    ack?.({ success: true, users });
   });
 
   // ============================================================
