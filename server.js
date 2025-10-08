@@ -1,5 +1,5 @@
 // Servidor Node.js con Socket.IO, Firebase Firestore y Storage
-// 💬 Compatible con tu app Android (SocketRepository y RoomManager actuales)
+// 💬 Compatible con tu app Android (SocketRepository + ChatViewModel actual)
 // 🎨 Logs con colores y emojis para depuración
 
 const express = require('express');
@@ -59,10 +59,10 @@ const MESSAGES_COLLECTION = 'messages';
 // -------------------------------
 // 📦 Estado en memoria
 // -------------------------------
-const connectedUsers = new Map();     // userId -> { id, username, email, socketId, ... }
-const socketToUserMap = new Map();    // socket.id -> userId
-const rooms = new Map();              // roomId -> { id, name, description, users:Set<userId>, currentSpeaker, type, isPrivate }
-const userToRoomMap = new Map();      // userId -> roomId
+const connectedUsers = new Map(); // userId -> { id, username, email, socketId }
+const socketToUserMap = new Map(); // socket.id -> userId
+const rooms = new Map(); // roomId -> { id, name, description, users:Set, type, isPrivate }
+const userToRoomMap = new Map(); // userId -> roomId
 
 // -------------------------------
 // 🚪 Salas base
@@ -76,7 +76,6 @@ rooms.set(SALAS_ROOM_ID, {
   name: 'Lobby de Salas',
   description: 'Pantalla de selección de salas',
   users: new Set(),
-  currentSpeaker: null,
   type: 'lobby',
   isPrivate: false,
 });
@@ -86,7 +85,6 @@ rooms.set(GENERAL_ROOM_ID, {
   name: 'Chat General',
   description: 'Sala de chat público',
   users: new Set(),
-  currentSpeaker: null,
   type: 'general',
   isPrivate: false,
 });
@@ -96,7 +94,6 @@ rooms.set(HANDY_ROOM_ID, {
   name: 'Radio Handy (PTT)',
   description: 'Simulación de radio PTT',
   users: new Set(),
-  currentSpeaker: null,
   type: 'ptt',
   isPrivate: false,
 });
@@ -111,7 +108,7 @@ function serializeRoom(room) {
     description: room.description || '',
     userCount: room.users?.size || 0,
     maxUsers: 50,
-    type: room.type || (room.id === HANDY_ROOM_ID ? 'ptt' : 'general'),
+    type: room.type,
     isPrivate: !!room.isPrivate,
     currentSpeakerId: room.currentSpeaker || null,
   };
@@ -143,78 +140,60 @@ io.on('connection', (socket) => {
   console.log(`${colors.cyan}✅ Nuevo socket conectado: ${socket.id}${colors.reset}`);
 
   // 📥 Registro de usuario
-  
-socket.on('user-connected', async (user) => {
-  console.log(`${colors.blue}📥 user-connected:${colors.reset}`, user);
-  if (!user || !user.id || !user.username) {
-    console.warn(`${colors.yellow}⚠️ Datos de usuario inválidos.${colors.reset}`);
-    return;
-  }
-
-  socketToUserMap.set(socket.id, user.id);
-  connectedUsers.set(user.id, { ...user, socketId: socket.id, isOnline: true });
-
-  try {
-    const userDoc = db.collection(USERS_COLLECTION).doc(user.id);
-    const snapshot = await userDoc.get();
-
-    if (snapshot.exists) {
-      await userDoc.update({
-        ...user,
-        isOnline: true,
-        lastLogin: Date.now(),
-      });
-      console.log(`${colors.green}🔑 Inicio de sesión Firebase:${colors.reset} ${user.username}`);
-    } else {
-      await userDoc.set({
-        ...user,
-        isOnline: true,
-        createdAt: Date.now(),
-      });
-      console.log(`${colors.green}🆕 Usuario nuevo registrado en Firebase:${colors.reset} ${user.username}`);
+  socket.on('user-connected', async (user) => {
+    console.log(`${colors.blue}📥 user-connected:${colors.reset}`, user);
+    if (!user || !user.id || !user.username) {
+      console.warn(`${colors.yellow}⚠️ Datos de usuario inválidos.${colors.reset}`);
+      return;
     }
-  } catch (error) {
-    console.error(`${colors.red}❌ Error registrando usuario en Firebase:${colors.reset}`, error);
-  }
 
-  // 🚀 Log de sincronización total
-  console.log(`${colors.cyan}🌐 ${user.username} está ahora ONLINE${colors.reset}`);
-  console.log(`${colors.cyan}📡 Usuarios conectados: ${connectedUsers.size}${colors.reset}`);
+    socketToUserMap.set(socket.id, user.id);
+    connectedUsers.set(user.id, { ...user, socketId: socket.id, isOnline: true });
 
-  // 📤 Emitir lista global de usuarios conectados (para UserManager)
-  const userList = Array.from(connectedUsers.values());
-  io.emit('connected_users', userList);
-  console.log(`${colors.magenta}📤 Emitida lista connected_users (${userList.length}) al cliente${colors.reset}`);
+    try {
+      const userDoc = db.collection(USERS_COLLECTION).doc(user.id);
+      const snapshot = await userDoc.get();
 
-  // 📋 También enviar lista de salas para el nuevo cliente
-  socket.emit('room_list', serializeRooms());
-});
+      if (snapshot.exists) {
+        await userDoc.update({
+          ...user,
+          isOnline: true,
+          lastLogin: Date.now(),
+        });
+      } else {
+        await userDoc.set({
+          ...user,
+          isOnline: true,
+          createdAt: Date.now(),
+        });
+      }
+      console.log(`${colors.green}🔑 Usuario sincronizado en Firebase: ${user.username}${colors.reset}`);
+    } catch (error) {
+      console.error(`${colors.red}❌ Error registrando usuario en Firebase:${colors.reset}`, error);
+    }
 
-  // 🧩 Aux: salir de la sala actual
+    io.emit('connected_users', Array.from(connectedUsers.values()));
+    socket.emit('room_list', serializeRooms());
+  });
+
+  // 🧩 Aux: salir de sala actual
   const leaveCurrentRoom = (userId, socketInstance) => {
     const prevRoomId = userToRoomMap.get(userId);
     if (prevRoomId && rooms.has(prevRoomId)) {
       const room = rooms.get(prevRoomId);
       room.users.delete(userId);
       socketInstance.leave(prevRoomId);
-
-      if (prevRoomId === HANDY_ROOM_ID && room.currentSpeaker === userId) {
-        room.currentSpeaker = null;
-        io.to(HANDY_ROOM_ID).emit('talk_token_released', { roomId: HANDY_ROOM_ID, currentSpeaker: null });
-      }
-
       io.to(prevRoomId).emit('user-left-room', { roomId: prevRoomId, userCount: room.users.size });
       console.log(`${colors.yellow}👋 ${userId} salió de ${prevRoomId}${colors.reset}`);
     }
   };
 
-  // 🏠 Unirse a sala
+  // 🏠 Unirse a sala (versión robusta)
   socket.on('join_room', (data = {}) => {
     const roomName = data.room || data.roomId;
     const { userId, username } = data;
     console.log(`${colors.cyan}📥 join_room:${colors.reset}`, data);
 
-    // Validaciones
     if (!roomName || !userId || !username) {
       socket.emit('join_error', { message: 'Datos de unión incompletos' });
       return;
@@ -237,7 +216,11 @@ socket.on('user-connected', async (user) => {
         users,
         userCount: users.length,
       });
+
+      // ✅ Confirmación doble
       socket.emit('room_joined', { roomId: roomName, username, userCount: users.length });
+      io.to(roomName).emit('room_joined', { roomId: roomName, username, userCount: users.length });
+
       console.log(`${colors.yellow}ℹ️ ${username} ya estaba en ${roomName}${colors.reset}`);
       return;
     }
@@ -250,7 +233,7 @@ socket.on('user-connected', async (user) => {
 
     const users = getRoomUsers(roomName);
 
-    // Emitir confirmaciones
+    // Confirmaciones seguras
     socket.emit('join_success', {
       message: `Te has unido a ${roomName}`,
       room: roomName,
@@ -258,10 +241,11 @@ socket.on('user-connected', async (user) => {
       users,
       userCount: users.length,
     });
+
     socket.emit('room_joined', { roomId: roomName, username, userCount: users.length });
+    io.to(roomName).emit('room_joined', { roomId: roomName, username, userCount: users.length });
 
     io.to(roomName).emit('user-joined-room', { roomId: roomName, userCount: users.length });
-
     console.log(`${colors.green}✅ ${username} se unió a ${roomName}${colors.reset}`);
   });
 
@@ -269,12 +253,9 @@ socket.on('user-connected', async (user) => {
   socket.on('leave_room', (data = {}) => {
     const { roomId, userId, username } = data;
     if (!userId) return;
-    const current = userToRoomMap.get(userId);
-    if (!current) return;
-
     leaveCurrentRoom(userId, socket);
-    socket.emit('left_room', { roomId: current });
-    console.log(`${colors.yellow}👋 ${username || userId} pidió salir de ${current}${colors.reset}`);
+    socket.emit('left_room', { roomId });
+    console.log(`${colors.yellow}👋 ${username || userId} pidió salir de ${roomId}${colors.reset}`);
   });
 
   // 👥 Lista de usuarios
@@ -282,13 +263,11 @@ socket.on('user-connected', async (user) => {
     const roomId = data.roomId || data.room || SALAS_ROOM_ID;
     const users = getRoomUsers(roomId);
     socket.emit('users_list', users);
-    console.log(`${colors.magenta}👥 Enviando usuarios de sala:${colors.reset} ${roomId}`);
   });
 
   // 📋 Lista de salas
   socket.on('get_rooms', () => {
     socket.emit('room_list', serializeRooms());
-    console.log(`${colors.magenta}📋 Lista de salas enviada.${colors.reset}`);
   });
 
   // 💬 Mensajes de texto
