@@ -271,6 +271,13 @@ io.on('connection', (socket) => {
     console.log(`${colors.magenta}👥 Enviando usuarios de sala (get_users):${colors.reset} ${roomId}`);
     socket.emit('users_list', users);
   });
+  socket.on("join_room", (data) => {
+  const { roomId, username } = data;
+  socket.join(roomId);
+  console.log(`✅ ${username} se unió a ${roomId}`);
+  socket.emit("room_joined", { roomId });
+});
+
 
   // (Compatibilidad) nombre anterior
   socket.on('get_room_users', (roomName) => {
