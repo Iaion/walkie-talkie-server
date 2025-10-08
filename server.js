@@ -187,19 +187,71 @@ io.on('connection', (socket) => {
   };
 
   // 🏠 Unirse a sala (idempotente)
-  socket.on('join_room', (data = {}) => {
-    const roomName = data.room || data.roomId;
-    const { userId, username } = data;
-    console.log(`${colors.cyan}📥 join_room:${colors.reset}`, data);
+  // 🏠 Unirse a sala (idempotente y compatible con Android)
+socket.on('join_room', (data = {}) => {
+  const roomName = data.room || data.roomId;
+  const { userId, username } = data;
+  console.log(`${colors.cyan}📥 join_room:${colors.reset}`, data);
 
-    if (!roomName || !userId || !username) {
-      socket.emit('join_error', { message: 'Datos de unión incompletos' });
-      return;
-    }
-    if (!rooms.has(roomName)) {
-      socket.emit('join_error', { message: `La sala ${roomName} no existe` });
-      return;
-    }
+  // 🔍 Validaciones básicas
+  if (!roomName || !userId || !username) {
+    socket.emit('join_error', { message: 'Datos de unión incompletos' });
+    console.warn(`${colors.yellow}⚠️ join_room con datos incompletos${colors.reset}`);
+    return;
+  }
+  if (!rooms.has(roomName)) {
+    socket.emit('join_error', { message: `La sala ${roomName} no existe` });
+    console.warn(`${colors.yellow}⚠️ Sala inexistente: ${roomName}${colors.reset}`);
+    return;
+  }
+
+  const room = rooms.get(roomName);
+
+  // 🧭 Si ya está en la misma sala, devolver confirmación inmediata
+  const current = userToRoomMap.get(userId);
+  if (current === roomName) {
+    const users = getRoomUsers(roomName);
+    socket.emit('join_success', {
+      message: `Ya estabas en ${roomName}`,
+      room: roomName,
+      roomId: roomName,
+      users,
+      currentSpeaker: room.currentSpeaker,
+      userCount: users.length,
+    });
+    socket.emit("room_joined", { roomId: roomName, username, userCount: users.length }); // 🔹 Compatibilidad Android
+    console.log(`${colors.yellow}ℹ️ ${username} ya estaba en ${roomName}${colors.reset}`);
+    return;
+  }
+
+  // 🔄 Salir de sala anterior si corresponde
+  leaveCurrentRoom(userId, socket);
+
+  // 🚪 Unirse a la nueva sala
+  socket.join(roomName);
+  room.users.add(userId);
+  userToRoomMap.set(userId, roomName);
+
+  const users = getRoomUsers(roomName);
+
+  // ✅ Confirmación al cliente
+  socket.emit('join_success', {
+    message: `Te has unido a ${roomName}`,
+    room: roomName,
+    roomId: roomName,
+    users,
+    currentSpeaker: room.currentSpeaker,
+    userCount: users.length,
+  });
+
+  // 🔹 Confirmación rápida para Android
+  socket.emit("room_joined", { roomId: roomName, username, userCount: users.length });
+
+  // 📢 Broadcast: notificar a la sala que alguien se unió
+  io.to(roomName).emit('user-joined-room', { roomId: roomName, userCount: users.length });
+
+  console.log(`${colors.green}✅ ${username} se unió a ${roomName}${colors.reset}`);
+});
 
     const current = userToRoomMap.get(userId);
     if (current === roomName) {
@@ -271,12 +323,7 @@ io.on('connection', (socket) => {
     console.log(`${colors.magenta}👥 Enviando usuarios de sala (get_users):${colors.reset} ${roomId}`);
     socket.emit('users_list', users);
   });
-  socket.on("join_room", (data) => {
-  const { roomId, username } = data;
-  socket.join(roomId);
-  console.log(`✅ ${username} se unió a ${roomId}`);
-  socket.emit("room_joined", { roomId });
-});
+
 
 
   // (Compatibilidad) nombre anterior
