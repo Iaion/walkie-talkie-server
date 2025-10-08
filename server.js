@@ -143,37 +143,52 @@ io.on('connection', (socket) => {
   console.log(`${colors.cyan}✅ Nuevo socket conectado: ${socket.id}${colors.reset}`);
 
   // 📥 Registro de usuario
-  socket.on('user-connected', async (user) => {
-    console.log(`${colors.blue}📥 user-connected:${colors.reset}`, user);
-    if (!user || !user.id || !user.username) {
-      console.warn(`${colors.yellow}⚠️ Datos de usuario inválidos.${colors.reset}`);
-      return;
+  
+socket.on('user-connected', async (user) => {
+  console.log(`${colors.blue}📥 user-connected:${colors.reset}`, user);
+  if (!user || !user.id || !user.username) {
+    console.warn(`${colors.yellow}⚠️ Datos de usuario inválidos.${colors.reset}`);
+    return;
+  }
+
+  socketToUserMap.set(socket.id, user.id);
+  connectedUsers.set(user.id, { ...user, socketId: socket.id, isOnline: true });
+
+  try {
+    const userDoc = db.collection(USERS_COLLECTION).doc(user.id);
+    const snapshot = await userDoc.get();
+
+    if (snapshot.exists) {
+      await userDoc.update({
+        ...user,
+        isOnline: true,
+        lastLogin: Date.now(),
+      });
+      console.log(`${colors.green}🔑 Inicio de sesión Firebase:${colors.reset} ${user.username}`);
+    } else {
+      await userDoc.set({
+        ...user,
+        isOnline: true,
+        createdAt: Date.now(),
+      });
+      console.log(`${colors.green}🆕 Usuario nuevo registrado en Firebase:${colors.reset} ${user.username}`);
     }
+  } catch (error) {
+    console.error(`${colors.red}❌ Error registrando usuario en Firebase:${colors.reset}`, error);
+  }
 
-    socketToUserMap.set(socket.id, user.id);
-    connectedUsers.set(user.id, { ...user, socketId: socket.id, isOnline: true });
+  // 🚀 Log de sincronización total
+  console.log(`${colors.cyan}🌐 ${user.username} está ahora ONLINE${colors.reset}`);
+  console.log(`${colors.cyan}📡 Usuarios conectados: ${connectedUsers.size}${colors.reset}`);
 
-    try {
-      const userDoc = db.collection(USERS_COLLECTION).doc(user.id);
-      const docSnapshot = await userDoc.get();
+  // 📤 Emitir lista global de usuarios conectados (para UserManager)
+  const userList = Array.from(connectedUsers.values());
+  io.emit('connected_users', userList);
+  console.log(`${colors.magenta}📤 Emitida lista connected_users (${userList.length}) al cliente${colors.reset}`);
 
-      if (docSnapshot.exists) {
-        await userDoc.update({ ...user, lastLogin: Date.now(), isOnline: true });
-        console.log(`${colors.green}🔑 Inicio de sesión:${colors.reset} ${user.username}`);
-      } else {
-        await userDoc.set({ ...user, createdAt: Date.now(), isOnline: true });
-        console.log(`${colors.green}🆕 Usuario nuevo registrado en Firebase:${colors.reset} ${user.username}`);
-      }
-    } catch (e) {
-      console.error(`${colors.red}❌ Error guardando usuario en Firebase:${colors.reset}`, e);
-    }
-
-    // Lista global de usuarios conectados
-    io.emit('connected_users', Array.from(connectedUsers.values()));
-
-    // Lista de salas para el cliente
-    socket.emit('room_list', serializeRooms());
-  });
+  // 📋 También enviar lista de salas para el nuevo cliente
+  socket.emit('room_list', serializeRooms());
+});
 
   // 🧩 Aux: salir de la sala actual
   const leaveCurrentRoom = (userId, socketInstance) => {
