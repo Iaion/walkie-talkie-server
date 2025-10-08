@@ -1,6 +1,6 @@
 // Servidor Node.js con Socket.IO, Firebase Firestore y Storage
-// 💬 Compatible con tu app Android (SocketRepository corregido)
-// 🎨 Incluye logs con colores y emojis para depuración en tiempo real
+// 💬 Compatible con tu app Android (SocketRepository y RoomManager actuales)
+// 🎨 Logs con colores y emojis para depuración
 
 const express = require('express');
 const http = require('http');
@@ -10,7 +10,7 @@ const { v4: uuidv4 } = require('uuid');
 const admin = require('firebase-admin');
 const { Buffer } = require('buffer');
 
-// 🎨 Códigos de color ANSI
+// 🎨 ANSI colors
 const colors = {
   reset: '\x1b[0m',
   cyan: '\x1b[36m',
@@ -31,7 +31,7 @@ const io = socketIo(server, {
 app.use(cors());
 
 // -------------------------------
-// 🔥 Inicialización Firebase
+// 🔥 Firebase init
 // -------------------------------
 if (!process.env.GOOGLE_APPLICATION_CREDENTIALS || !process.env.FIREBASE_STORAGE_BUCKET) {
   console.error(`${colors.red}❌ Falta configuración de Firebase${colors.reset}`);
@@ -57,12 +57,12 @@ const USERS_COLLECTION = 'users';
 const MESSAGES_COLLECTION = 'messages';
 
 // -------------------------------
-// 📦 Estructuras de datos
+// 📦 Estado en memoria
 // -------------------------------
-const connectedUsers = new Map();
-const socketToUserMap = new Map();
-const rooms = new Map();
-const userToRoomMap = new Map();
+const connectedUsers = new Map();     // userId -> { id, username, email, socketId, ... }
+const socketToUserMap = new Map();    // socket.id -> userId
+const rooms = new Map();              // roomId -> { id, name, description, users:Set<userId>, currentSpeaker, type, isPrivate }
+const userToRoomMap = new Map();      // userId -> roomId
 
 // -------------------------------
 // 🚪 Salas base
@@ -76,6 +76,8 @@ rooms.set(GENERAL_ROOM_ID, {
   description: 'Sala de chat público',
   users: new Set(),
   currentSpeaker: null,
+  type: 'general',
+  isPrivate: false,
 });
 
 rooms.set(HANDY_ROOM_ID, {
@@ -84,25 +86,52 @@ rooms.set(HANDY_ROOM_ID, {
   description: 'Simulación de radio PTT',
   users: new Set(),
   currentSpeaker: null,
+  type: 'ptt',
+  isPrivate: false,
 });
 
 // -------------------------------
-// 🧩 API REST básica
+// 🔧 Helpers
+// -------------------------------
+function serializeRoom(room) {
+  return {
+    id: room.id,
+    name: room.name,
+    description: room.description || '',
+    userCount: room.users?.size || 0,
+    maxUsers: 50,
+    type: room.type || (room.id === HANDY_ROOM_ID ? 'ptt' : 'general'),
+    isPrivate: !!room.isPrivate,
+    currentSpeakerId: room.currentSpeaker || null,
+    // createdAt/updatedAt opcionalmente si quisieras
+  };
+}
+
+function serializeRooms() {
+  return Array.from(rooms.values()).map(serializeRoom);
+}
+
+function getRoomUsers(roomId) {
+  const room = rooms.get(roomId);
+  if (!room) return [];
+  return Array.from(room.users)
+    .map((id) => connectedUsers.get(id))
+    .filter(Boolean);
+}
+
 // -------------------------------
 app.get('/health', (_, res) => res.status(200).send('Servidor operativo.'));
 app.get('/users', (_, res) => res.json(Array.from(connectedUsers.values())));
-app.get('/rooms', (_, res) => res.json(Array.from(rooms.values())));
+app.get('/rooms', (_, res) => res.json(serializeRooms()));
+// -------------------------------
 
-// -------------------------------
 // 🔌 Conexión Socket.IO
-// -------------------------------
 io.on('connection', (socket) => {
   console.log(`${colors.cyan}✅ Nuevo socket conectado: ${socket.id}${colors.reset}`);
 
   // 📥 Registro de usuario
   socket.on('user-connected', async (user) => {
     console.log(`${colors.blue}📥 user-connected:${colors.reset}`, user);
-
     if (!user || !user.id || !user.username) {
       console.warn(`${colors.yellow}⚠️ Datos de usuario inválidos.${colors.reset}`);
       return;
@@ -118,11 +147,14 @@ io.on('connection', (socket) => {
       console.error(`${colors.red}❌ Error guardando usuario:${colors.reset}`, e);
     }
 
-    io.emit('user-list', Array.from(connectedUsers.values()));
-    socket.emit('room_list', Array.from(rooms.values()));
+    // Lista global de usuarios conectados (puede escucharla tu UserManager)
+    io.emit('connected_users', Array.from(connectedUsers.values()));
+
+    // Lista de salas serializada (lo que tu RoomManager espera)
+    socket.emit('room_list', serializeRooms());
   });
 
-  // 🧩 Función auxiliar
+  // 🧩 Aux: salir de la sala actual
   const leaveCurrentRoom = (userId, socket) => {
     const prevRoomId = userToRoomMap.get(userId);
     if (prevRoomId && rooms.has(prevRoomId)) {
@@ -130,6 +162,7 @@ io.on('connection', (socket) => {
       room.users.delete(userId);
       socket.leave(prevRoomId);
 
+      // Si era Handy y hablaba, soltar token
       if (prevRoomId === HANDY_ROOM_ID && room.currentSpeaker === userId) {
         room.currentSpeaker = null;
         io.to(HANDY_ROOM_ID).emit('talk_token_released', { roomId: HANDY_ROOM_ID, currentSpeaker: null });
@@ -140,58 +173,82 @@ io.on('connection', (socket) => {
     }
   };
 
-  // 🏠 Unirse a sala
+  // 🏠 Unirse a sala (idempotente)
   socket.on('join_room', (data) => {
-    const roomName = data.room || data.roomId;
-    const { userId, username } = data;
-
+    const roomName = data?.room || data?.roomId;
+    const { userId, username } = data || {};
     console.log(`${colors.cyan}📥 join_room:${colors.reset}`, data);
 
     if (!roomName || !userId || !username) {
       socket.emit('join_error', { message: 'Datos de unión incompletos' });
       return;
     }
-
     if (!rooms.has(roomName)) {
       socket.emit('join_error', { message: `La sala ${roomName} no existe` });
       return;
     }
 
+    const current = userToRoomMap.get(userId);
+    if (current === roomName) {
+      // ✅ Ya está en la sala: solo confirma. Evita churn de leave/join y timeouts.
+      const room = rooms.get(roomName);
+      const users = getRoomUsers(roomName);
+      socket.emit('join_success', {
+        message: `Ya estabas en ${roomName}`,
+        room: roomName,
+        roomId: roomName, // <-- Android lee room/roomId/roomName
+        users,
+        currentSpeaker: room.currentSpeaker,
+        userCount: users.length,
+      });
+      console.log(`${colors.yellow}ℹ️ ${username} ya estaba en ${roomName}${colors.reset}`);
+      return;
+    }
+
+    // Cambio real de sala
     leaveCurrentRoom(userId, socket);
     socket.join(roomName);
     const room = rooms.get(roomName);
     room.users.add(userId);
     userToRoomMap.set(userId, roomName);
 
-    const users = Array.from(room.users)
-      .map((id) => connectedUsers.get(id))
-      .filter(Boolean);
+    const users = getRoomUsers(roomName);
 
+    // ✅ Confirmación para el cliente Android
     socket.emit('join_success', {
       message: `Te has unido a ${roomName}`,
       room: roomName,
+      roomId: roomName,
       users,
       currentSpeaker: room.currentSpeaker,
       userCount: users.length,
     });
 
+    // Broadcast de actualización de contador
     io.to(roomName).emit('user-joined-room', { roomId: roomName, userCount: users.length });
+
     console.log(`${colors.green}✅ ${username} se unió a ${roomName}${colors.reset}`);
   });
 
   // 📋 Solicitar salas
   socket.on('get_rooms', () => {
     console.log(`${colors.magenta}📋 get_rooms solicitado${colors.reset}`);
-    socket.emit('room_list', Array.from(rooms.values()));
+    socket.emit('room_list', serializeRooms());
   });
 
-  // 👥 Lista de usuarios
+  // 👥 Lista de usuarios por sala — alias compatibles con Android
+  socket.on('get_users', (data) => {
+    const roomId = data?.roomId || data?.room || GENERAL_ROOM_ID;
+    const users = getRoomUsers(roomId);
+    console.log(`${colors.magenta}👥 Enviando usuarios de sala (get_users):${colors.reset} ${roomId}`);
+    socket.emit('users_list', users);
+  });
+
+  // (Compatibilidad) nombre anterior
   socket.on('get_room_users', (roomName) => {
-    if (!roomName || !rooms.has(roomName)) return;
-    const users = Array.from(rooms.get(roomName).users)
-      .map((id) => connectedUsers.get(id))
-      .filter(Boolean);
-    console.log(`${colors.magenta}👥 Enviando usuarios de sala:${colors.reset}`, roomName);
+    const roomId = typeof roomName === 'string' ? roomName : roomName?.roomId || GENERAL_ROOM_ID;
+    const users = getRoomUsers(roomId);
+    console.log(`${colors.magenta}👥 Enviando usuarios de sala (get_room_users):${colors.reset} ${roomId}`);
     socket.emit('users_list', users);
   });
 
@@ -228,7 +285,7 @@ io.on('connection', (socket) => {
 
   // 💬 Mensajes de texto
   socket.on('send_message', async (data) => {
-    const { userId, username, text, roomId } = data;
+    const { userId, username, text, roomId } = data || {};
     if (!text || !userId || !roomId) return;
 
     const message = {
@@ -249,10 +306,13 @@ io.on('connection', (socket) => {
     }
   });
 
-  // 🎧 Mensajes de audio
+  // 🎧 Mensajes de audio (espera audioData en base64)
   socket.on('audio_message', async (data) => {
-    const { userId, username, audioData, roomId } = data;
-    if (!audioData || !userId || !roomId) return;
+    const { userId, username, audioData, roomId } = data || {};
+    if (!audioData || !userId || !roomId) {
+      console.warn(`${colors.yellow}⚠️ audio_message inválido (falta audioData/userId/roomId)${colors.reset}`);
+      return;
+    }
 
     const room = rooms.get(roomId);
     if (roomId === HANDY_ROOM_ID && room?.currentSpeaker !== userId) {
@@ -293,7 +353,7 @@ io.on('connection', (socket) => {
       leaveCurrentRoom(userId, socket);
       connectedUsers.delete(userId);
       userToRoomMap.delete(userId);
-      io.emit('user-list', Array.from(connectedUsers.values()));
+      io.emit('connected_users', Array.from(connectedUsers.values()));
     }
     socketToUserMap.delete(socket.id);
     console.log(`${colors.red}🔴 Socket desconectado:${colors.reset} ${socket.id}`);
