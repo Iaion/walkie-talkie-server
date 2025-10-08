@@ -188,108 +188,70 @@ io.on('connection', (socket) => {
     }
   };
 
-  // 🏠 Unirse a sala (versión robusta)
   socket.on('join_room', (data = {}) => {
-    const roomName = data.room || data.roomId;
-    const { userId, username } = data;
-    console.log(`${colors.cyan}📥 join_room:${colors.reset}`, data);
+  const roomName = data.room || data.roomId;
+  const { userId, username } = data;
+  console.log(`${colors.cyan}📥 join_room:${colors.reset}`, data);
 
-    if (!roomName || !userId || !username) {
-      socket.emit('join_error', { message: 'Datos de unión incompletos' });
-      return;
-    }
-    if (!rooms.has(roomName)) {
-      socket.emit('join_error', { message: `La sala ${roomName} no existe` });
-      return;
-    }
+  // Validaciones
+  if (!roomName || !userId || !username) {
+    socket.emit('join_error', { message: 'Datos de unión incompletos' });
+    return;
+  }
+  if (!rooms.has(roomName)) {
+    socket.emit('join_error', { message: `La sala ${roomName} no existe` });
+    return;
+  }
 
-    const room = rooms.get(roomName);
-    const current = userToRoomMap.get(userId);
+  const room = rooms.get(roomName);
+  const current = userToRoomMap.get(userId);
 
-    // Ya estaba en la sala
-    if (current === roomName) {
-      const users = getRoomUsers(roomName);
-      socket.emit('join_success', {
-        message: `Ya estabas en ${roomName}`,
-        room: roomName,
-        roomId: roomName,
-        users,
-        userCount: users.length,
-      });
-
-      // ✅ Confirmación doble
-      socket.emit('room_joined', { roomId: roomName, username, userCount: users.length });
-      io.to(roomName).emit('room_joined', { roomId: roomName, username, userCount: users.length });
-
-      console.log(`${colors.yellow}ℹ️ ${username} ya estaba en ${roomName}${colors.reset}`);
-      return;
-    }
-
-    // Cambio de sala
-    leaveCurrentRoom(userId, socket);
-    socket.join(roomName);
-    room.users.add(userId);
-    userToRoomMap.set(userId, roomName);
-
+  // Ya estaba en la sala
+  if (current === roomName) {
     const users = getRoomUsers(roomName);
-
-    // Confirmaciones seguras
-    socket.emit('join_success', {
-      message: `Te has unido a ${roomName}`,
+    const payload = {
+      message: `Ya estabas en ${roomName}`,
       room: roomName,
       roomId: roomName,
       users,
       userCount: users.length,
-    });
+    };
 
+    // 🔥 Triple confirmación (Railway-safe)
+    socket.emit('join_success', payload);
     socket.emit('room_joined', { roomId: roomName, username, userCount: users.length });
     io.to(roomName).emit('room_joined', { roomId: roomName, username, userCount: users.length });
+    io.to(socket.id).emit('room_joined', { roomId: roomName, username, userCount: users.length });
 
-    io.to(roomName).emit('user-joined-room', { roomId: roomName, userCount: users.length });
-    console.log(`${colors.green}✅ ${username} se unió a ${roomName}${colors.reset}`);
-  });
+    console.log(`${colors.yellow}ℹ️ ${username} ya estaba en ${roomName}${colors.reset}`);
+    return;
+  }
 
-  // 🚪 Salir de sala
-  socket.on('leave_room', (data = {}) => {
-    const { roomId, userId, username } = data;
-    if (!userId) return;
-    leaveCurrentRoom(userId, socket);
-    socket.emit('left_room', { roomId });
-    console.log(`${colors.yellow}👋 ${username || userId} pidió salir de ${roomId}${colors.reset}`);
-  });
+  // Cambio de sala
+  leaveCurrentRoom(userId, socket);
+  socket.join(roomName);
+  room.users.add(userId);
+  userToRoomMap.set(userId, roomName);
 
-  // 👥 Lista de usuarios
-  socket.on('get_users', (data = {}) => {
-    const roomId = data.roomId || data.room || SALAS_ROOM_ID;
-    const users = getRoomUsers(roomId);
-    socket.emit('users_list', users);
-  });
+  const users = getRoomUsers(roomName);
+  const payload = {
+    message: `Te has unido a ${roomName}`,
+    room: roomName,
+    roomId: roomName,
+    users,
+    userCount: users.length,
+  };
 
-  // 📋 Lista de salas
-  socket.on('get_rooms', () => {
-    socket.emit('room_list', serializeRooms());
-  });
+  // 🔥 Confirmaciones seguras
+  socket.emit('join_success', payload);
+  socket.emit('room_joined', { roomId: roomName, username, userCount: users.length });
+  io.to(roomName).emit('room_joined', { roomId: roomName, username, userCount: users.length });
+  io.to(socket.id).emit('room_joined', { roomId: roomName, username, userCount: users.length });
 
-  // 💬 Mensajes de texto
-  socket.on('send_message', async (data = {}) => {
-    const { userId, username, text, roomId } = data;
-    if (!text || !userId || !roomId) return;
-    const message = {
-      id: uuidv4(),
-      userId,
-      username,
-      text,
-      roomId,
-      timestamp: Date.now(),
-    };
-    try {
-      await db.collection(MESSAGES_COLLECTION).add(message);
-      io.to(roomId).emit('new_message', message);
-      console.log(`${colors.green}💬 ${username} → ${roomId}:${colors.reset} ${text}`);
-    } catch (e) {
-      console.error(`${colors.red}❌ Error guardando mensaje:${colors.reset}`, e);
-    }
-  });
+  io.to(roomName).emit('user-joined-room', { roomId: roomName, userCount: users.length });
+  console.log(`${colors.green}✅ ${username} se unió a ${roomName}${colors.reset}`);
+});
+
 
   // 🎧 Mensajes de audio
   socket.on('audio_message', async (data = {}) => {
