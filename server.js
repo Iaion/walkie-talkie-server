@@ -67,8 +67,19 @@ const userToRoomMap = new Map();      // userId -> roomId
 // -------------------------------
 // 🚪 Salas base
 // -------------------------------
+const SALAS_ROOM_ID = 'salas';        // 🆕 Lobby
 const GENERAL_ROOM_ID = 'general';
 const HANDY_ROOM_ID = 'handy';
+
+rooms.set(SALAS_ROOM_ID, {
+  id: SALAS_ROOM_ID,
+  name: 'Lobby de Salas',
+  description: 'Pantalla de selección de salas',
+  users: new Set(),
+  currentSpeaker: null,
+  type: 'lobby',
+  isPrivate: false,
+});
 
 rooms.set(GENERAL_ROOM_ID, {
   id: GENERAL_ROOM_ID,
@@ -103,7 +114,6 @@ function serializeRoom(room) {
     type: room.type || (room.id === HANDY_ROOM_ID ? 'ptt' : 'general'),
     isPrivate: !!room.isPrivate,
     currentSpeakerId: room.currentSpeaker || null,
-    // createdAt/updatedAt opcionalmente si quisieras
   };
 }
 
@@ -147,11 +157,14 @@ io.on('connection', (socket) => {
       console.error(`${colors.red}❌ Error guardando usuario:${colors.reset}`, e);
     }
 
-    // Lista global de usuarios conectados (puede escucharla tu UserManager)
+    // Lista global de usuarios conectados
     io.emit('connected_users', Array.from(connectedUsers.values()));
 
-    // Lista de salas serializada (lo que tu RoomManager espera)
+    // Lista de salas serializada (para RoomManager)
     socket.emit('room_list', serializeRooms());
+
+    // 📝 NO auto-unimos a ninguna sala aquí.
+    // El cliente decidirá y emitirá join_room("salas") en SalasScreen.
   });
 
   // 🧩 Aux: salir de la sala actual
@@ -174,9 +187,9 @@ io.on('connection', (socket) => {
   };
 
   // 🏠 Unirse a sala (idempotente)
-  socket.on('join_room', (data) => {
-    const roomName = data?.room || data?.roomId;
-    const { userId, username } = data || {};
+  socket.on('join_room', (data = {}) => {
+    const roomName = data.room || data.roomId;
+    const { userId, username } = data;
     console.log(`${colors.cyan}📥 join_room:${colors.reset}`, data);
 
     if (!roomName || !userId || !username) {
@@ -190,13 +203,13 @@ io.on('connection', (socket) => {
 
     const current = userToRoomMap.get(userId);
     if (current === roomName) {
-      // ✅ Ya está en la sala: solo confirma. Evita churn de leave/join y timeouts.
+      // ✅ Ya está en la sala: confirmar igual para evitar timeouts del cliente
       const room = rooms.get(roomName);
       const users = getRoomUsers(roomName);
       socket.emit('join_success', {
         message: `Ya estabas en ${roomName}`,
         room: roomName,
-        roomId: roomName, // <-- Android lee room/roomId/roomName
+        roomId: roomName,
         users,
         currentSpeaker: room.currentSpeaker,
         userCount: users.length,
@@ -230,6 +243,21 @@ io.on('connection', (socket) => {
     console.log(`${colors.green}✅ ${username} se unió a ${roomName}${colors.reset}`);
   });
 
+  // 🚪 Salir de sala (desde cliente)
+  socket.on('leave_room', (data = {}) => {
+    const { roomId, userId, username } = data;
+    if (!userId) return;
+
+    const current = userToRoomMap.get(userId);
+    if (!current) return;
+
+    leaveCurrentRoom(userId, socket);
+
+    // Respuesta opcional al cliente
+    socket.emit('left_room', { roomId: current });
+    console.log(`${colors.yellow}👋 ${username || userId} pidió salir de ${current}${colors.reset}`);
+  });
+
   // 📋 Solicitar salas
   socket.on('get_rooms', () => {
     console.log(`${colors.magenta}📋 get_rooms solicitado${colors.reset}`);
@@ -237,8 +265,8 @@ io.on('connection', (socket) => {
   });
 
   // 👥 Lista de usuarios por sala — alias compatibles con Android
-  socket.on('get_users', (data) => {
-    const roomId = data?.roomId || data?.room || GENERAL_ROOM_ID;
+  socket.on('get_users', (data = {}) => {
+    const roomId = data.roomId || data.room || SALAS_ROOM_ID;
     const users = getRoomUsers(roomId);
     console.log(`${colors.magenta}👥 Enviando usuarios de sala (get_users):${colors.reset} ${roomId}`);
     socket.emit('users_list', users);
@@ -246,7 +274,7 @@ io.on('connection', (socket) => {
 
   // (Compatibilidad) nombre anterior
   socket.on('get_room_users', (roomName) => {
-    const roomId = typeof roomName === 'string' ? roomName : roomName?.roomId || GENERAL_ROOM_ID;
+    const roomId = typeof roomName === 'string' ? roomName : roomName?.roomId || SALAS_ROOM_ID;
     const users = getRoomUsers(roomId);
     console.log(`${colors.magenta}👥 Enviando usuarios de sala (get_room_users):${colors.reset} ${roomId}`);
     socket.emit('users_list', users);
@@ -284,8 +312,8 @@ io.on('connection', (socket) => {
   });
 
   // 💬 Mensajes de texto
-  socket.on('send_message', async (data) => {
-    const { userId, username, text, roomId } = data || {};
+  socket.on('send_message', async (data = {}) => {
+    const { userId, username, text, roomId } = data;
     if (!text || !userId || !roomId) return;
 
     const message = {
@@ -307,8 +335,8 @@ io.on('connection', (socket) => {
   });
 
   // 🎧 Mensajes de audio (espera audioData en base64)
-  socket.on('audio_message', async (data) => {
-    const { userId, username, audioData, roomId } = data || {};
+  socket.on('audio_message', async (data = {}) => {
+    const { userId, username, audioData, roomId } = data;
     if (!audioData || !userId || !roomId) {
       console.warn(`${colors.yellow}⚠️ audio_message inválido (falta audioData/userId/roomId)${colors.reset}`);
       return;
