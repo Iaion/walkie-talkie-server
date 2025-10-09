@@ -200,6 +200,32 @@ io.on("connection", (socket) => {
     ack?.({ success: true, roomId: roomName, message: `Te uniste a ${roomName}` });
   });
 
+  socket.on("get_profile", (data, ack) => {
+  const userId = data.userId;
+  // Obtener perfil desde Firestore:
+  db.collection("users").doc(userId).get().then(doc => {
+    if (!doc.exists) return ack({ success: false, message: "Usuario no encontrado" });
+    ack({ success: true, user: doc.data() });
+  }).catch(err => ack({ success: false, message: err.message }));
+});
+
+socket.on("update_profile", (data, ack) => {
+  const userId = data.userId;
+  db.collection("users").doc(userId).update(data)
+    .then(() => ack({ success: true, user: data }))
+    .catch(err => ack({ success: false, message: err.message }));
+});
+
+socket.on("update_status", (data, ack) => {
+  const userId = data.userId;
+  db.collection("users").doc(userId).update({
+    status: data.status,
+    presence: data.presence
+  }).then(() => ack({ success: true }))
+    .catch(err => ack({ success: false, message: err.message }));
+});
+
+
   // ============================================================
   // 💬 Mensajes de texto
   // ============================================================
