@@ -211,34 +211,68 @@ io.on("connection", (socket) => {
   });
 
   // ============================================================
-  // 💬 Mensajes de texto
+  // 💬 Mensajes de texto - CON LOGS MEJORADOS
   // ============================================================
   socket.on("send_message", async (data = {}, ack) => {
-    console.log(`${colors.cyan}💬 [RECV] → send_message recibido:${colors.reset}`, data);
+    const timestamp = new Date().toISOString();
+    console.log(`\n${colors.cyan}╔═══════════════════════════════════════════════════${colors.reset}`);
+    console.log(`${colors.cyan}║ 💬 [${timestamp}] MENSAJE RECIBIDO${colors.reset}`);
+    console.log(`${colors.cyan}╠═══════════════════════════════════════════════════${colors.reset}`);
+    
+    // 📊 LOG DETALLADO DE LA INFORMACIÓN DEL MENSAJE
+    console.log(`${colors.cyan}║ 📋 INFORMACIÓN DEL USUARIO:${colors.reset}`);
+    console.log(`${colors.cyan}║    👤 User ID: ${colors.yellow}${data.userId || 'NO PROPORCIONADO'}${colors.reset}`);
+    console.log(`${colors.cyan}║    🏷️  Username: ${colors.yellow}${data.username || 'NO PROPORCIONADO'}${colors.reset}`);
+    console.log(`${colors.cyan}║    🆔 Socket ID: ${colors.yellow}${socket.id}${colors.reset}`);
+    
+    console.log(`${colors.cyan}║ 📍 INFORMACIÓN DE LA SALA:${colors.reset}`);
+    console.log(`${colors.cyan}║    🏠 Room ID: ${colors.yellow}${data.roomId || 'NO PROPORCIONADO'}${colors.reset}`);
+    const room = rooms.get(data.roomId);
+    console.log(`${colors.cyan}║    👥 Usuarios en sala: ${colors.yellow}${room ? room.users.size : 'SALA NO ENCONTRADA'}${colors.reset}`);
+    
+    console.log(`${colors.cyan}║ 💭 CONTENIDO DEL MENSAJE:${colors.reset}`);
+    console.log(`${colors.cyan}║    📝 Texto: ${colors.yellow}${data.text || 'NO PROPORCIONADO'}${colors.reset}`);
+    console.log(`${colors.cyan}║    📏 Longitud: ${colors.yellow}${data.text ? data.text.length : 0} caracteres${colors.reset}`);
+    
+    console.log(`${colors.cyan}╠═══════════════════════════════════════════════════${colors.reset}`);
 
     const { userId, username, roomId, text } = data;
     if (!userId || !username || !roomId || !text) {
       const msg = "❌ Datos de mensaje inválidos";
-      console.warn(`${colors.red}${msg}${colors.reset}`);
+      console.log(`${colors.cyan}║ ❌ ERROR: ${colors.red}${msg}${colors.reset}`);
+      console.log(`${colors.cyan}╚═══════════════════════════════════════════════════${colors.reset}\n`);
       return ack?.({ success: false, message: msg });
     }
 
     const message = { id: uuidv4(), userId, username, roomId, text, timestamp: Date.now() };
 
     try {
-      console.log(`${colors.yellow}🗂️ Guardando mensaje en Firestore...${colors.reset}`);
+      console.log(`${colors.cyan}║ 🗂️  Guardando mensaje en Firestore...${colors.reset}`);
       await db.collection(MESSAGES_COLLECTION).add(message);
-      console.log(`${colors.green}✅ Mensaje guardado correctamente.${colors.reset}`);
+      console.log(`${colors.cyan}║ ✅ Mensaje guardado correctamente en Firestore${colors.reset}`);
+      console.log(`${colors.cyan}║ 🆔 ID del mensaje: ${colors.yellow}${message.id}${colors.reset}`);
 
+      // 📤 Emitir mensaje a la sala
+      const clientsInRoom = io.sockets.adapter.rooms.get(roomId)?.size || 0;
+      console.log(`${colors.cyan}║ 📤 Enviando mensaje a la sala:${colors.reset}`);
+      console.log(`${colors.cyan}║    🏠 Sala: ${colors.yellow}${roomId}${colors.reset}`);
+      console.log(`${colors.cyan}║    👥 Clientes en sala: ${colors.yellow}${clientsInRoom}${colors.reset}`);
+      
       io.to(roomId).emit("new_message", message);
       socket.emit("message_sent", message);
-      console.log(`${colors.green}💬 [OK] ${username} → [${roomId}]: ${text}${colors.reset}`);
+      
+      console.log(`${colors.cyan}║ ✅ Mensaje emitido correctamente${colors.reset}`);
+      console.log(`${colors.cyan}║ 💬 Resumen: ${colors.green}${username} → [${roomId}]: ${text.substring(0, 50)}${text.length > 50 ? '...' : ''}${colors.reset}`);
+      
       ack?.({ success: true, message: "Mensaje entregado", id: message.id });
-      console.log(`${colors.green}✅ ACK → send_message confirmado (${message.id})${colors.reset}`);
+      console.log(`${colors.cyan}║ ✅ ACK enviado al cliente${colors.reset}`);
+      
     } catch (err) {
-      console.error(`${colors.red}❌ Error al guardar mensaje:${colors.reset}`, err);
+      console.error(`${colors.cyan}║ ❌ Error al procesar mensaje:${colors.red}`, err);
       ack?.({ success: false, message: "Error guardando mensaje" });
     }
+    
+    console.log(`${colors.cyan}╚═══════════════════════════════════════════════════${colors.reset}\n`);
   });
 
   // ============================================================
