@@ -1,7 +1,7 @@
 // ============================================================
 // 🌐 Servidor Node.js con Socket.IO, Firebase Firestore y Storage
 // 💬 Compatible con tu app Android (SocketRepository + ChatViewModel actual)
-// 🎨 Logs detallados con emojis, colores y seguimiento completo
+// 🪲 Modo DEBUG EXTREMO: Logs detallados para cada paso de envío, unión y ACK
 // ============================================================
 
 const express = require("express");
@@ -22,6 +22,7 @@ const colors = {
   magenta: "\x1b[35m",
   blue: "\x1b[34m",
   gray: "\x1b[90m",
+  bold: "\x1b[1m",
 };
 
 const app = express();
@@ -113,17 +114,19 @@ app.get("/rooms", (_, res) => res.json(serializeRooms()));
 // 🔌 Socket.IO
 // ============================================================
 io.on("connection", (socket) => {
-  console.log(`${colors.cyan}✅ Nuevo socket conectado:${colors.reset} ${socket.id}`);
+  console.log(`${colors.cyan}🔗 NUEVA CONEXIÓN SOCKET:${colors.reset} ${socket.id}`);
 
   // ============================================================
   // 🧩 Usuario conectado
   // ============================================================
   socket.on("user-connected", async (user, ack) => {
-    console.log(`${colors.blue}📥 user-connected:${colors.reset}`, user);
+    console.log(`${colors.blue}📥 Evento → user-connected:${colors.reset}`, user);
+
     if (!user || !user.id || !user.username) {
       const msg = "⚠️ Datos de usuario inválidos";
       console.warn(`${colors.yellow}${msg}${colors.reset}`);
-      return ack?.({ success: false, message: msg });
+      ack?.({ success: false, message: msg });
+      return;
     }
 
     socketToUserMap.set(socket.id, user.id);
@@ -137,34 +140,40 @@ io.on("connection", (socket) => {
       } else {
         await userDoc.set({ ...user, isOnline: true, createdAt: Date.now() });
       }
-      console.log(`${colors.green}🔑 Usuario sincronizado en Firebase: ${user.username}${colors.reset}`);
+      console.log(`${colors.green}🔑 Usuario sincronizado con Firebase: ${user.username}${colors.reset}`);
     } catch (error) {
-      console.error(`${colors.red}❌ Error registrando usuario en Firebase:${colors.reset}`, error);
+      console.error(`${colors.red}❌ Error al registrar usuario:${colors.reset}`, error);
     }
 
     io.emit("connected_users", Array.from(connectedUsers.values()));
     socket.emit("room_list", serializeRooms());
     ack?.({ success: true });
+    console.log(`${colors.green}✅ ACK → user-connected confirmado${colors.reset}`);
   });
 
   // ============================================================
   // 🚪 Unión de salas
   // ============================================================
   socket.on("join_room", (data = {}, ack) => {
+    console.log(`${colors.magenta}🚪 Evento → join_room:${colors.reset}`, data);
+
     const roomName = data.room || data.roomId || "salas";
     const { userId, username } = data;
-    console.log(`${colors.magenta}📥 join_room:${colors.reset}`, data);
 
     if (!roomName || !userId || !username) {
       const msg = "❌ Datos de unión incompletos";
       socket.emit("join_error", { message: msg });
-      return ack?.({ success: false, message: msg });
+      ack?.({ success: false, message: msg });
+      console.warn(`${colors.red}${msg}${colors.reset}`);
+      return;
     }
 
     if (!rooms.has(roomName)) {
       const msg = `❌ Sala ${roomName} no existe`;
       socket.emit("join_error", { message: msg });
-      return ack?.({ success: false, message: msg });
+      ack?.({ success: false, message: msg });
+      console.warn(`${colors.red}${msg}${colors.reset}`);
+      return;
     }
 
     const room = rooms.get(roomName);
@@ -172,9 +181,9 @@ io.on("connection", (socket) => {
 
     if (current === roomName) {
       const msg = `ℹ️ ${username} ya estaba en ${roomName}`;
-      socket.emit("room_joined", { roomId: roomName, username, userCount: room.users.size });
       console.log(`${colors.yellow}${msg}${colors.reset}`);
-      return ack?.({ success: true, roomId: roomName, message: msg });
+      ack?.({ success: true, roomId: roomName, message: msg });
+      return;
     }
 
     // 👋 Salir de sala anterior
@@ -196,58 +205,38 @@ io.on("connection", (socket) => {
     socket.emit("room_joined", { roomId: roomName, username, userCount: users.length });
     io.to(roomName).emit("user-joined-room", { roomId: roomName, username, userCount: users.length });
 
-    console.log(`${colors.green}✅ ${username} se unió a ${roomName}${colors.reset}`);
+    console.log(`${colors.green}✅ ${username} se unió correctamente a ${roomName}${colors.reset}`);
     ack?.({ success: true, roomId: roomName, message: `Te uniste a ${roomName}` });
+    console.log(`${colors.green}✅ ACK → join_room confirmado (${roomName})${colors.reset}`);
   });
-
-  socket.on("get_profile", (data, ack) => {
-  const userId = data.userId;
-  // Obtener perfil desde Firestore:
-  db.collection("users").doc(userId).get().then(doc => {
-    if (!doc.exists) return ack({ success: false, message: "Usuario no encontrado" });
-    ack({ success: true, user: doc.data() });
-  }).catch(err => ack({ success: false, message: err.message }));
-});
-
-socket.on("update_profile", (data, ack) => {
-  const userId = data.userId;
-  db.collection("users").doc(userId).update(data)
-    .then(() => ack({ success: true, user: data }))
-    .catch(err => ack({ success: false, message: err.message }));
-});
-
-socket.on("update_status", (data, ack) => {
-  const userId = data.userId;
-  db.collection("users").doc(userId).update({
-    status: data.status,
-    presence: data.presence
-  }).then(() => ack({ success: true }))
-    .catch(err => ack({ success: false, message: err.message }));
-});
-
 
   // ============================================================
   // 💬 Mensajes de texto
   // ============================================================
   socket.on("send_message", async (data = {}, ack) => {
-    const { userId, username, roomId, text } = data;
-    console.log(`${colors.cyan}💬 send_message:${colors.reset}`, data);
+    console.log(`${colors.cyan}💬 [RECV] → send_message recibido:${colors.reset}`, data);
 
+    const { userId, username, roomId, text } = data;
     if (!userId || !username || !roomId || !text) {
       const msg = "❌ Datos de mensaje inválidos";
+      console.warn(`${colors.red}${msg}${colors.reset}`);
       return ack?.({ success: false, message: msg });
     }
 
     const message = { id: uuidv4(), userId, username, roomId, text, timestamp: Date.now() };
 
     try {
+      console.log(`${colors.yellow}🗂️ Guardando mensaje en Firestore...${colors.reset}`);
       await db.collection(MESSAGES_COLLECTION).add(message);
+      console.log(`${colors.green}✅ Mensaje guardado correctamente.${colors.reset}`);
+
       io.to(roomId).emit("new_message", message);
       socket.emit("message_sent", message);
-      console.log(`${colors.green}💬 ${username} → [${roomId}]: ${text}${colors.reset}`);
-      ack?.({ success: true, message: "Mensaje entregado" });
+      console.log(`${colors.green}💬 [OK] ${username} → [${roomId}]: ${text}${colors.reset}`);
+      ack?.({ success: true, message: "Mensaje entregado", id: message.id });
+      console.log(`${colors.green}✅ ACK → send_message confirmado (${message.id})${colors.reset}`);
     } catch (err) {
-      console.error(`${colors.red}❌ Error guardando mensaje:${colors.reset}`, err);
+      console.error(`${colors.red}❌ Error al guardar mensaje:${colors.reset}`, err);
       ack?.({ success: false, message: "Error guardando mensaje" });
     }
   });
@@ -256,17 +245,23 @@ socket.on("update_status", (data, ack) => {
   // 🎧 Mensajes de audio
   // ============================================================
   socket.on("audio_message", async (data = {}, ack) => {
+    console.log(`${colors.blue}🎧 [RECV] → audio_message recibido${colors.reset}`, data.roomId);
+
     const { userId, username, audioData, roomId } = data;
-    console.log(`${colors.blue}🎧 audio_message:${colors.reset}`, roomId);
     if (!audioData || !userId || !roomId) {
-      return ack?.({ success: false, message: "Datos de audio inválidos" });
+      const msg = "❌ Datos de audio inválidos";
+      console.warn(`${colors.red}${msg}${colors.reset}`);
+      return ack?.({ success: false, message: msg });
     }
 
     try {
+      console.log(`${colors.yellow}⬆️ Subiendo archivo a Firebase Storage...${colors.reset}`);
       const buffer = Buffer.from(audioData, "base64");
       const filePath = `audios/${roomId}/${userId}_${Date.now()}_${uuidv4()}.m4a`;
       const file = bucket.file(filePath);
       await file.save(buffer, { contentType: "audio/m4a", resumable: false });
+      console.log(`${colors.green}✅ Archivo subido: ${filePath}${colors.reset}`);
+
       await file.makePublic();
       const url = file.publicUrl();
 
@@ -280,12 +275,16 @@ socket.on("update_status", (data, ack) => {
       };
 
       await db.collection(MESSAGES_COLLECTION).add(audioMsg);
+      console.log(`${colors.green}🗂️ Audio registrado en Firestore.${colors.reset}`);
+
       io.to(roomId).emit("new_message", audioMsg);
       socket.emit("message_sent", audioMsg);
-      console.log(`${colors.green}🎤 Audio de ${username} en [${roomId}] guardado.${colors.reset}`);
+
+      console.log(`${colors.green}🎤 [OK] Audio de ${username} emitido a [${roomId}] → ${url}${colors.reset}`);
       ack?.({ success: true, message: "Audio enviado correctamente", audioUrl: url });
+      console.log(`${colors.green}✅ ACK → audio_message confirmado (${roomId})${colors.reset}`);
     } catch (err) {
-      console.error(`${colors.red}❌ Error subiendo audio:${colors.reset}`, err);
+      console.error(`${colors.red}❌ Error al procesar audio:${colors.reset}`, err);
       ack?.({ success: false, message: "Error subiendo audio" });
     }
   });
@@ -295,6 +294,7 @@ socket.on("update_status", (data, ack) => {
   // ============================================================
   socket.on("get_rooms", (_, ack) => {
     const list = serializeRooms();
+    console.log(`${colors.gray}📋 [RECV] get_rooms solicitado.${colors.reset}`);
     socket.emit("room_list", list);
     ack?.({ success: true, rooms: list });
   });
@@ -302,6 +302,7 @@ socket.on("update_status", (data, ack) => {
   socket.on("get_users", (data = {}, ack) => {
     const { roomId } = data;
     const users = getRoomUsers(roomId || "general");
+    console.log(`${colors.gray}👥 [RECV] get_users → sala:${roomId}${colors.reset}`);
     socket.emit("connected_users", users);
     ack?.({ success: true, users });
   });
