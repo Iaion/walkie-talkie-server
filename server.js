@@ -28,17 +28,14 @@ const colors = {
 const app = express();
 const server = http.createServer(app);
 const io = socketIo(server, {
-  cors: {
-    origin: "*",
-    methods: ["GET", "POST"],
-  },
+  cors: { origin: "*", methods: ["GET", "POST"] },
   transports: ["websocket", "polling"],  // ✅ Acepta ambos tipos
   allowEIO3: true,                        // ✅ Permite clientes antiguos (como el tuyo v2.1.0)
   maxHttpBufferSize: 1e8,                 // ✅ Mantiene el tamaño de audio
 });
 
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: "25mb" })); // por si te llega dataURL base64 grande
 
 // ============================================================
 // 🔥 Firebase
@@ -109,6 +106,45 @@ function getRoomUsers(roomId) {
   const room = rooms.get(roomId);
   if (!room) return [];
   return Array.from(room.users).map((id) => connectedUsers.get(id)).filter(Boolean);
+}
+
+// 🧰 Helpers avatar
+function isHttpUrl(str) {
+  return typeof str === "string" && /^https?:\/\//i.test(str);
+}
+function isDataUrl(str) {
+  return typeof str === "string" && /^data:image\/[a-zA-Z0-9.+-]+;base64,/i.test(str);
+}
+function getMimeFromDataUrl(dataUrl) {
+  const match = /^data:(image\/[a-zA-Z0-9.+-]+);base64,/.exec(dataUrl || "");
+  return match ? match[1] : "image/jpeg";
+}
+function getBase64FromDataUrl(dataUrl) {
+  const idx = (dataUrl || "").indexOf("base64,");
+  return idx !== -1 ? dataUrl.substring(idx + 7) : null;
+}
+
+async function uploadAvatarFromDataUrl(userId, dataUrl) {
+  try {
+    const mime = getMimeFromDataUrl(dataUrl);
+    const ext = mime.split("/")[1] || "jpg";
+    const base64 = getBase64FromDataUrl(dataUrl);
+    if (!base64) throw new Error("Data URL inválida (sin base64)");
+
+    const buffer = Buffer.from(base64, "base64");
+    const filePath = `avatars/${userId}/${Date.now()}_${uuidv4()}.${ext}`;
+    const file = bucket.file(filePath);
+
+    console.log(`${colors.yellow}⬆️ Subiendo avatar → ${filePath} (${mime})${colors.reset}`);
+    await file.save(buffer, { contentType: mime, resumable: false });
+    await file.makePublic();
+    const url = file.publicUrl();
+    console.log(`${colors.green}✅ Avatar subido y público:${colors.reset} ${url}`);
+    return url;
+  } catch (e) {
+    console.error(`${colors.red}❌ Error subiendo avatar:${colors.reset}`, e);
+    throw e;
+  }
 }
 
 // ============================================================
@@ -251,6 +287,98 @@ io.on("connection", (socket) => {
     } catch (err) {
       ack?.({ success: false, message: "Error subiendo audio" });
       console.error(`${colors.red}❌ Error al procesar audio:${colors.reset}`, err);
+    }
+  });
+
+  // ============================================================
+  // 👤 PERFIL: get_profile / update_profile (incluye avatar)
+  // ============================================================
+  socket.on("get_profile", async (data = {}, callback) => {
+    try {
+      const userId = data.userId;
+      if (!userId) {
+        console.warn(`${colors.yellow}⚠️ get_profile sin userId${colors.reset}`);
+        return callback?.({ success: false, message: "userId requerido" });
+      }
+
+      const snap = await db.collection(USERS_COLLECTION).doc(userId).get();
+      if (!snap.exists) {
+        console.warn(`${colors.yellow}⚠️ Perfil no encontrado: ${userId}${colors.reset}`);
+        return callback?.({ success: false, message: "Perfil no encontrado" });
+      }
+
+      const user = snap.data() || {};
+      console.log(`${colors.green}📤 get_profile OK → ${user.username}${colors.reset}`);
+      return callback?.({
+        success: true,
+        ...user, // para compatibilidad si tu cliente esperaba llano
+        // o si preferís:
+        // user
+      });
+    } catch (e) {
+      console.error(`${colors.red}❌ Error get_profile:${colors.reset}`, e);
+      return callback?.({ success: false, message: e.message || "Error interno" });
+    }
+  });
+
+  socket.on("update_profile", async (data = {}, callback) => {
+    try {
+      const {
+        userId,
+        fullName = "",
+        username = "",
+        email = "",
+        phone = "",
+        avatarUri = ""
+      } = data;
+
+      console.log(`${colors.blue}📥 Evento → update_profile:${colors.reset}`, {
+        userId, fullName, username, email, phone,
+        avatarUri: avatarUri ? (isHttpUrl(avatarUri) ? "http-url" : (isDataUrl(avatarUri) ? "data-url" : "otro")) : "vacío"
+      });
+
+      if (!userId) {
+        console.warn(`${colors.yellow}⚠️ update_profile sin userId${colors.reset}`);
+        return callback?.({ success: false, message: "userId requerido" });
+      }
+
+      let finalAvatar = avatarUri || "";
+      if (isDataUrl(avatarUri)) {
+        // subir y obtener URL pública
+        finalAvatar = await uploadAvatarFromDataUrl(userId, avatarUri);
+      } else if (avatarUri && !isHttpUrl(avatarUri)) {
+        // si llega algo raro, lo ignoramos para no romper
+        console.warn(`${colors.yellow}⚠️ avatarUri no es URL ni DataURL, se ignora${colors.reset}`);
+        finalAvatar = "";
+      }
+
+      const updatedUser = {
+        id: userId,
+        fullName,
+        username,
+        email,
+        phone,
+        avatarUri: finalAvatar,
+        status: "Online",      // puedes conservar estos defaults si tu app los usa
+        presence: "Available",
+        updatedAt: Date.now()
+      };
+
+      await db.collection(USERS_COLLECTION).doc(userId).set(updatedUser, { merge: true });
+      connectedUsers.set(userId, { ...(connectedUsers.get(userId) || {}), ...updatedUser, socketId: socket.id, isOnline: true });
+
+      console.log(`${colors.green}✅ Perfil actualizado para ${username}${colors.reset}`);
+      io.emit("user_updated", updatedUser); // opcional: broadcast para UI en vivo
+
+      return callback?.({
+        success: true,
+        message: "Perfil actualizado correctamente",
+        user: updatedUser
+      });
+
+    } catch (error) {
+      console.error(`${colors.red}❌ Error en update_profile:${colors.reset}`, error);
+      return callback?.({ success: false, message: error.message || "Error interno del servidor" });
     }
   });
 
