@@ -1,7 +1,7 @@
 // ============================================================
-// 🌐 Servidor Node.js con Socket.IO, Firebase Firestore y Storage
-// 💬 Compatible con tu app Android (SocketRepository + ChatViewModel actual)
-// 🪲 Modo DEBUG EXTREMO: Logs detallados para cada paso de envío, unión y ACK
+// 🌐 Servidor Node.js con Socket.IO, Firebase Firestore y Storage + PTT
+// 💬 Compatible con tu app Android (SocketRepository, ChatViewModel, PTTManager)
+// 🪲 Modo DEBUG EXTREMO: Logs detallados para cada paso de unión, envío y token
 // ============================================================
 
 const express = require("express");
@@ -68,6 +68,9 @@ const connectedUsers = new Map();
 const socketToUserMap = new Map();
 const rooms = new Map();
 const userToRoomMap = new Map();
+
+// 🆕 Estado PTT: 1 solo hablante por sala
+const pttState = {}; // { roomId: { speakerId, speakerName, startedAt } }
 
 // ============================================================
 // 🚪 Salas base
@@ -164,7 +167,6 @@ io.on("connection", (socket) => {
       const msg = "❌ Datos de unión incompletos";
       socket.emit("join_error", { message: msg });
       ack?.({ success: false, message: msg });
-      console.warn(`${colors.red}${msg}${colors.reset}`);
       return;
     }
 
@@ -172,31 +174,18 @@ io.on("connection", (socket) => {
       const msg = `❌ Sala ${roomName} no existe`;
       socket.emit("join_error", { message: msg });
       ack?.({ success: false, message: msg });
-      console.warn(`${colors.red}${msg}${colors.reset}`);
       return;
     }
 
     const room = rooms.get(roomName);
-    const current = userToRoomMap.get(userId);
-
-    if (current === roomName) {
-      const msg = `ℹ️ ${username} ya estaba en ${roomName}`;
-      console.log(`${colors.yellow}${msg}${colors.reset}`);
-      ack?.({ success: true, roomId: roomName, message: msg });
-      return;
-    }
-
-    // 👋 Salir de sala anterior
     const prevRoomId = userToRoomMap.get(userId);
     if (prevRoomId && rooms.has(prevRoomId)) {
       const prev = rooms.get(prevRoomId);
       prev.users.delete(userId);
       socket.leave(prevRoomId);
       io.to(prevRoomId).emit("user-left-room", { roomId: prevRoomId, userCount: prev.users.size });
-      console.log(`${colors.gray}👋 ${username} salió de ${prevRoomId}${colors.reset}`);
     }
 
-    // 🚪 Unirse a nueva sala
     socket.join(roomName);
     room.users.add(userId);
     userToRoomMap.set(userId, roomName);
@@ -207,37 +196,27 @@ io.on("connection", (socket) => {
 
     console.log(`${colors.green}✅ ${username} se unió correctamente a ${roomName}${colors.reset}`);
     ack?.({ success: true, roomId: roomName, message: `Te uniste a ${roomName}` });
-    console.log(`${colors.green}✅ ACK → join_room confirmado (${roomName})${colors.reset}`);
   });
 
   // ============================================================
   // 💬 Mensajes de texto
   // ============================================================
   socket.on("send_message", async (data = {}, ack) => {
-    console.log(`${colors.cyan}💬 [RECV] → send_message recibido:${colors.reset}`, data);
-
     const { userId, username, roomId, text } = data;
-    if (!userId || !username || !roomId || !text) {
-      const msg = "❌ Datos de mensaje inválidos";
-      console.warn(`${colors.red}${msg}${colors.reset}`);
-      return ack?.({ success: false, message: msg });
-    }
+    if (!userId || !username || !roomId || !text)
+      return ack?.({ success: false, message: "❌ Datos de mensaje inválidos" });
 
     const message = { id: uuidv4(), userId, username, roomId, text, timestamp: Date.now() };
 
     try {
-      console.log(`${colors.yellow}🗂️ Guardando mensaje en Firestore...${colors.reset}`);
       await db.collection(MESSAGES_COLLECTION).add(message);
-      console.log(`${colors.green}✅ Mensaje guardado correctamente.${colors.reset}`);
-
       io.to(roomId).emit("new_message", message);
       socket.emit("message_sent", message);
+      ack?.({ success: true, id: message.id });
       console.log(`${colors.green}💬 [OK] ${username} → [${roomId}]: ${text}${colors.reset}`);
-      ack?.({ success: true, message: "Mensaje entregado", id: message.id });
-      console.log(`${colors.green}✅ ACK → send_message confirmado (${message.id})${colors.reset}`);
     } catch (err) {
-      console.error(`${colors.red}❌ Error al guardar mensaje:${colors.reset}`, err);
       ack?.({ success: false, message: "Error guardando mensaje" });
+      console.error(`${colors.red}❌ Error al guardar mensaje:${colors.reset}`, err);
     }
   });
 
@@ -245,48 +224,66 @@ io.on("connection", (socket) => {
   // 🎧 Mensajes de audio
   // ============================================================
   socket.on("audio_message", async (data = {}, ack) => {
-    console.log(`${colors.blue}🎧 [RECV] → audio_message recibido${colors.reset}`, data.roomId);
-
     const { userId, username, audioData, roomId } = data;
-    if (!audioData || !userId || !roomId) {
-      const msg = "❌ Datos de audio inválidos";
-      console.warn(`${colors.red}${msg}${colors.reset}`);
-      return ack?.({ success: false, message: msg });
-    }
+    if (!audioData || !userId || !roomId)
+      return ack?.({ success: false, message: "❌ Datos de audio inválidos" });
 
     try {
-      console.log(`${colors.yellow}⬆️ Subiendo archivo a Firebase Storage...${colors.reset}`);
       const buffer = Buffer.from(audioData, "base64");
       const filePath = `audios/${roomId}/${userId}_${Date.now()}_${uuidv4()}.m4a`;
       const file = bucket.file(filePath);
       await file.save(buffer, { contentType: "audio/m4a", resumable: false });
-      console.log(`${colors.green}✅ Archivo subido: ${filePath}${colors.reset}`);
-
       await file.makePublic();
       const url = file.publicUrl();
 
-      const audioMsg = {
-        id: uuidv4(),
-        userId,
-        username,
-        roomId,
-        audioUrl: url,
-        timestamp: Date.now(),
-      };
-
+      const audioMsg = { id: uuidv4(), userId, username, roomId, audioUrl: url, timestamp: Date.now() };
       await db.collection(MESSAGES_COLLECTION).add(audioMsg);
-      console.log(`${colors.green}🗂️ Audio registrado en Firestore.${colors.reset}`);
-
       io.to(roomId).emit("new_message", audioMsg);
       socket.emit("message_sent", audioMsg);
+      ack?.({ success: true, audioUrl: url });
 
-      console.log(`${colors.green}🎤 [OK] Audio de ${username} emitido a [${roomId}] → ${url}${colors.reset}`);
-      ack?.({ success: true, message: "Audio enviado correctamente", audioUrl: url });
-      console.log(`${colors.green}✅ ACK → audio_message confirmado (${roomId})${colors.reset}`);
+      console.log(`${colors.green}🎤 Audio → ${username} en [${roomId}] → ${url}${colors.reset}`);
     } catch (err) {
-      console.error(`${colors.red}❌ Error al procesar audio:${colors.reset}`, err);
       ack?.({ success: false, message: "Error subiendo audio" });
+      console.error(`${colors.red}❌ Error al procesar audio:${colors.reset}`, err);
     }
+  });
+
+  // ============================================================
+  // 🔊 FUNCIONALIDAD PTT (Push-To-Talk)
+  // ============================================================
+  socket.on("request_talk_token", (data = {}) => {
+    const { roomId, userId, username } = data;
+    if (!roomId || !userId) return;
+
+    const room = rooms.get(roomId);
+    if (!room) return;
+
+    if (!pttState[roomId] || !pttState[roomId].speakerId) {
+      // Nadie hablando → concede token
+      pttState[roomId] = { speakerId: userId, speakerName: username, startedAt: Date.now() };
+      socket.emit("token_granted", { roomId, userId, username });
+      io.to(roomId).emit("current_speaker_update", userId);
+      console.log(`${colors.green}🎙️ Token concedido a ${username} (${userId}) en ${roomId}${colors.reset}`);
+    } else {
+      // Ya hay alguien hablando
+      socket.emit("token_denied", {
+        roomId,
+        currentSpeaker: pttState[roomId].speakerId,
+      });
+      console.log(`${colors.yellow}🚫 Token denegado a ${username}, ya habla ${pttState[roomId].speakerName}${colors.reset}`);
+    }
+  });
+
+  socket.on("release_talk_token", (data = {}) => {
+    const { roomId, userId } = data;
+    const state = pttState[roomId];
+    if (!state || state.speakerId !== userId) return;
+
+    console.log(`${colors.gray}🔓 Token liberado por ${userId} en ${roomId}${colors.reset}`);
+    pttState[roomId] = null;
+    io.to(roomId).emit("token_released", { roomId, currentSpeaker: null });
+    io.to(roomId).emit("current_speaker_update", null);
   });
 
   // ============================================================
@@ -294,7 +291,6 @@ io.on("connection", (socket) => {
   // ============================================================
   socket.on("get_rooms", (_, ack) => {
     const list = serializeRooms();
-    console.log(`${colors.gray}📋 [RECV] get_rooms solicitado.${colors.reset}`);
     socket.emit("room_list", list);
     ack?.({ success: true, rooms: list });
   });
@@ -302,7 +298,6 @@ io.on("connection", (socket) => {
   socket.on("get_users", (data = {}, ack) => {
     const { roomId } = data;
     const users = getRoomUsers(roomId || "general");
-    console.log(`${colors.gray}👥 [RECV] get_users → sala:${roomId}${colors.reset}`);
     socket.emit("connected_users", users);
     ack?.({ success: true, users });
   });
@@ -318,14 +313,19 @@ io.on("connection", (socket) => {
         const r = rooms.get(prevRoom);
         r.users.delete(userId);
         io.to(prevRoom).emit("user-left-room", { roomId: prevRoom, userCount: r.users.size });
+
+        // Si el usuario era el hablante PTT, liberar token
+        if (pttState[prevRoom] && pttState[prevRoom].speakerId === userId) {
+          pttState[prevRoom] = null;
+          io.to(prevRoom).emit("token_released", { roomId: prevRoom, currentSpeaker: null });
+          io.to(prevRoom).emit("current_speaker_update", null);
+          console.log(`${colors.red}🎙️ Token liberado por desconexión de ${userId}${colors.reset}`);
+        }
       }
       connectedUsers.delete(userId);
       userToRoomMap.delete(userId);
       socketToUserMap.delete(socket.id);
       io.emit("connected_users", Array.from(connectedUsers.values()));
-      console.log(`${colors.red}🔴 Usuario desconectado:${colors.reset} ${userId}`);
-    } else {
-      console.log(`${colors.red}🔴 Socket desconectado sin usuario:${colors.reset} ${socket.id}`);
     }
   });
 });
@@ -335,6 +335,6 @@ io.on("connection", (socket) => {
 // ============================================================
 const PORT = process.env.PORT || 8080;
 server.listen(PORT, () => {
-  console.log(`${colors.green}🚀 Servidor de chat corriendo en puerto ${PORT}${colors.reset}`);
+  console.log(`${colors.green}🚀 Servidor de chat+PTT corriendo en puerto ${PORT}${colors.reset}`);
   console.log(`${colors.cyan}🌐 http://localhost:${PORT}${colors.reset}`);
 });
