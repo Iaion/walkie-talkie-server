@@ -28,8 +28,13 @@ const colors = {
 const app = express();
 const server = http.createServer(app);
 const io = socketIo(server, {
-  cors: { origin: "*", methods: ["GET", "POST"] },
-  maxHttpBufferSize: 1e8,
+  cors: {
+    origin: "*",
+    methods: ["GET", "POST"],
+  },
+  transports: ["websocket", "polling"],  // ✅ Acepta ambos tipos
+  allowEIO3: true,                        // ✅ Permite clientes antiguos (como el tuyo v2.1.0)
+  maxHttpBufferSize: 1e8,                 // ✅ Mantiene el tamaño de audio
 });
 
 app.use(cors());
