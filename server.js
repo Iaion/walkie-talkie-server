@@ -29,13 +29,13 @@ const app = express();
 const server = http.createServer(app);
 const io = socketIo(server, {
   cors: { origin: "*", methods: ["GET", "POST"] },
-  transports: ["websocket", "polling"], // ✅ Acepta ambos tipos
-  allowEIO3: true, // ✅ Permite clientes antiguos (como el tuyo v2.1.0)
-  maxHttpBufferSize: 1e8, // ✅ Mantiene el tamaño de audio
+  transports: ["websocket", "polling"],  // ✅ Acepta ambos tipos
+  allowEIO3: true,                        // ✅ Permite clientes antiguos (como el tuyo v2.1.0)
+  maxHttpBufferSize: 1e8,                 // ✅ Mantiene el tamaño de audio
 });
 
 app.use(cors());
-app.use(express.json({ limit: "25mb" }));
+app.use(express.json({ limit: "25mb" })); // por si te llega dataURL base64 grande
 
 // ============================================================
 // 🔥 Firebase
@@ -64,13 +64,22 @@ const USERS_COLLECTION = "users";
 const MESSAGES_COLLECTION = "messages";
 
 // ============================================================
-// 📦 Estado en memoria (multi-socket compatible)
+// 📦 Estado en memoria (robusto, multi-socket)
 // ============================================================
-const connectedUsers = new Map(); // userId -> {userData, sockets: Set()}
-const socketToUserMap = new Map(); // socketId -> userId
-const rooms = new Map();
+// userId -> { userData, sockets: Set<socketId> }
+const connectedUsers = new Map();
+// socketId -> userId
+const socketToUserMap = new Map();
+// socketId -> roomId (sala por socket, evita “patearse” entre dispositivos)
+const socketToRoomMap = new Map();
+// userId -> lastRoomId (para rejoin automático)
 const userToRoomMap = new Map();
-const pttState = {}; // { roomId: { speakerId, speakerName, startedAt } }
+
+const rooms = new Map();
+
+// 🆕 Estado PTT: 1 solo hablante por sala
+// { roomId: { speakerId, speakerName, startedAt } }
+const pttState = {};
 
 // ============================================================
 // 🚪 Salas base
@@ -103,10 +112,13 @@ function serializeRooms() {
 function getRoomUsers(roomId) {
   const room = rooms.get(roomId);
   if (!room) return [];
-  return Array.from(room.users).map((id) => {
-    const u = connectedUsers.get(id);
-    return u ? { ...u.userData, isOnline: true } : null;
-  }).filter(Boolean);
+  // Devolvemos info de usuario (una sola vez por userId), independientemente de la cantidad de sockets
+  return Array.from(room.users)
+    .map((userId) => {
+      const entry = connectedUsers.get(userId);
+      return entry ? { ...entry.userData, isOnline: true } : null;
+    })
+    .filter(Boolean);
 }
 
 // 🧰 Helpers avatar
@@ -124,15 +136,18 @@ function getBase64FromDataUrl(dataUrl) {
   const idx = (dataUrl || "").indexOf("base64,");
   return idx !== -1 ? dataUrl.substring(idx + 7) : null;
 }
+
 async function uploadAvatarFromDataUrl(userId, dataUrl) {
   try {
     const mime = getMimeFromDataUrl(dataUrl);
     const ext = mime.split("/")[1] || "jpg";
     const base64 = getBase64FromDataUrl(dataUrl);
     if (!base64) throw new Error("Data URL inválida (sin base64)");
+
     const buffer = Buffer.from(base64, "base64");
     const filePath = `avatars/${userId}/${Date.now()}_${uuidv4()}.${ext}`;
     const file = bucket.file(filePath);
+
     console.log(`${colors.yellow}⬆️ Subiendo avatar → ${filePath} (${mime})${colors.reset}`);
     await file.save(buffer, { contentType: mime, resumable: false });
     await file.makePublic();
@@ -149,13 +164,14 @@ async function uploadAvatarFromDataUrl(userId, dataUrl) {
 // 🌐 Endpoints REST
 // ============================================================
 app.get("/health", (_, res) => res.status(200).send("Servidor operativo 🚀"));
-app.get("/users", (_, res) => {
-  const users = Array.from(connectedUsers.values()).map(u => ({
-    ...u.userData,
-    socketCount: u.sockets.size
-  }));
-  res.json(users);
-});
+app.get("/users", (_, res) =>
+  res.json(
+    Array.from(connectedUsers.values()).map((u) => ({
+      ...u.userData,
+      socketCount: u.sockets.size,
+    }))
+  )
+);
 app.get("/rooms", (_, res) => res.json(serializeRooms()));
 
 // ============================================================
@@ -180,7 +196,7 @@ io.on("connection", (socket) => {
     const userId = user.id;
     socketToUserMap.set(socket.id, userId);
 
-    // 👥 Permitir múltiples conexiones por usuario
+    // 👥 Multi-socket por usuario
     const existing = connectedUsers.get(userId);
     if (existing) {
       existing.sockets.add(socket.id);
@@ -189,25 +205,31 @@ io.on("connection", (socket) => {
       connectedUsers.set(userId, { userData: { ...user, isOnline: true }, sockets: new Set([socket.id]) });
     }
 
-    // 🔥 Firebase sync
+    // 🆕 Reasociar a última sala si existe
+    const lastRoom = userToRoomMap.get(userId);
+    if (lastRoom && rooms.has(lastRoom)) {
+      socket.join(lastRoom);
+      socketToRoomMap.set(socket.id, lastRoom);
+      rooms.get(lastRoom).users.add(userId);
+
+      // Enviar doble confirmación para tu cliente (ACK + evento)
+      socket.emit("join_success", { room: lastRoom, roomId: lastRoom, message: "Reingreso automático" });
+      console.log(`${colors.green}🔁 ${user.username} reingresó a ${lastRoom}${colors.reset}`);
+    }
+
+    // 🔥 Firebase
     try {
       const userDoc = db.collection(USERS_COLLECTION).doc(userId);
-      const snapshot = await userDoc.get();
-      if (snapshot.exists) {
-        await userDoc.update({ ...user, isOnline: true, lastLogin: Date.now() });
-      } else {
-        await userDoc.set({ ...user, isOnline: true, createdAt: Date.now() });
-      }
+      await userDoc.set({ ...user, isOnline: true, lastLogin: Date.now() }, { merge: true });
       console.log(`${colors.green}🔑 Usuario sincronizado con Firebase: ${user.username}${colors.reset}`);
     } catch (error) {
       console.error(`${colors.red}❌ Error al registrar usuario:${colors.reset}`, error);
     }
 
-    io.emit("connected_users", Array.from(connectedUsers.values()).map(u => ({
-      ...u.userData,
-      socketCount: u.sockets.size
-    })));
-
+    io.emit(
+      "connected_users",
+      Array.from(connectedUsers.values()).map((u) => ({ ...u.userData, socketCount: u.sockets.size }))
+    );
     socket.emit("room_list", serializeRooms());
     ack?.({ success: true });
     console.log(`${colors.green}✅ ACK → user-connected confirmado${colors.reset}`);
@@ -221,12 +243,14 @@ io.on("connection", (socket) => {
 
     const roomName = data.room || data.roomId || "salas";
     const { userId, username } = data;
+
     if (!roomName || !userId || !username) {
       const msg = "❌ Datos de unión incompletos";
       socket.emit("join_error", { message: msg });
       ack?.({ success: false, message: msg });
       return;
     }
+
     if (!rooms.has(roomName)) {
       const msg = `❌ Sala ${roomName} no existe`;
       socket.emit("join_error", { message: msg });
@@ -234,17 +258,74 @@ io.on("connection", (socket) => {
       return;
     }
 
-    const room = rooms.get(roomName);
+    // ⚠️ OJO: mapeamos la sala por *socket*, no por usuario (para multi-dispositivo)
+    const prevRoomId = socketToRoomMap.get(socket.id);
+    if (prevRoomId && rooms.has(prevRoomId)) {
+      const prev = rooms.get(prevRoomId);
+      socket.leave(prevRoomId);
+      // Si no quedan otros sockets del mismo usuario en esa sala, quitar userId del Set
+      const stillInPrev = Array.from(connectedUsers.get(userId)?.sockets || []).some(
+        (sid) => socketToRoomMap.get(sid) === prevRoomId && sid !== socket.id
+      );
+      if (!stillInPrev) {
+        prev.users.delete(userId);
+        io.to(prevRoomId).emit("user-left-room", { roomId: prevRoomId, userCount: prev.users.size });
+      }
+    }
+
     socket.join(roomName);
-    room.users.add(userId);
-    userToRoomMap.set(userId, roomName);
+    socketToRoomMap.set(socket.id, roomName);
+    userToRoomMap.set(userId, roomName); // última sala conocida (para rejoin automático)
+    rooms.get(roomName).users.add(userId);
 
     const users = getRoomUsers(roomName);
-    socket.emit("room_joined", { roomId: roomName, username, userCount: users.length });
+    // Doble confirmación: evento + ACK
+    socket.emit("join_success", { room: roomName, roomId: roomName, userCount: users.length });
     io.to(roomName).emit("user-joined-room", { roomId: roomName, username, userCount: users.length });
 
     console.log(`${colors.green}✅ ${username} se unió correctamente a ${roomName}${colors.reset}`);
-    ack?.({ success: true, roomId: roomName, message: `Te uniste a ${roomName}` });
+    ack?.({ success: true, room: roomName, roomId: roomName, message: `Te uniste a ${roomName}` });
+  });
+
+  // ============================================================
+  // 🚪 Salir de sala (tu app lo emite)
+  // ============================================================
+  socket.on("leave_room", (data = {}, ack) => {
+    const { roomId, userId, username } = data || {};
+    const currentRoom = socketToRoomMap.get(socket.id) || roomId;
+
+    if (!currentRoom || !rooms.has(currentRoom) || !userId) {
+      const msg = "⚠️ leave_room: datos inválidos";
+      ack?.({ success: false, message: msg });
+      return;
+    }
+
+    socket.leave(currentRoom);
+    socketToRoomMap.delete(socket.id);
+
+    // ¿Queda otro socket de este usuario en la misma sala?
+    const hasAnotherSocketInRoom = Array.from(connectedUsers.get(userId)?.sockets || []).some(
+      (sid) => socketToRoomMap.get(sid) === currentRoom
+    );
+
+    if (!hasAnotherSocketInRoom) {
+      const r = rooms.get(currentRoom);
+      r.users.delete(userId);
+
+      // Si era el hablante PTT, liberar token
+      if (pttState[currentRoom] && pttState[currentRoom].speakerId === userId) {
+        pttState[currentRoom] = null;
+        io.to(currentRoom).emit("token_released", { roomId: currentRoom, currentSpeaker: null });
+        io.to(currentRoom).emit("current_speaker_update", null);
+        console.log(`${colors.red}🎙️ Token liberado (leave_room) por ${userId}${colors.reset}`);
+      }
+
+      io.to(currentRoom).emit("user-left-room", { roomId: currentRoom, username, userCount: r.users.size });
+    }
+
+    socket.emit("left_room", { roomId: currentRoom });
+    ack?.({ success: true, roomId: currentRoom });
+    console.log(`${colors.gray}👋 ${username || userId} salió de ${currentRoom}${colors.reset}`);
   });
 
   // ============================================================
@@ -252,10 +333,12 @@ io.on("connection", (socket) => {
   // ============================================================
   socket.on("send_message", async (data = {}, ack) => {
     const { userId, username, roomId, text } = data;
-    if (!userId || !username || !roomId || !text)
+    if (!userId || !username || !roomId || !text) {
       return ack?.({ success: false, message: "❌ Datos de mensaje inválidos" });
+    }
 
     const message = { id: uuidv4(), userId, username, roomId, text, timestamp: Date.now() };
+
     try {
       await db.collection(MESSAGES_COLLECTION).add(message);
       io.to(roomId).emit("new_message", message);
@@ -269,12 +352,13 @@ io.on("connection", (socket) => {
   });
 
   // ============================================================
-  // 🎧 Mensajes de audio
+  // 🎧 Mensajes de audio (base64 -> Storage)
   // ============================================================
   socket.on("audio_message", async (data = {}, ack) => {
     const { userId, username, audioData, roomId } = data;
     if (!audioData || !userId || !roomId)
       return ack?.({ success: false, message: "❌ Datos de audio inválidos" });
+
     try {
       const buffer = Buffer.from(audioData, "base64");
       const filePath = `audios/${roomId}/${userId}_${Date.now()}_${uuidv4()}.m4a`;
@@ -282,16 +366,145 @@ io.on("connection", (socket) => {
       await file.save(buffer, { contentType: "audio/m4a", resumable: false });
       await file.makePublic();
       const url = file.publicUrl();
+
       const audioMsg = { id: uuidv4(), userId, username, roomId, audioUrl: url, timestamp: Date.now() };
       await db.collection(MESSAGES_COLLECTION).add(audioMsg);
       io.to(roomId).emit("new_message", audioMsg);
       socket.emit("message_sent", audioMsg);
       ack?.({ success: true, audioUrl: url });
+
       console.log(`${colors.green}🎤 Audio → ${username} en [${roomId}] → ${url}${colors.reset}`);
     } catch (err) {
       ack?.({ success: false, message: "Error subiendo audio" });
       console.error(`${colors.red}❌ Error al procesar audio:${colors.reset}`, err);
     }
+  });
+
+  // ============================================================
+  // 👤 PERFIL: get_profile / update_profile (incluye avatar)
+  // ============================================================
+  socket.on("get_profile", async (data = {}, callback) => {
+    try {
+      const userId = data.userId;
+      if (!userId) {
+        console.warn(`${colors.yellow}⚠️ get_profile sin userId${colors.reset}`);
+        return callback?.({ success: false, message: "userId requerido" });
+      }
+
+      const snap = await db.collection(USERS_COLLECTION).doc(userId).get();
+      if (!snap.exists) {
+        console.warn(`${colors.yellow}⚠️ Perfil no encontrado: ${userId}${colors.reset}`);
+        return callback?.({ success: false, message: "Perfil no encontrado" });
+      }
+
+      const user = snap.data() || {};
+      console.log(`${colors.green}📤 get_profile OK → ${user.username}${colors.reset}`);
+      return callback?.({
+        success: true,
+        ...user,
+      });
+    } catch (e) {
+      console.error(`${colors.red}❌ Error get_profile:${colors.reset}`, e);
+      return callback?.({ success: false, message: e.message || "Error interno" });
+    }
+  });
+
+  socket.on("update_profile", async (data = {}, callback) => {
+    try {
+      const {
+        userId,
+        fullName = "",
+        username = "",
+        email = "",
+        phone = "",
+        avatarUri = "",
+      } = data;
+
+      console.log(`${colors.blue}📥 Evento → update_profile:${colors.reset}`, {
+        userId, fullName, username, email, phone,
+        avatarUri: avatarUri ? (isHttpUrl(avatarUri) ? "http-url" : (isDataUrl(avatarUri) ? "data-url" : "otro")) : "vacío"
+      });
+
+      if (!userId) {
+        console.warn(`${colors.yellow}⚠️ update_profile sin userId${colors.reset}`);
+        return callback?.({ success: false, message: "userId requerido" });
+      }
+
+      let finalAvatar = avatarUri || "";
+      if (isDataUrl(avatarUri)) {
+        finalAvatar = await uploadAvatarFromDataUrl(userId, avatarUri);
+      } else if (avatarUri && !isHttpUrl(avatarUri)) {
+        console.warn(`${colors.yellow}⚠️ avatarUri no es URL ni DataURL, se ignora${colors.reset}`);
+        finalAvatar = "";
+      }
+
+      const updatedUser = {
+        id: userId,
+        fullName,
+        username,
+        email,
+        phone,
+        avatarUri: finalAvatar,
+        status: "Online",
+        presence: "Available",
+        updatedAt: Date.now(),
+      };
+
+      await db.collection(USERS_COLLECTION).doc(userId).set(updatedUser, { merge: true });
+
+      const entry = connectedUsers.get(userId);
+      if (entry) {
+        entry.userData = { ...entry.userData, ...updatedUser };
+      }
+
+      console.log(`${colors.green}✅ Perfil actualizado para ${username}${colors.reset}`);
+      io.emit("user_updated", updatedUser);
+
+      return callback?.({
+        success: true,
+        message: "Perfil actualizado correctamente",
+        user: updatedUser,
+      });
+
+    } catch (error) {
+      console.error(`${colors.red}❌ Error en update_profile:${colors.reset}`, error);
+      return callback?.({ success: false, message: error.message || "Error interno del servidor" });
+    }
+  });
+
+  // ============================================================
+  // 🔊 FUNCIONALIDAD PTT (Push-To-Talk)
+  // ============================================================
+  socket.on("request_talk_token", (data = {}) => {
+    const { roomId, userId, username } = data;
+    if (!roomId || !userId) return;
+
+    const room = rooms.get(roomId);
+    if (!room) return;
+
+    if (!pttState[roomId] || !pttState[roomId].speakerId) {
+      pttState[roomId] = { speakerId: userId, speakerName: username, startedAt: Date.now() };
+      socket.emit("token_granted", { roomId, userId, username });
+      io.to(roomId).emit("current_speaker_update", userId);
+      console.log(`${colors.green}🎙️ Token concedido a ${username} (${userId}) en ${roomId}${colors.reset}`);
+    } else {
+      socket.emit("token_denied", {
+        roomId,
+        currentSpeaker: pttState[roomId].speakerId,
+      });
+      console.log(`${colors.yellow}🚫 Token denegado a ${username}, ya habla ${pttState[roomId].speakerName}${colors.reset}`);
+    }
+  });
+
+  socket.on("release_talk_token", (data = {}) => {
+    const { roomId, userId } = data;
+    const state = pttState[roomId];
+    if (!state || state.speakerId !== userId) return;
+
+    console.log(`${colors.gray}🔓 Token liberado por ${userId} en ${roomId}${colors.reset}`);
+    pttState[roomId] = null;
+    io.to(roomId).emit("token_released", { roomId, currentSpeaker: null });
+    io.to(roomId).emit("current_speaker_update", null);
   });
 
   // ============================================================
@@ -311,30 +524,63 @@ io.on("connection", (socket) => {
   });
 
   // ============================================================
+  // 🔄 (Opcional) Aviso de intento de reconexión del cliente
+  // ============================================================
+  socket.on("reconnect_attempt", () => {
+    const userId = socketToUserMap.get(socket.id);
+    const roomId = socketToRoomMap.get(socket.id);
+    console.log(`${colors.yellow}♻️ reconnect_attempt: user=${userId} room=${roomId || "-"}${colors.reset}`);
+    if (roomId) socket.emit("join_success", { room: roomId, roomId });
+  });
+
+  // ============================================================
   // 🔴 Desconexión (multi-socket segura)
   // ============================================================
   socket.on("disconnect", () => {
     const userId = socketToUserMap.get(socket.id);
-    if (!userId) return;
+    const roomId = socketToRoomMap.get(socket.id);
 
-    const entry = connectedUsers.get(userId);
-    if (!entry) return;
+    if (roomId && rooms.has(roomId) && userId) {
+      // ¿Queda otro socket del mismo user en la sala?
+      const stillInRoom = Array.from(connectedUsers.get(userId)?.sockets || []).some(
+        (sid) => sid !== socket.id && socketToRoomMap.get(sid) === roomId
+      );
+      if (!stillInRoom) {
+        const r = rooms.get(roomId);
+        r.users.delete(userId);
 
-    entry.sockets.delete(socket.id);
-    socketToUserMap.delete(socket.id);
+        // Si era el hablante PTT, liberar token
+        if (pttState[roomId] && pttState[roomId].speakerId === userId) {
+          pttState[roomId] = null;
+          io.to(roomId).emit("token_released", { roomId, currentSpeaker: null });
+          io.to(roomId).emit("current_speaker_update", null);
+          console.log(`${colors.red}🎙️ Token liberado por desconexión de ${userId}${colors.reset}`);
+        }
 
-    if (entry.sockets.size === 0) {
-      connectedUsers.delete(userId);
-      userToRoomMap.delete(userId);
-      console.log(`${colors.red}🔴 Usuario ${userId} sin sesiones activas, eliminado.${colors.reset}`);
-    } else {
-      console.log(`${colors.yellow}⚪ Usuario ${userId} cerró una sesión (${entry.sockets.size} restantes).${colors.reset}`);
+        io.to(roomId).emit("user-left-room", { roomId, userCount: r.users.size });
+      }
     }
 
-    io.emit("connected_users", Array.from(connectedUsers.values()).map(u => ({
-      ...u.userData,
-      socketCount: u.sockets.size
-    })));
+    if (userId) {
+      const entry = connectedUsers.get(userId);
+      if (entry) {
+        entry.sockets.delete(socket.id);
+        if (entry.sockets.size === 0) {
+          connectedUsers.delete(userId);
+          console.log(`${colors.red}🔴 Usuario ${userId} sin sesiones activas, eliminado.${colors.reset}`);
+        } else {
+          console.log(`${colors.yellow}⚪ Usuario ${userId} cerró una sesión (${entry.sockets.size} restantes).${colors.reset}`);
+        }
+      }
+    }
+
+    socketToRoomMap.delete(socket.id);
+    socketToUserMap.delete(socket.id);
+
+    io.emit(
+      "connected_users",
+      Array.from(connectedUsers.values()).map((u) => ({ ...u.userData, socketCount: u.sockets.size }))
+    );
   });
 });
 
