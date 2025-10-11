@@ -475,71 +475,203 @@ io.on("connection", (socket) => {
     // ============================================================
   // 🔊 FUNCIONALIDAD PTT (Push-To-Talk)
   // ============================================================
-  socket.on("request_talk_token", (data = {}, ack) => {
-    const { roomId, userId, username } = data;
-    if (!roomId || !userId) {
-      const msg = "⚠️ request_talk_token: datos inválidos";
-      console.warn(`${colors.yellow}${msg}${colors.reset}`, data);
-      return ack?.({ success: false, message: msg });
+ // ============================================================
+// 👤 PERFIL: get_profile / update_profile (incluye avatar)
+// ============================================================
+socket.on("get_profile", async (data = {}, callback) => {
+  try {
+    const userId = data.userId;
+    console.log(`${colors.cyan}📥 Evento → get_profile${colors.reset} desde socket ${socket.id}`, data);
+
+    if (!userId) {
+      console.warn(`${colors.yellow}⚠️ get_profile sin userId${colors.reset}`);
+      return callback?.({ success: false, message: "userId requerido" });
     }
 
-    const room = rooms.get(roomId);
-    if (!room) {
-      const msg = `❌ Sala no encontrada (${roomId})`;
-      console.warn(`${colors.red}${msg}${colors.reset}`);
-      return ack?.({ success: false, message: msg });
+    const snap = await db.collection(USERS_COLLECTION).doc(userId).get();
+    if (!snap.exists) {
+      console.warn(`${colors.yellow}⚠️ Perfil no encontrado: ${userId}${colors.reset}`);
+      return callback?.({ success: false, message: "Perfil no encontrado" });
     }
 
-    const current = pttState[roomId];
-    if (!current || !current.speakerId) {
-      // 🔓 No hay hablante activo → conceder token
-      pttState[roomId] = { speakerId: userId, speakerName: username, startedAt: Date.now() };
+    const user = snap.data() || {};
+    console.log(`${colors.green}📤 get_profile OK → ${user.username}${colors.reset}`);
+    return callback?.({
+      success: true,
+      ...user,
+    });
+  } catch (e) {
+    console.error(`${colors.red}❌ Error get_profile:${colors.reset}`, e);
+    return callback?.({ success: false, message: e.message || "Error interno" });
+  }
+});
 
-      console.log(`${colors.green}🎙️ Token concedido a ${username} (${userId}) en sala ${roomId}${colors.reset}`);
-      console.log(`${colors.cyan}📡 Emitiendo token_granted a todos en la sala...${colors.reset}`);
+socket.on("update_profile", async (data = {}, callback) => {
+  try {
+    console.log(`${colors.cyan}📥 Evento → update_profile${colors.reset} desde socket ${socket.id}`, data);
+    const {
+      userId,
+      fullName = "",
+      username = "",
+      email = "",
+      phone = "",
+      avatarUri = "",
+    } = data;
 
-      io.to(roomId).emit("token_granted", { roomId, userId, username });
-      io.to(roomId).emit("current_speaker_update", userId);
-
-      ack?.({ success: true, message: "Token concedido" });
-    } else {
-      // 🚫 Ya hay alguien hablando
-      const speaker = current.speakerName || current.speakerId;
-      console.log(`${colors.yellow}🚫 Token denegado a ${username}, ya habla ${speaker}${colors.reset}`);
-
-      socket.emit("token_denied", {
-        roomId,
-        currentSpeaker: current.speakerId,
-        speakerName: current.speakerName,
-      });
-
-      ack?.({ success: false, message: `Ya está hablando ${speaker}` });
+    if (!userId) {
+      console.warn(`${colors.yellow}⚠️ update_profile sin userId${colors.reset}`);
+      return callback?.({ success: false, message: "userId requerido" });
     }
+
+    let finalAvatar = avatarUri || "";
+    if (isDataUrl(avatarUri)) {
+      finalAvatar = await uploadAvatarFromDataUrl(userId, avatarUri);
+    } else if (avatarUri && !isHttpUrl(avatarUri)) {
+      console.warn(`${colors.yellow}⚠️ avatarUri no es URL ni DataURL, se ignora${colors.reset}`);
+      finalAvatar = "";
+    }
+
+    const updatedUser = {
+      id: userId,
+      fullName,
+      username,
+      email,
+      phone,
+      avatarUri: finalAvatar,
+      status: "Online",
+      presence: "Available",
+      updatedAt: Date.now(),
+    };
+
+    await db.collection(USERS_COLLECTION).doc(userId).set(updatedUser, { merge: true });
+
+    const entry = connectedUsers.get(userId);
+    if (entry) {
+      entry.userData = { ...entry.userData, ...updatedUser };
+    }
+
+    console.log(`${colors.green}✅ Perfil actualizado para ${username}${colors.reset}`);
+    io.emit("user_updated", updatedUser);
+
+    return callback?.({
+      success: true,
+      message: "Perfil actualizado correctamente",
+      user: updatedUser,
+    });
+
+  } catch (error) {
+    console.error(`${colors.red}❌ Error en update_profile:${colors.reset}`, error);
+    return callback?.({ success: false, message: error.message || "Error interno del servidor" });
+  }
+});
+
+// ============================================================
+// 🔊 FUNCIONALIDAD PTT (Push-To-Talk)
+// ============================================================
+// ============================================================
+// 🔊 FUNCIONALIDAD PTT (Push-To-Talk) con ACK extendido
+// ============================================================
+socket.on("request_talk_token", (data = {}, ack) => {
+  const { roomId, userId, username } = data;
+
+  console.log(`${colors.cyan}📥 Evento → request_talk_token${colors.reset} desde socket ${socket.id}`, data);
+  console.log(`${colors.gray}📦 Salas del socket:${colors.reset}`, Array.from(socket.rooms));
+  console.log(`${colors.gray}📊 pttState actual:${colors.reset}`, JSON.stringify(pttState, null, 2));
+
+  if (!roomId || !userId) {
+    const msg = "⚠️ request_talk_token: datos inválidos";
+    console.warn(`${colors.yellow}${msg}${colors.reset}`, data);
+    return ack?.({ success: false, message: msg });
+  }
+
+  // 🔄 Reasignación de seguridad (por si el socket perdió la sala)
+  if (!socket.rooms.has(roomId)) {
+    socket.join(roomId);
+    console.log(`${colors.yellow}⚠️ Usuario ${userId} re-asignado a sala ${roomId} (recovery)${colors.reset}`);
+  }
+
+  const room = rooms.get(roomId);
+  if (!room) {
+    const msg = `❌ Sala no encontrada (${roomId})`;
+    console.warn(`${colors.red}${msg}${colors.reset}`);
+    return ack?.({ success: false, message: msg });
+  }
+
+  const current = pttState[roomId];
+  if (!current || !current.speakerId) {
+    // 🔓 No hay hablante activo → conceder token
+    pttState[roomId] = { speakerId: userId, speakerName: username, startedAt: Date.now() };
+
+    console.log(`${colors.green}🎙️ Token concedido a ${username} (${userId}) en sala ${roomId}${colors.reset}`);
+    console.log(`${colors.cyan}📡 Emitiendo token_granted a todos en la sala...${colors.reset}`);
+
+    io.to(roomId).emit("token_granted", { roomId, userId, username });
+    io.to(roomId).emit("current_speaker_update", userId);
+
+    // ✅ Enviar confirmación inmediata también por ACK
+    return ack?.({
+      success: true,
+      roomId,
+      userId,
+      username,
+      message: "Token concedido correctamente (ACK)",
+    });
+  } else {
+    // 🚫 Ya hay alguien hablando
+    const speaker = current.speakerName || current.speakerId;
+    console.log(`${colors.yellow}🚫 Token denegado a ${username}, ya habla ${speaker}${colors.reset}`);
+
+    socket.emit("token_denied", {
+      roomId,
+      currentSpeaker: current.speakerId,
+      speakerName: current.speakerName,
+    });
+
+    return ack?.({
+      success: false,
+      roomId,
+      currentSpeaker: current.speakerId,
+      message: `Ya está hablando ${speaker}`,
+    });
+  }
+});
+
+socket.on("release_talk_token", (data = {}, ack) => {
+  console.log(`${colors.cyan}📥 Evento → release_talk_token${colors.reset} desde socket ${socket.id}`, data);
+  console.log(`${colors.gray}📦 Salas del socket:${colors.reset}`, Array.from(socket.rooms));
+  console.log(`${colors.gray}📊 pttState actual antes:${colors.reset}`, JSON.stringify(pttState, null, 2));
+
+  const { roomId, userId } = data;
+  if (!roomId || !userId) {
+    const msg = "⚠️ release_talk_token: datos inválidos";
+    console.warn(`${colors.yellow}${msg}${colors.reset}`, data);
+    return ack?.({ success: false, message: msg });
+  }
+
+  const state = pttState[roomId];
+  if (!state || state.speakerId !== userId) {
+    const msg = "⚠️ No posees el token o no hay hablante activo";
+    console.warn(`${colors.yellow}${msg}${colors.reset}`);
+    return ack?.({ success: false, message: msg });
+  }
+
+  console.log(`${colors.gray}🔓 Token liberado por ${userId} en sala ${roomId}${colors.reset}`);
+  pttState[roomId] = null;
+
+  io.to(roomId).emit("token_released", { roomId, currentSpeaker: null });
+  io.to(roomId).emit("current_speaker_update", null);
+
+  console.log(`${colors.green}✅ Token liberado correctamente y evento emitido a sala ${roomId}${colors.reset}`);
+  console.log(`${colors.gray}📊 pttState actual después:${colors.reset}`, JSON.stringify(pttState, null, 2));
+
+  // ✅ Confirmación inmediata por ACK
+  return ack?.({
+    success: true,
+    roomId,
+    userId,
+    message: "Token liberado correctamente (ACK)",
   });
-
-  socket.on("release_talk_token", (data = {}, ack) => {
-    const { roomId, userId } = data;
-    if (!roomId || !userId) {
-      const msg = "⚠️ release_talk_token: datos inválidos";
-      console.warn(`${colors.yellow}${msg}${colors.reset}`, data);
-      return ack?.({ success: false, message: msg });
-    }
-
-    const state = pttState[roomId];
-    if (!state || state.speakerId !== userId) {
-      const msg = "⚠️ No posees el token o no hay hablante activo";
-      console.warn(`${colors.yellow}${msg}${colors.reset}`);
-      return ack?.({ success: false, message: msg });
-    }
-
-    console.log(`${colors.gray}🔓 Token liberado por ${userId} en sala ${roomId}${colors.reset}`);
-    pttState[roomId] = null;
-
-    io.to(roomId).emit("token_released", { roomId, currentSpeaker: null });
-    io.to(roomId).emit("current_speaker_update", null);
-
-    ack?.({ success: true, message: "Token liberado" });
-  });
+});
 
 
   // ============================================================
