@@ -472,40 +472,75 @@ io.on("connection", (socket) => {
     }
   });
 
-  // ============================================================
+    // ============================================================
   // 🔊 FUNCIONALIDAD PTT (Push-To-Talk)
   // ============================================================
-  socket.on("request_talk_token", (data = {}) => {
+  socket.on("request_talk_token", (data = {}, ack) => {
     const { roomId, userId, username } = data;
-    if (!roomId || !userId) return;
+    if (!roomId || !userId) {
+      const msg = "⚠️ request_talk_token: datos inválidos";
+      console.warn(`${colors.yellow}${msg}${colors.reset}`, data);
+      return ack?.({ success: false, message: msg });
+    }
 
     const room = rooms.get(roomId);
-    if (!room) return;
+    if (!room) {
+      const msg = `❌ Sala no encontrada (${roomId})`;
+      console.warn(`${colors.red}${msg}${colors.reset}`);
+      return ack?.({ success: false, message: msg });
+    }
 
-    if (!pttState[roomId] || !pttState[roomId].speakerId) {
+    const current = pttState[roomId];
+    if (!current || !current.speakerId) {
+      // 🔓 No hay hablante activo → conceder token
       pttState[roomId] = { speakerId: userId, speakerName: username, startedAt: Date.now() };
-      socket.emit("token_granted", { roomId, userId, username });
+
+      console.log(`${colors.green}🎙️ Token concedido a ${username} (${userId}) en sala ${roomId}${colors.reset}`);
+      console.log(`${colors.cyan}📡 Emitiendo token_granted a todos en la sala...${colors.reset}`);
+
+      io.to(roomId).emit("token_granted", { roomId, userId, username });
       io.to(roomId).emit("current_speaker_update", userId);
-      console.log(`${colors.green}🎙️ Token concedido a ${username} (${userId}) en ${roomId}${colors.reset}`);
+
+      ack?.({ success: true, message: "Token concedido" });
     } else {
+      // 🚫 Ya hay alguien hablando
+      const speaker = current.speakerName || current.speakerId;
+      console.log(`${colors.yellow}🚫 Token denegado a ${username}, ya habla ${speaker}${colors.reset}`);
+
       socket.emit("token_denied", {
         roomId,
-        currentSpeaker: pttState[roomId].speakerId,
+        currentSpeaker: current.speakerId,
+        speakerName: current.speakerName,
       });
-      console.log(`${colors.yellow}🚫 Token denegado a ${username}, ya habla ${pttState[roomId].speakerName}${colors.reset}`);
+
+      ack?.({ success: false, message: `Ya está hablando ${speaker}` });
     }
   });
 
-  socket.on("release_talk_token", (data = {}) => {
+  socket.on("release_talk_token", (data = {}, ack) => {
     const { roomId, userId } = data;
-    const state = pttState[roomId];
-    if (!state || state.speakerId !== userId) return;
+    if (!roomId || !userId) {
+      const msg = "⚠️ release_talk_token: datos inválidos";
+      console.warn(`${colors.yellow}${msg}${colors.reset}`, data);
+      return ack?.({ success: false, message: msg });
+    }
 
-    console.log(`${colors.gray}🔓 Token liberado por ${userId} en ${roomId}${colors.reset}`);
+    const state = pttState[roomId];
+    if (!state || state.speakerId !== userId) {
+      const msg = "⚠️ No posees el token o no hay hablante activo";
+      console.warn(`${colors.yellow}${msg}${colors.reset}`);
+      return ack?.({ success: false, message: msg });
+    }
+
+    console.log(`${colors.gray}🔓 Token liberado por ${userId} en sala ${roomId}${colors.reset}`);
     pttState[roomId] = null;
+
     io.to(roomId).emit("token_released", { roomId, currentSpeaker: null });
     io.to(roomId).emit("current_speaker_update", null);
+
+    ack?.({ success: true, message: "Token liberado" });
   });
+
 
   // ============================================================
   // 📋 Solicitudes de datos
