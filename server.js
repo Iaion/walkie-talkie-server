@@ -472,9 +472,7 @@ io.on("connection", (socket) => {
     }
   });
 
-    // ============================================================
-  // 🔊 FUNCIONALIDAD PTT (Push-To-Talk)
-  // ============================================================
+
  // ============================================================
 // 👤 PERFIL: get_profile / update_profile (incluye avatar)
 // ============================================================
@@ -569,8 +567,12 @@ socket.on("update_profile", async (data = {}, callback) => {
 // 🔊 FUNCIONALIDAD PTT (Push-To-Talk)
 // ============================================================
 // ============================================================
-// 🔊 FUNCIONALIDAD PTT (Push-To-Talk) con ACK extendido
+// 🔊 FUNCIONALIDAD PTT (Push-To-Talk) con ACK extendido y expiración automática
 // ============================================================
+
+const TOKEN_TIMEOUT_MS = 10_000; // 10 segundos de inactividad
+const tokenTimers = {}; // { roomId: timeoutId }
+
 socket.on("request_talk_token", (data = {}, ack) => {
   const { roomId, userId, username } = data;
 
@@ -598,15 +600,34 @@ socket.on("request_talk_token", (data = {}, ack) => {
   }
 
   const current = pttState[roomId];
-  if (!current || !current.speakerId) {
-    // 🔓 No hay hablante activo → conceder token
-    pttState[roomId] = { speakerId: userId, speakerName: username, startedAt: Date.now() };
+  const now = Date.now();
+
+  // 🕐 Si el token está activo pero vencido, liberarlo automáticamente
+  if (current && current.startedAt && now - current.startedAt > TOKEN_TIMEOUT_MS) {
+    console.log(`${colors.yellow}⏳ Token expirado (${((now - current.startedAt) / 1000).toFixed(1)}s) — liberando automáticamente${colors.reset}`);
+    clearTimeout(tokenTimers[roomId]);
+    pttState[roomId] = null;
+  }
+
+  // 🔓 No hay hablante activo → conceder token
+  if (!pttState[roomId] || !pttState[roomId].speakerId) {
+    pttState[roomId] = { speakerId: userId, speakerName: username, startedAt: now };
 
     console.log(`${colors.green}🎙️ Token concedido a ${username} (${userId}) en sala ${roomId}${colors.reset}`);
-    console.log(`${colors.cyan}📡 Emitiendo token_granted a todos en la sala...${colors.reset}`);
-
     io.to(roomId).emit("token_granted", { roomId, userId, username });
     io.to(roomId).emit("current_speaker_update", userId);
+
+    // ⏱️ Programar expiración automática
+    clearTimeout(tokenTimers[roomId]);
+    tokenTimers[roomId] = setTimeout(() => {
+      const current = pttState[roomId];
+      if (current && current.speakerId === userId) {
+        console.log(`${colors.magenta}⏰ Token auto-liberado por timeout (${TOKEN_TIMEOUT_MS / 1000}s) — ${username}${colors.reset}`);
+        pttState[roomId] = null;
+        io.to(roomId).emit("token_released", { roomId, currentSpeaker: null });
+        io.to(roomId).emit("current_speaker_update", null);
+      }
+    }, TOKEN_TIMEOUT_MS);
 
     // ✅ Enviar confirmación inmediata también por ACK
     return ack?.({
@@ -616,32 +637,33 @@ socket.on("request_talk_token", (data = {}, ack) => {
       username,
       message: "Token concedido correctamente (ACK)",
     });
-  } else {
-    // 🚫 Ya hay alguien hablando
-    const speaker = current.speakerName || current.speakerId;
-    console.log(`${colors.yellow}🚫 Token denegado a ${username}, ya habla ${speaker}${colors.reset}`);
-
-    socket.emit("token_denied", {
-      roomId,
-      currentSpeaker: current.speakerId,
-      speakerName: current.speakerName,
-    });
-
-    return ack?.({
-      success: false,
-      roomId,
-      currentSpeaker: current.speakerId,
-      message: `Ya está hablando ${speaker}`,
-    });
   }
+
+  // 🚫 Ya hay alguien hablando
+  const speaker = current?.speakerName || current?.speakerId;
+  console.log(`${colors.yellow}🚫 Token denegado a ${username}, ya habla ${speaker}${colors.reset}`);
+
+  socket.emit("token_denied", {
+    roomId,
+    currentSpeaker: current?.speakerId,
+    speakerName: current?.speakerName,
+  });
+
+  return ack?.({
+    success: false,
+    roomId,
+    currentSpeaker: current?.speakerId,
+    message: `Ya está hablando ${speaker}`,
+  });
 });
 
+// ============================================================
+// 🔓 Liberación manual o automática del token
+// ============================================================
 socket.on("release_talk_token", (data = {}, ack) => {
-  console.log(`${colors.cyan}📥 Evento → release_talk_token${colors.reset} desde socket ${socket.id}`, data);
-  console.log(`${colors.gray}📦 Salas del socket:${colors.reset}`, Array.from(socket.rooms));
-  console.log(`${colors.gray}📊 pttState actual antes:${colors.reset}`, JSON.stringify(pttState, null, 2));
-
   const { roomId, userId } = data;
+  console.log(`${colors.cyan}📥 Evento → release_talk_token${colors.reset} desde socket ${socket.id}`, data);
+
   if (!roomId || !userId) {
     const msg = "⚠️ release_talk_token: datos inválidos";
     console.warn(`${colors.yellow}${msg}${colors.reset}`, data);
@@ -655,22 +677,41 @@ socket.on("release_talk_token", (data = {}, ack) => {
     return ack?.({ success: false, message: msg });
   }
 
-  console.log(`${colors.gray}🔓 Token liberado por ${userId} en sala ${roomId}${colors.reset}`);
+  // 🔓 Liberar token
+  clearTimeout(tokenTimers[roomId]);
   pttState[roomId] = null;
 
   io.to(roomId).emit("token_released", { roomId, currentSpeaker: null });
   io.to(roomId).emit("current_speaker_update", null);
 
-  console.log(`${colors.green}✅ Token liberado correctamente y evento emitido a sala ${roomId}${colors.reset}`);
-  console.log(`${colors.gray}📊 pttState actual después:${colors.reset}`, JSON.stringify(pttState, null, 2));
+  console.log(`${colors.green}✅ Token liberado correctamente por ${userId} (${roomId})${colors.reset}`);
+  console.log(`${colors.gray}📊 pttState actualizado:${colors.reset}`, JSON.stringify(pttState, null, 2));
 
-  // ✅ Confirmación inmediata por ACK
   return ack?.({
     success: true,
     roomId,
     userId,
     message: "Token liberado correctamente (ACK)",
   });
+});
+
+// ============================================================
+// 🔁 Mecanismo opcional de Keep-Alive PTT
+// ============================================================
+socket.on("ptt_keep_alive", (data = {}) => {
+  const { roomId, userId } = data;
+  const current = pttState[roomId];
+  if (current && current.speakerId === userId) {
+    current.startedAt = Date.now();
+    clearTimeout(tokenTimers[roomId]);
+    tokenTimers[roomId] = setTimeout(() => {
+      if (pttState[roomId] && pttState[roomId].speakerId === userId) {
+        console.log(`${colors.magenta}⏰ Token auto-liberado por inactividad — ${userId}${colors.reset}`);
+        pttState[roomId] = null;
+        io.to(roomId).emit("token_released", { roomId, currentSpeaker: null });
+      }
+    }, TOKEN_TIMEOUT_MS);
+  }
 });
 
 
