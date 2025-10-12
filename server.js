@@ -696,29 +696,36 @@ io.on("connection", (socket) => {
     ack?.({ success: true, users });
   });
 
-  // ============================================================
-  // 🛰️ WebRTC — Señalización para transmisión de audio en vivo (PTT WebRTC)
-  // ============================================================
-  socket.on("webrtc_offer", (data = {}) => {
-    const { target, from, roomId } = data;
-    console.log(`${colors.magenta}📡 webrtc_offer:${colors.reset} ${from} → ${target} (sala ${roomId})`);
-    if (!target) return console.warn(`${colors.yellow}⚠️ Offer sin target${colors.reset}`);
-    io.to(target).emit("webrtc_offer", data); // Reenviar al destinatario
-  });
+// ============================================================
+// 🛰️ WebRTC — Señalización basada en salas (roomId)
+// ============================================================
+socket.on("webrtc_offer", (data = {}) => {
+  const { roomId, from, sdp } = data;
+  if (!roomId || !sdp) {
+    return console.warn(`${colors.yellow}⚠️ webrtc_offer sin roomId o sdp${colors.reset}`);
+  }
+  console.log(`${colors.magenta}📡 webrtc_offer${colors.reset} desde ${from} → sala ${roomId}`);
+  socket.to(roomId).emit("webrtc_offer", { from, sdp, roomId });
+});
 
-  socket.on("webrtc_answer", (data = {}) => {
-    const { target, from } = data;
-    console.log(`${colors.magenta}📡 webrtc_answer:${colors.reset} ${from} → ${target}`);
-    if (!target) return console.warn(`${colors.yellow}⚠️ Answer sin target${colors.reset}`);
-    io.to(target).emit("webrtc_answer", data); // Reenviar al originador
-  });
+socket.on("webrtc_answer", (data = {}) => {
+  const { roomId, from, sdp } = data;
+  if (!roomId || !sdp) {
+    return console.warn(`${colors.yellow}⚠️ webrtc_answer sin roomId o sdp${colors.reset}`);
+  }
+  console.log(`${colors.magenta}📡 webrtc_answer${colors.reset} desde ${from} → sala ${roomId}`);
+  socket.to(roomId).emit("webrtc_answer", { from, sdp, roomId });
+});
 
-  socket.on("webrtc_ice_candidate", (data = {}) => {
-    const { target, from } = data;
-    console.log(`${colors.magenta}📡 webrtc_ice_candidate:${colors.reset} ${from} → ${target}`);
-    if (!target) return console.warn(`${colors.yellow}⚠️ ICE candidate sin target${colors.reset}`);
-    io.to(target).emit("webrtc_ice_candidate", data); // Reenviar ICE
-  });
+socket.on("webrtc_ice_candidate", (data = {}) => {
+  const { roomId, from, candidate } = data;
+  if (!roomId || !candidate) {
+    return console.warn(`${colors.yellow}⚠️ webrtc_ice_candidate sin roomId o candidate${colors.reset}`);
+  }
+  console.log(`${colors.magenta}📡 webrtc_ice_candidate${colors.reset} desde ${from} → sala ${roomId}`);
+  socket.to(roomId).emit("webrtc_ice_candidate", { from, candidate, roomId });
+});
+
 
   // ============================================================
   // 🔄 (Opcional) Aviso de intento de reconexión del cliente
