@@ -756,6 +756,30 @@ socket.on("reset_all_ptt", () => {
     socket.emit("connected_users", users);
     ack?.({ success: true, users });
   });
+  // ============================================================
+// 🛰️ WebRTC — Señalización para transmisión de audio en vivo (PTT WebRTC)
+// ============================================================
+socket.on("webrtc_offer", (data = {}) => {
+  const { target, from, roomId } = data;
+  console.log(`${colors.magenta}📡 webrtc_offer:${colors.reset} ${from} → ${target} (sala ${roomId})`);
+  if (!target) return console.warn(`${colors.yellow}⚠️ Offer sin target${colors.reset}`);
+  io.to(target).emit("webrtc_offer", data); // Reenviar al destinatario
+});
+
+socket.on("webrtc_answer", (data = {}) => {
+  const { target, from } = data;
+  console.log(`${colors.magenta}📡 webrtc_answer:${colors.reset} ${from} → ${target}`);
+  if (!target) return console.warn(`${colors.yellow}⚠️ Answer sin target${colors.reset}`);
+  io.to(target).emit("webrtc_answer", data); // Reenviar al originador
+});
+
+socket.on("webrtc_ice_candidate", (data = {}) => {
+  const { target, from } = data;
+  console.log(`${colors.magenta}📡 webrtc_ice_candidate:${colors.reset} ${from} → ${target}`);
+  if (!target) return console.warn(`${colors.yellow}⚠️ ICE candidate sin target${colors.reset}`);
+  io.to(target).emit("webrtc_ice_candidate", data); // Reenviar ICE
+});
+
 
   // ============================================================
   // 🔄 (Opcional) Aviso de intento de reconexión del cliente
