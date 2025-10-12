@@ -137,6 +137,11 @@ function getBase64FromDataUrl(dataUrl) {
   return idx !== -1 ? dataUrl.substring(idx + 7) : null;
 }
 
+function isPTTRoomId(roomId) {
+  const r = rooms.get(roomId);
+  return (r && r.type === "ptt") || roomId === "handy";
+}
+
 async function uploadAvatarFromDataUrl(userId, dataUrl) {
   try {
     const mime = getMimeFromDataUrl(dataUrl);
@@ -368,22 +373,58 @@ io.on("connection", (socket) => {
   });
 
   // ============================================================
-  // 🎧 Mensajes de audio (base64 -> Storage)
+  // 🎧 Mensajes de audio
+  //  - En salas PTT (handy): transmisión en tiempo real (sin guardar)
+  //  - En salas normales: subir a Storage y registrar en Firestore
   // ============================================================
   socket.on("audio_message", async (data = {}, ack) => {
     const { userId, username, audioData, roomId } = data;
-    if (!audioData || !userId || !roomId)
-      return ack?.({ success: false, message: "❌ Datos de audio inválidos" });
 
+    if (!audioData || !userId || !roomId) {
+      return ack?.({ success: false, message: "❌ Datos de audio inválidos" });
+    }
+
+    // ============================================================
+    // 🟡 Caso PTT: transmitir audio en tiempo real (sin Firebase)
+    // ============================================================
+    if (isPTTRoomId(roomId)) {
+      // reenviamos el audio base64 directamente a todos los demás usuarios de la sala
+      socket.to(roomId).emit("ptt_audio_stream", {
+        userId,
+        username,
+        roomId,
+        chunkBase64: audioData,  // base64 del audio m4a
+        timestamp: Date.now(),
+      });
+
+      console.log(
+        `${colors.cyan}📡 [PTT] Audio transmitido en tiempo real por ${username} en [${roomId}]${colors.reset}`
+      );
+
+      return ack?.({ success: true, message: "Audio transmitido en tiempo real (no guardado)" });
+    }
+
+    // ============================================================
+    // 🟢 Caso normal: subir a Firebase Storage + guardar en Firestore
+    // ============================================================
     try {
       const buffer = Buffer.from(audioData, "base64");
       const filePath = `audios/${roomId}/${userId}_${Date.now()}_${uuidv4()}.m4a`;
       const file = bucket.file(filePath);
+
       await file.save(buffer, { contentType: "audio/m4a", resumable: false });
       await file.makePublic();
       const url = file.publicUrl();
 
-      const audioMsg = { id: uuidv4(), userId, username, roomId, audioUrl: url, timestamp: Date.now() };
+      const audioMsg = {
+        id: uuidv4(),
+        userId,
+        username,
+        roomId,
+        audioUrl: url,
+        timestamp: Date.now(),
+      };
+
       await db.collection(MESSAGES_COLLECTION).add(audioMsg);
       io.to(roomId).emit("new_message", audioMsg);
       socket.emit("message_sent", audioMsg);
