@@ -240,6 +240,15 @@ io.on("connection", (socket) => {
   // ============================================================
   socket.on("join_room", (data = {}, ack) => {
     console.log(`${colors.magenta}🚪 Evento → join_room:${colors.reset}`, data);
+    // ❌ Evitar que el mismo usuario ya esté en la sala con otro socket
+    const alreadyInRoom = Array.from(connectedUsers.get(userId)?.sockets || []).some(
+     (sid) => socketToRoomMap.get(sid) === roomName
+    );
+    if (alreadyInRoom) {
+     console.warn(`${colors.yellow}⚠️ ${username} ya está en ${roomName}, ignorando join duplicado.${colors.reset}`);
+    return ack?.({ success: true, message: "Ya estás en esta sala" });
+    }
+
 
     const roomName = data.room || data.roomId || "salas";
     const { userId, username } = data;
@@ -380,99 +389,7 @@ io.on("connection", (socket) => {
     }
   });
 
-  // ============================================================
-  // 👤 PERFIL: get_profile / update_profile (incluye avatar)
-  // ============================================================
-  socket.on("get_profile", async (data = {}, callback) => {
-    try {
-      const userId = data.userId;
-      if (!userId) {
-        console.warn(`${colors.yellow}⚠️ get_profile sin userId${colors.reset}`);
-        return callback?.({ success: false, message: "userId requerido" });
-      }
-
-      const snap = await db.collection(USERS_COLLECTION).doc(userId).get();
-      if (!snap.exists) {
-        console.warn(`${colors.yellow}⚠️ Perfil no encontrado: ${userId}${colors.reset}`);
-        return callback?.({ success: false, message: "Perfil no encontrado" });
-      }
-
-      const user = snap.data() || {};
-      console.log(`${colors.green}📤 get_profile OK → ${user.username}${colors.reset}`);
-      return callback?.({
-        success: true,
-        ...user,
-      });
-    } catch (e) {
-      console.error(`${colors.red}❌ Error get_profile:${colors.reset}`, e);
-      return callback?.({ success: false, message: e.message || "Error interno" });
-    }
-  });
-
-  socket.on("update_profile", async (data = {}, callback) => {
-    try {
-      const {
-        userId,
-        fullName = "",
-        username = "",
-        email = "",
-        phone = "",
-        avatarUri = "",
-      } = data;
-
-      console.log(`${colors.blue}📥 Evento → update_profile:${colors.reset}`, {
-        userId, fullName, username, email, phone,
-        avatarUri: avatarUri ? (isHttpUrl(avatarUri) ? "http-url" : (isDataUrl(avatarUri) ? "data-url" : "otro")) : "vacío"
-      });
-
-      if (!userId) {
-        console.warn(`${colors.yellow}⚠️ update_profile sin userId${colors.reset}`);
-        return callback?.({ success: false, message: "userId requerido" });
-      }
-
-      let finalAvatar = avatarUri || "";
-      if (isDataUrl(avatarUri)) {
-        finalAvatar = await uploadAvatarFromDataUrl(userId, avatarUri);
-      } else if (avatarUri && !isHttpUrl(avatarUri)) {
-        console.warn(`${colors.yellow}⚠️ avatarUri no es URL ni DataURL, se ignora${colors.reset}`);
-        finalAvatar = "";
-      }
-
-      const updatedUser = {
-        id: userId,
-        fullName,
-        username,
-        email,
-        phone,
-        avatarUri: finalAvatar,
-        status: "Online",
-        presence: "Available",
-        updatedAt: Date.now(),
-      };
-
-      await db.collection(USERS_COLLECTION).doc(userId).set(updatedUser, { merge: true });
-
-      const entry = connectedUsers.get(userId);
-      if (entry) {
-        entry.userData = { ...entry.userData, ...updatedUser };
-      }
-
-      console.log(`${colors.green}✅ Perfil actualizado para ${username}${colors.reset}`);
-      io.emit("user_updated", updatedUser);
-
-      return callback?.({
-        success: true,
-        message: "Perfil actualizado correctamente",
-        user: updatedUser,
-      });
-
-    } catch (error) {
-      console.error(`${colors.red}❌ Error en update_profile:${colors.reset}`, error);
-      return callback?.({ success: false, message: error.message || "Error interno del servidor" });
-    }
-  });
-
-
+  
  // ============================================================
 // 👤 PERFIL: get_profile / update_profile (incluye avatar)
 // ============================================================
@@ -574,7 +491,7 @@ const TOKEN_TIMEOUT_MS = 10_000; // 10 segundos sin actividad = liberación auto
 const tokenTimers = {}; // { roomId: timeoutId }
 
 // ============================================================
-// 🎙️ Solicitud de token (Push-To-Talk Request)
+// 🎙️ Solicitud de token (Push-To-Talk Request) con control atómico
 // ============================================================
 socket.on("request_talk_token", (data = {}, ack) => {
   const { roomId, userId, username } = data;
@@ -586,8 +503,6 @@ socket.on("request_talk_token", (data = {}, ack) => {
     return ack?.({ success: false, message: msg });
   }
 
-  if (!socket.rooms.has(roomId)) socket.join(roomId);
-
   const room = rooms.get(roomId);
   if (!room) {
     const msg = `❌ Sala no encontrada: ${roomId}`;
@@ -595,47 +510,51 @@ socket.on("request_talk_token", (data = {}, ack) => {
     return ack?.({ success: false, message: msg });
   }
 
+  // 🧱 Lock simple para evitar condiciones de carrera
+  if (pttState[roomId]?.locked) {
+    return ack?.({ success: false, message: "Token en verificación, reintenta" });
+  }
+  pttState[roomId] = pttState[roomId] || {};
+  pttState[roomId].locked = true;
+
   const now = Date.now();
   const current = pttState[roomId];
 
-  // 🕐 Expirar token viejo si ya caducó
-  if (current && now - current.startedAt > TOKEN_TIMEOUT_MS) {
-    console.log(`${colors.yellow}⏰ Token expirado en ${roomId}, liberando...${colors.reset}`);
-    clearTimeout(tokenTimers[roomId]);
-    pttState[roomId] = null;
-  }
-
-  // 🔓 No hay hablante → conceder token
-  if (!pttState[roomId] || !pttState[roomId].speakerId) {
-    pttState[roomId] = { speakerId: userId, speakerName: username, startedAt: now, socketId: socket.id };
+  if (!current.speakerId || now - (current.startedAt || 0) > TOKEN_TIMEOUT_MS) {
+    pttState[roomId] = {
+      speakerId: userId,
+      speakerName: username,
+      startedAt: now,
+      socketId: socket.id,
+    };
 
     console.log(`${colors.green}🎙️ Token concedido a ${username} (${userId}) en sala ${roomId}${colors.reset}`);
     io.to(roomId).emit("token_granted", { roomId, userId, username });
     io.to(roomId).emit("current_speaker_update", userId);
 
-    // ⏱️ Auto-expiración del token
+    // ⏱️ Expiración automática
     clearTimeout(tokenTimers[roomId]);
     tokenTimers[roomId] = setTimeout(() => {
-      const state = pttState[roomId];
-      if (state && state.speakerId === userId) {
-        console.log(`${colors.magenta}⏳ Token auto-liberado por inactividad — ${username}${colors.reset}`);
-        pttState[roomId] = null;
+      if (pttState[roomId]?.speakerId === userId) {
+        console.log(`${colors.magenta}⏳ Token auto-liberado — ${username}${colors.reset}`);
+        delete pttState[roomId];
         io.to(roomId).emit("token_released", { roomId, currentSpeaker: null });
         io.to(roomId).emit("current_speaker_update", null);
       }
     }, TOKEN_TIMEOUT_MS);
 
+    delete pttState[roomId].locked;
     return ack?.({
       success: true,
       roomId,
       userId,
       username,
-      message: "Token concedido correctamente (ACK)",
+      message: "Token concedido correctamente",
     });
   }
 
-  // 🚫 Denegar si ya hay hablante
   const speaker = current.speakerName || current.speakerId;
+  delete pttState[roomId].locked;
   console.log(`${colors.yellow}🚫 Token denegado a ${username}, ya habla ${speaker}${colors.reset}`);
   socket.emit("token_denied", {
     roomId,
@@ -649,6 +568,7 @@ socket.on("request_talk_token", (data = {}, ack) => {
     message: `Ya está hablando ${speaker}`,
   });
 });
+
 
 // ============================================================
 // 🔓 Liberación manual del token
@@ -707,21 +627,62 @@ socket.on("ptt_keep_alive", (data = {}) => {
 });
 
 // ============================================================
-// ❌ Liberar token si el hablante se desconecta
+// 🔴 Desconexión unificada (control total multi-socket + PTT + limpieza)
 // ============================================================
 socket.on("disconnect", (reason) => {
+  const userId = socketToUserMap.get(socket.id);
+  const roomId = socketToRoomMap.get(socket.id);
   console.log(`${colors.red}🔌 Socket desconectado:${colors.reset} ${socket.id} (${reason})`);
 
-  for (const [roomId, state] of Object.entries(pttState)) {
+  // 🎙️ Si tenía token PTT, liberarlo
+  for (const [rid, state] of Object.entries(pttState)) {
     if (state && state.socketId === socket.id) {
-      console.log(`${colors.yellow}⚠️ ${state.speakerName} (${state.speakerId}) se desconectó. Liberando token de ${roomId}.${colors.reset}`);
-      clearTimeout(tokenTimers[roomId]);
-      pttState[roomId] = null;
-      io.to(roomId).emit("token_released", { roomId, currentSpeaker: null });
-      io.to(roomId).emit("current_speaker_update", null);
+      console.log(`${colors.yellow}🎙️ Liberando token de ${rid} por desconexión de ${state.speakerName}${colors.reset}`);
+      clearTimeout(tokenTimers[rid]);
+      delete pttState[rid];
+      io.to(rid).emit("token_released", { roomId: rid, currentSpeaker: null });
+      io.to(rid).emit("current_speaker_update", null);
     }
   }
+
+  // 🧹 Limpieza de sala si era la última conexión del user
+  if (userId && roomId && rooms.has(roomId)) {
+    const stillConnected = Array.from(connectedUsers.get(userId)?.sockets || []).some(
+      (sid) => sid !== socket.id && socketToRoomMap.get(sid) === roomId
+    );
+
+    if (!stillConnected) {
+      const room = rooms.get(roomId);
+      room.users.delete(userId);
+      io.to(roomId).emit("user-left-room", { roomId, userCount: room.users.size });
+    }
+  }
+
+  // 🧩 Limpieza de estructuras
+  if (userId) {
+    const entry = connectedUsers.get(userId);
+    if (entry) {
+      entry.sockets.delete(socket.id);
+      if (entry.sockets.size === 0) {
+        connectedUsers.delete(userId);
+        console.log(`${colors.red}🔴 Usuario ${userId} completamente desconectado.${colors.reset}`);
+      }
+    }
+  }
+
+  socketToRoomMap.delete(socket.id);
+  socketToUserMap.delete(socket.id);
+
+  // 📡 Actualizar lista global
+  io.emit(
+    "connected_users",
+    Array.from(connectedUsers.values()).map((u) => ({
+      ...u.userData,
+      socketCount: u.sockets.size,
+    }))
+  );
 });
+
 
 // ============================================================
 // 🧹 Comando global de administrador — reset_all_ptt
