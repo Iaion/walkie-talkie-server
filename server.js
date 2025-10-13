@@ -696,34 +696,60 @@ io.on("connection", (socket) => {
     ack?.({ success: true, users });
   });
 
-// ============================================================
+//// ============================================================
 // 🛰️ WebRTC — Señalización basada en salas (roomId)
 // ============================================================
 socket.on("webrtc_offer", (data = {}) => {
-  const { roomId, from, sdp } = data;
+  const { roomId, from, sdp, type } = data;
   if (!roomId || !sdp) {
-    return console.warn(`${colors.yellow}⚠️ webrtc_offer sin roomId o sdp${colors.reset}`);
+    return console.warn(`${colors.yellow}⚠️ webrtc_offer sin roomId o sdp${colors.reset}`, data);
   }
-  console.log(`${colors.magenta}📡 webrtc_offer${colors.reset} desde ${from} → sala ${roomId}`);
-  socket.to(roomId).emit("webrtc_offer", { from, sdp, roomId });
+
+  const peers = io.sockets.adapter.rooms.get(roomId)?.size || 0;
+  console.log(`${colors.magenta}📡 webrtc_offer${colors.reset} desde ${from} → sala ${roomId} (${peers} peer${peers === 1 ? "" : "s"})`);
+
+  // Reenviar a todos en la sala excepto al emisor
+  socket.to(roomId).emit("webrtc_offer", {
+    roomId,
+    from,
+    sdp,
+    type: type || "offer"
+  });
 });
 
 socket.on("webrtc_answer", (data = {}) => {
-  const { roomId, from, sdp } = data;
+  const { roomId, from, sdp, type } = data;
   if (!roomId || !sdp) {
-    return console.warn(`${colors.yellow}⚠️ webrtc_answer sin roomId o sdp${colors.reset}`);
+    return console.warn(`${colors.yellow}⚠️ webrtc_answer sin roomId o sdp${colors.reset}`, data);
   }
-  console.log(`${colors.magenta}📡 webrtc_answer${colors.reset} desde ${from} → sala ${roomId}`);
-  socket.to(roomId).emit("webrtc_answer", { from, sdp, roomId });
+
+  const peers = io.sockets.adapter.rooms.get(roomId)?.size || 0;
+  console.log(`${colors.magenta}📡 webrtc_answer${colors.reset} desde ${from} → sala ${roomId} (${peers} peer${peers === 1 ? "" : "s"})`);
+
+  socket.to(roomId).emit("webrtc_answer", {
+    roomId,
+    from,
+    sdp,
+    type: type || "answer"
+  });
 });
 
 socket.on("webrtc_ice_candidate", (data = {}) => {
-  const { roomId, from, candidate } = data;
-  if (!roomId || !candidate) {
-    return console.warn(`${colors.yellow}⚠️ webrtc_ice_candidate sin roomId o candidate${colors.reset}`);
+  const { roomId, from, sdpMid, sdpMLineIndex, sdp } = data;
+  if (!roomId || !sdpMid || typeof sdpMLineIndex !== "number" || !sdp) {
+    return console.warn(`${colors.yellow}⚠️ webrtc_ice_candidate inválido${colors.reset}`, data);
   }
-  console.log(`${colors.magenta}📡 webrtc_ice_candidate${colors.reset} desde ${from} → sala ${roomId}`);
-  socket.to(roomId).emit("webrtc_ice_candidate", { from, candidate, roomId });
+
+  const peers = io.sockets.adapter.rooms.get(roomId)?.size || 0;
+  console.log(`${colors.magenta}📡 webrtc_ice_candidate${colors.reset} desde ${from} → sala ${roomId} (${peers} peer${peers === 1 ? "" : "s"})`);
+
+  socket.to(roomId).emit("webrtc_ice_candidate", {
+    roomId,
+    from,
+    sdpMid,
+    sdpMLineIndex,
+    sdp
+  });
 });
 
 
