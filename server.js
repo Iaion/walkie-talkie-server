@@ -1,5 +1,5 @@
 // ============================================================
-// 🌐 Servidor Node.js con Socket.IO, Firebase Firestore y Storage + PTT
+// 🌐 Servidor Node.js con Socket.IO, Firebase Firestore y Storage + PTT + WebRTC
 // 💬 Compatible con tu app Android (SocketRepository, ChatViewModel, PTTManager)
 // 🪲 Modo DEBUG EXTREMO: Logs detallados para cada paso de unión, envío y token
 // ============================================================
@@ -29,13 +29,13 @@ const app = express();
 const server = http.createServer(app);
 const io = socketIo(server, {
   cors: { origin: "*", methods: ["GET", "POST"] },
-  transports: ["websocket", "polling"],  // ✅ Acepta ambos tipos
-  allowEIO3: true,                        // ✅ Permite clientes antiguos (como el tuyo v2.1.0)
-  maxHttpBufferSize: 1e8,                 // ✅ Mantiene el tamaño de audio
+  transports: ["websocket", "polling"],
+  allowEIO3: true,
+  maxHttpBufferSize: 1e8,
 });
 
 app.use(cors());
-app.use(express.json({ limit: "25mb" })); // por si te llega dataURL base64 grande
+app.use(express.json({ limit: "25mb" }));
 
 // ============================================================
 // 🔥 Firebase
@@ -64,21 +64,13 @@ const USERS_COLLECTION = "users";
 const MESSAGES_COLLECTION = "messages";
 
 // ============================================================
-// 📦 Estado en memoria (robusto, multi-socket)
+// 📦 Estado en memoria
 // ============================================================
-// userId -> { userData, sockets: Set<socketId> }
 const connectedUsers = new Map();
-// socketId -> userId
 const socketToUserMap = new Map();
-// socketId -> roomId (sala por socket, evita "patearse" entre dispositivos)
 const socketToRoomMap = new Map();
-// userId -> lastRoomId (para rejoin automático)
 const userToRoomMap = new Map();
-
 const rooms = new Map();
-
-// 🆕 Estado PTT: 1 solo hablante por sala
-// { roomId: { speakerId, speakerName, startedAt } }
 const pttState = {};
 
 // ============================================================
@@ -87,7 +79,6 @@ const pttState = {};
 function createRoom(id, name, description, type) {
   return { id, name, description, users: new Set(), type, isPrivate: false };
 }
-
 rooms.set("salas", createRoom("salas", "Lobby de Salas", "Pantalla principal", "lobby"));
 rooms.set("general", createRoom("general", "Chat General", "Sala pública", "general"));
 rooms.set("handy", createRoom("handy", "Radio Handy (PTT)", "Simulación de radio", "ptt"));
@@ -112,7 +103,6 @@ function serializeRooms() {
 function getRoomUsers(roomId) {
   const room = rooms.get(roomId);
   if (!room) return [];
-  // Devolvemos info de usuario (una sola vez por userId), independientemente de la cantidad de sockets
   return Array.from(room.users)
     .map((userId) => {
       const entry = connectedUsers.get(userId);
@@ -121,7 +111,6 @@ function getRoomUsers(roomId) {
     .filter(Boolean);
 }
 
-// 🧰 Helpers avatar
 function isHttpUrl(str) {
   return typeof str === "string" && /^https?:\/\//i.test(str);
 }
@@ -136,33 +125,44 @@ function getBase64FromDataUrl(dataUrl) {
   const idx = (dataUrl || "").indexOf("base64,");
   return idx !== -1 ? dataUrl.substring(idx + 7) : null;
 }
-
 function isPTTRoomId(roomId) {
   const r = rooms.get(roomId);
   return (r && r.type === "ptt") || roomId === "handy";
 }
 
 async function uploadAvatarFromDataUrl(userId, dataUrl) {
-  try {
-    const mime = getMimeFromDataUrl(dataUrl);
-    const ext = mime.split("/")[1] || "jpg";
-    const base64 = getBase64FromDataUrl(dataUrl);
-    if (!base64) throw new Error("Data URL inválida (sin base64)");
+  const mime = getMimeFromDataUrl(dataUrl);
+  const ext = mime.split("/")[1] || "jpg";
+  const base64 = getBase64FromDataUrl(dataUrl);
+  if (!base64) throw new Error("Data URL inválida (sin base64)");
 
-    const buffer = Buffer.from(base64, "base64");
-    const filePath = `avatars/${userId}/${Date.now()}_${uuidv4()}.${ext}`;
-    const file = bucket.file(filePath);
+  const buffer = Buffer.from(base64, "base64");
+  const filePath = `avatars/${userId}/${Date.now()}_${uuidv4()}.${ext}`;
+  const file = bucket.file(filePath);
+  console.log(`${colors.yellow}⬆️ Subiendo avatar → ${filePath} (${mime})${colors.reset}`);
+  await file.save(buffer, { contentType: mime, resumable: false });
+  await file.makePublic();
+  const url = file.publicUrl();
+  console.log(`${colors.green}✅ Avatar subido y público:${colors.reset} ${url}`);
+  return url;
+}
 
-    console.log(`${colors.yellow}⬆️ Subiendo avatar → ${filePath} (${mime})${colors.reset}`);
-    await file.save(buffer, { contentType: mime, resumable: false });
-    await file.makePublic();
-    const url = file.publicUrl();
-    console.log(`${colors.green}✅ Avatar subido y público:${colors.reset} ${url}`);
-    return url;
-  } catch (e) {
-    console.error(`${colors.red}❌ Error subiendo avatar:${colors.reset}`, e);
-    throw e;
-  }
+// ============================================================
+// 🛰️ WebRTC — Señalización + filtrado ICE candidates
+// ============================================================
+function isLocalCandidate(candidateStr = "") {
+  return (
+    candidateStr.includes("192.168.") ||
+    candidateStr.includes("10.") ||
+    candidateStr.includes("127.0.0.1") ||
+    candidateStr.includes("::1") ||
+    candidateStr.includes("fec0::") ||
+    candidateStr.includes("2802:")
+  );
+}
+
+function isValidCandidateType(candidateStr = "") {
+  return candidateStr.includes("srflx") || candidateStr.includes("relay");
 }
 
 // ============================================================
@@ -183,8 +183,8 @@ app.get("/rooms", (_, res) => res.json(serializeRooms()));
 // 🔊 FUNCIONALIDAD PTT (Push-To-Talk) con ACK, Keep-Alive, desconexión segura y reset global
 // ============================================================
 
-const TOKEN_TIMEOUT_MS = 10_000; // 10 segundos sin actividad = liberación automática
-const tokenTimers = {}; // { roomId: timeoutId }
+const TOKEN_TIMEOUT_MS = 10_000;
+const tokenTimers = {};
 
 // ============================================================
 // 🔌 Socket.IO
@@ -208,7 +208,6 @@ io.on("connection", (socket) => {
     const userId = user.id;
     socketToUserMap.set(socket.id, userId);
 
-    // 👥 Multi-socket por usuario
     const existing = connectedUsers.get(userId);
     if (existing) {
       existing.sockets.add(socket.id);
@@ -217,19 +216,15 @@ io.on("connection", (socket) => {
       connectedUsers.set(userId, { userData: { ...user, isOnline: true }, sockets: new Set([socket.id]) });
     }
 
-    // 🆕 Reasociar a última sala si existe
     const lastRoom = userToRoomMap.get(userId);
     if (lastRoom && rooms.has(lastRoom)) {
       socket.join(lastRoom);
       socketToRoomMap.set(socket.id, lastRoom);
       rooms.get(lastRoom).users.add(userId);
-
-      // Enviar doble confirmación para tu cliente (ACK + evento)
       socket.emit("join_success", { room: lastRoom, roomId: lastRoom, message: "Reingreso automático" });
       console.log(`${colors.green}🔁 ${user.username} reingresó a ${lastRoom}${colors.reset}`);
     }
 
-    // 🔥 Firebase
     try {
       const userDoc = db.collection(USERS_COLLECTION).doc(userId);
       await userDoc.set({ ...user, isOnline: true, lastLogin: Date.now() }, { merge: true });
@@ -263,7 +258,6 @@ io.on("connection", (socket) => {
       return;
     }
 
-    // ❌ Evitar que el mismo usuario ya esté en la sala con otro socket
     const alreadyInRoom = Array.from(connectedUsers.get(userId)?.sockets || []).some(
       (sid) => socketToRoomMap.get(sid) === roomName
     );
@@ -279,12 +273,10 @@ io.on("connection", (socket) => {
       return;
     }
 
-    // ⚠️ OJO: mapeamos la sala por *socket*, no por usuario (para multi-dispositivo)
     const prevRoomId = socketToRoomMap.get(socket.id);
     if (prevRoomId && rooms.has(prevRoomId)) {
       const prev = rooms.get(prevRoomId);
       socket.leave(prevRoomId);
-      // Si no quedan otros sockets del mismo usuario en esa sala, quitar userId del Set
       const stillInPrev = Array.from(connectedUsers.get(userId)?.sockets || []).some(
         (sid) => socketToRoomMap.get(sid) === prevRoomId && sid !== socket.id
       );
@@ -296,11 +288,10 @@ io.on("connection", (socket) => {
 
     socket.join(roomName);
     socketToRoomMap.set(socket.id, roomName);
-    userToRoomMap.set(userId, roomName); // última sala conocida (para rejoin automático)
+    userToRoomMap.set(userId, roomName);
     rooms.get(roomName).users.add(userId);
 
     const users = getRoomUsers(roomName);
-    // Doble confirmación: evento + ACK
     socket.emit("join_success", { room: roomName, roomId: roomName, userCount: users.length });
     io.to(roomName).emit("user-joined-room", { roomId: roomName, username, userCount: users.length });
 
@@ -309,7 +300,7 @@ io.on("connection", (socket) => {
   });
 
   // ============================================================
-  // 🚪 Salir de sala (tu app lo emite)
+  // 🚪 Salir de sala
   // ============================================================
   socket.on("leave_room", (data = {}, ack) => {
     const { roomId, userId, username } = data || {};
@@ -324,7 +315,6 @@ io.on("connection", (socket) => {
     socket.leave(currentRoom);
     socketToRoomMap.delete(socket.id);
 
-    // ¿Queda otro socket de este usuario en la misma sala?
     const hasAnotherSocketInRoom = Array.from(connectedUsers.get(userId)?.sockets || []).some(
       (sid) => socketToRoomMap.get(sid) === currentRoom
     );
@@ -333,7 +323,6 @@ io.on("connection", (socket) => {
       const r = rooms.get(currentRoom);
       r.users.delete(userId);
 
-      // Si era el hablante PTT, liberar token
       if (pttState[currentRoom] && pttState[currentRoom].speakerId === userId) {
         pttState[currentRoom] = null;
         io.to(currentRoom).emit("token_released", { roomId: currentRoom, currentSpeaker: null });
@@ -374,8 +363,6 @@ io.on("connection", (socket) => {
 
   // ============================================================
   // 🎧 Mensajes de audio
-  //  - En salas PTT (handy): transmisión en tiempo real (sin guardar)
-  //  - En salas normales: subir a Storage y registrar en Firestore
   // ============================================================
   socket.on("audio_message", async (data = {}, ack) => {
     const { userId, username, audioData, roomId } = data;
@@ -384,16 +371,12 @@ io.on("connection", (socket) => {
       return ack?.({ success: false, message: "❌ Datos de audio inválidos" });
     }
 
-    // ============================================================
-    // 🟡 Caso PTT: transmitir audio en tiempo real (sin Firebase)
-    // ============================================================
     if (isPTTRoomId(roomId)) {
-      // reenviamos el audio base64 directamente a todos los demás usuarios de la sala
       socket.to(roomId).emit("ptt_audio_stream", {
         userId,
         username,
         roomId,
-        chunkBase64: audioData,  // base64 del audio m4a
+        chunkBase64: audioData,
         timestamp: Date.now(),
       });
 
@@ -404,9 +387,6 @@ io.on("connection", (socket) => {
       return ack?.({ success: true, message: "Audio transmitido en tiempo real (no guardado)" });
     }
 
-    // ============================================================
-    // 🟢 Caso normal: subir a Firebase Storage + guardar en Firestore
-    // ============================================================
     try {
       const buffer = Buffer.from(audioData, "base64");
       const filePath = `audios/${roomId}/${userId}_${Date.now()}_${uuidv4()}.m4a`;
@@ -438,7 +418,7 @@ io.on("connection", (socket) => {
   });
 
   // ============================================================
-  // 👤 PERFIL: get_profile / update_profile (incluye avatar)
+  // 👤 PERFIL: get_profile / update_profile
   // ============================================================
   socket.on("get_profile", async (data = {}, callback) => {
     try {
@@ -528,7 +508,7 @@ io.on("connection", (socket) => {
   });
 
   // ============================================================
-  // 🎙️ Solicitud de token (Push-To-Talk Request) con control atómico
+  // 🎙️ Solicitud de token PTT
   // ============================================================
   socket.on("request_talk_token", (data = {}, ack) => {
     const { roomId, userId, username } = data;
@@ -547,7 +527,6 @@ io.on("connection", (socket) => {
       return ack?.({ success: false, message: msg });
     }
 
-    // 🧱 Lock simple para evitar condiciones de carrera
     if (pttState[roomId]?.locked) {
       return ack?.({ success: false, message: "Token en verificación, reintenta" });
     }
@@ -569,7 +548,6 @@ io.on("connection", (socket) => {
       io.to(roomId).emit("token_granted", { roomId, userId, username });
       io.to(roomId).emit("current_speaker_update", userId);
 
-      // ⏱️ Expiración automática
       clearTimeout(tokenTimers[roomId]);
       tokenTimers[roomId] = setTimeout(() => {
         if (pttState[roomId]?.speakerId === userId) {
@@ -642,7 +620,7 @@ io.on("connection", (socket) => {
   });
 
   // ============================================================
-  // 💓 Keep-Alive del cliente (mantiene el token activo)
+  // 💓 Keep-Alive del cliente
   // ============================================================
   socket.on("ptt_keep_alive", (data = {}) => {
     const { roomId, userId } = data;
@@ -665,7 +643,6 @@ io.on("connection", (socket) => {
   // ============================================================
   // 🧹 Comando global de administrador — reset_all_ptt
   // ============================================================
-  // 👉 Limpia TODOS los tokens activos en todas las salas y notifica a los clientes.
   socket.on("reset_all_ptt", () => {
     console.log(`${colors.magenta}🧹 Comando → reset_all_ptt recibido. Liberando todos los tokens...${colors.reset}`);
 
@@ -696,62 +673,46 @@ io.on("connection", (socket) => {
     ack?.({ success: true, users });
   });
 
-//// ============================================================
-// 🛰️ WebRTC — Señalización basada en salas (roomId)
-// ============================================================
-socket.on("webrtc_offer", (data = {}) => {
-  const { roomId, from, sdp, type } = data;
-  if (!roomId || !sdp) {
-    return console.warn(`${colors.yellow}⚠️ webrtc_offer sin roomId o sdp${colors.reset}`, data);
-  }
-
-  const peers = io.sockets.adapter.rooms.get(roomId)?.size || 0;
-  console.log(`${colors.magenta}📡 webrtc_offer${colors.reset} desde ${from} → sala ${roomId} (${peers} peer${peers === 1 ? "" : "s"})`);
-
-  // Reenviar a todos en la sala excepto al emisor
-  socket.to(roomId).emit("webrtc_offer", {
-    roomId,
-    from,
-    sdp,
-    type: type || "offer"
+  // ============================================================
+  // 🛰️ WebRTC — Señalización con filtrado ICE
+  // ============================================================
+  socket.on("webrtc_offer", (data = {}) => {
+    const { roomId, from, sdp, type } = data;
+    if (!roomId || !sdp) {
+      return console.warn(`${colors.yellow}⚠️ webrtc_offer sin roomId o sdp${colors.reset}`, data);
+    }
+    const peers = io.sockets.adapter.rooms.get(roomId)?.size || 0;
+    console.log(`${colors.magenta}📡 webrtc_offer${colors.reset} desde ${from} → sala ${roomId} (${peers} peer${peers === 1 ? "" : "s"})`);
+    socket.to(roomId).emit("webrtc_offer", { roomId, from, sdp, type: type || "offer" });
   });
-});
 
-socket.on("webrtc_answer", (data = {}) => {
-  const { roomId, from, sdp, type } = data;
-  if (!roomId || !sdp) {
-    return console.warn(`${colors.yellow}⚠️ webrtc_answer sin roomId o sdp${colors.reset}`, data);
-  }
-
-  const peers = io.sockets.adapter.rooms.get(roomId)?.size || 0;
-  console.log(`${colors.magenta}📡 webrtc_answer${colors.reset} desde ${from} → sala ${roomId} (${peers} peer${peers === 1 ? "" : "s"})`);
-
-  socket.to(roomId).emit("webrtc_answer", {
-    roomId,
-    from,
-    sdp,
-    type: type || "answer"
+  socket.on("webrtc_answer", (data = {}) => {
+    const { roomId, from, sdp, type } = data;
+    if (!roomId || !sdp) {
+      return console.warn(`${colors.yellow}⚠️ webrtc_answer sin roomId o sdp${colors.reset}`, data);
+    }
+    const peers = io.sockets.adapter.rooms.get(roomId)?.size || 0;
+    console.log(`${colors.magenta}📡 webrtc_answer${colors.reset} desde ${from} → sala ${roomId} (${peers} peer${peers === 1 ? "" : "s"})`);
+    socket.to(roomId).emit("webrtc_answer", { roomId, from, sdp, type: type || "answer" });
   });
-});
 
-socket.on("webrtc_ice_candidate", (data = {}) => {
-  const { roomId, from, sdpMid, sdpMLineIndex, sdp } = data;
-  if (!roomId || !sdpMid || typeof sdpMLineIndex !== "number" || !sdp) {
-    return console.warn(`${colors.yellow}⚠️ webrtc_ice_candidate inválido${colors.reset}`, data);
-  }
+  socket.on("webrtc_ice_candidate", (data = {}) => {
+    const { roomId, from, sdpMid, sdpMLineIndex, candidate } = data;
+    if (!roomId || !candidate) {
+      return console.warn(`${colors.yellow}⚠️ webrtc_ice_candidate inválido${colors.reset}`, data);
+    }
 
-  const peers = io.sockets.adapter.rooms.get(roomId)?.size || 0;
-  console.log(`${colors.magenta}📡 webrtc_ice_candidate${colors.reset} desde ${from} → sala ${roomId} (${peers} peer${peers === 1 ? "" : "s"})`);
+    const candStr = candidate.candidate || candidate;
+    if (isLocalCandidate(candStr) && !isValidCandidateType(candStr)) {
+      console.warn(`${colors.gray}⚠️ ICE local descartado:${colors.reset} ${candStr}`);
+      return;
+    }
 
-  socket.to(roomId).emit("webrtc_ice_candidate", {
-    roomId,
-    from,
-    sdpMid,
-    sdpMLineIndex,
-    sdp
+    const peers = io.sockets.adapter.rooms.get(roomId)?.size || 0;
+    console.log(`${colors.magenta}📡 webrtc_ice_candidate${colors.reset} válido desde ${from} → sala ${roomId} (${peers} peers)`);
+
+    socket.to(roomId).emit("webrtc_ice_candidate", { roomId, from, sdpMid, sdpMLineIndex, candidate });
   });
-});
-
 
   // ============================================================
   // 🔄 (Opcional) Aviso de intento de reconexión del cliente
@@ -764,14 +725,13 @@ socket.on("webrtc_ice_candidate", (data = {}) => {
   });
 
   // ============================================================
-  // 🔴 Desconexión unificada (control total multi-socket + PTT + limpieza)
+  // 🔴 Desconexión unificada
   // ============================================================
   socket.on("disconnect", (reason) => {
     const userId = socketToUserMap.get(socket.id);
     const roomId = socketToRoomMap.get(socket.id);
     console.log(`${colors.red}🔌 Socket desconectado:${colors.reset} ${socket.id} (${reason})`);
 
-    // 🎙️ Si tenía token PTT, liberarlo
     for (const [rid, state] of Object.entries(pttState)) {
       if (state && state.socketId === socket.id) {
         console.log(`${colors.yellow}🎙️ Liberando token de ${rid} por desconexión de ${state.speakerName}${colors.reset}`);
@@ -782,7 +742,6 @@ socket.on("webrtc_ice_candidate", (data = {}) => {
       }
     }
 
-    // 🧹 Limpieza de sala si era la última conexión del user
     if (userId && roomId && rooms.has(roomId)) {
       const stillConnected = Array.from(connectedUsers.get(userId)?.sockets || []).some(
         (sid) => sid !== socket.id && socketToRoomMap.get(sid) === roomId
@@ -795,7 +754,6 @@ socket.on("webrtc_ice_candidate", (data = {}) => {
       }
     }
 
-    // 🧩 Limpieza de estructuras
     if (userId) {
       const entry = connectedUsers.get(userId);
       if (entry) {
@@ -810,7 +768,6 @@ socket.on("webrtc_ice_candidate", (data = {}) => {
     socketToRoomMap.delete(socket.id);
     socketToUserMap.delete(socket.id);
 
-    // 📡 Actualizar lista global
     io.emit(
       "connected_users",
       Array.from(connectedUsers.values()).map((u) => ({
@@ -826,6 +783,6 @@ socket.on("webrtc_ice_candidate", (data = {}) => {
 // ============================================================
 const PORT = process.env.PORT || 8080;
 server.listen(PORT, () => {
-  console.log(`${colors.green}🚀 Servidor de chat+PTT corriendo en puerto ${PORT}${colors.reset}`);
+  console.log(`${colors.green}🚀 Servidor de chat+PTT+WebRTC corriendo en puerto ${PORT}${colors.reset}`);
   console.log(`${colors.cyan}🌐 http://localhost:${PORT}${colors.reset}`);
 });
