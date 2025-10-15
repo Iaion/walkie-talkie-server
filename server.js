@@ -663,14 +663,10 @@ socket.on("webrtc_offer", (data = {}) => {
   if (!roomId || !sdp || !to) {
     return console.warn(`⚠️ webrtc_offer sin roomId, to o sdp`, data);
   }
-
-  const targetSocket = findSocketByUserId(to, roomId);
-  if (!targetSocket) {
-    return console.warn(`⚠️ No se encontró socket destino ${to} en sala ${roomId}`);
-  }
-
-  console.log(`📡 webrtc_offer desde ${from} → ${to} (${roomId})`);
-  targetSocket.emit("webrtc_offer", { from, sdp, type: type || "offer" });
+  const target = findSocketByUserId(to, roomId);
+  if (!target) return console.warn(`⚠️ Destino ${to} no está en sala ${roomId}`);
+  console.log(`📡 webrtc_offer ${from} → ${to} (${roomId})`);
+  target.emit("webrtc_offer", { from, sdp, type: type || "offer" });
 });
 
 socket.on("webrtc_answer", (data = {}) => {
@@ -678,14 +674,10 @@ socket.on("webrtc_answer", (data = {}) => {
   if (!roomId || !sdp || !to) {
     return console.warn(`⚠️ webrtc_answer sin roomId, to o sdp`, data);
   }
-
-  const targetSocket = findSocketByUserId(to, roomId);
-  if (!targetSocket) {
-    return console.warn(`⚠️ No se encontró socket destino ${to} en sala ${roomId}`);
-  }
-
-  console.log(`📡 webrtc_answer desde ${from} → ${to} (${roomId})`);
-  targetSocket.emit("webrtc_answer", { from, sdp, type: type || "answer" });
+  const target = findSocketByUserId(to, roomId);
+  if (!target) return console.warn(`⚠️ Destino ${to} no está en sala ${roomId}`);
+  console.log(`📡 webrtc_answer ${from} → ${to} (${roomId})`);
+  target.emit("webrtc_answer", { from, sdp, type: type || "answer" });
 });
 
 socket.on("webrtc_ice_candidate", (data = {}) => {
@@ -693,27 +685,15 @@ socket.on("webrtc_ice_candidate", (data = {}) => {
   if (!roomId || !candidate || !to) {
     return console.warn(`⚠️ webrtc_ice_candidate inválido`, data);
   }
-
-  const candidateStr = candidate.candidate || candidate;
-  const isLocal = (c = "") =>
-    c.includes("192.168.") || c.includes("10.") || c.includes("127.0.0.1") || c.includes("::1");
-  const isValidType = (c = "") => c.includes("srflx") || c.includes("relay");
-
-  if (isLocal(candidateStr) && !isValidType(candidateStr)) {
-    console.warn(`⚙️ ICE local descartado: ${candidateStr}`);
-    return;
-  }
-
-  const targetSocket = findSocketByUserId(to, roomId);
-  if (!targetSocket) {
-    return console.warn(`⚠️ No se encontró socket destino ${to} en sala ${roomId}`);
-  }
-
+  const candidateStr = candidate.candidate || candidate; // aceptar string u objeto
+  // (Si querés filtrar, hacelo acá; si no, reenviá directo)
+  const target = findSocketByUserId(to, roomId);
+  if (!target) return console.warn(`⚠️ Destino ${to} no está en sala ${roomId}`);
   console.log(`📡 webrtc_ice_candidate ${from} → ${to} (${roomId})`);
-  targetSocket.emit("webrtc_ice_candidate", { from, candidate: candidateStr, sdpMid, sdpMLineIndex });
+  target.emit("webrtc_ice_candidate", { from, candidate: candidateStr, sdpMid, sdpMLineIndex });
 });
 
-// Helper
+// Helper: buscar la socket de un userId dentro de una sala
 function findSocketByUserId(userId, roomId) {
   const room = io.sockets.adapter.rooms.get(roomId);
   if (!room) return null;
