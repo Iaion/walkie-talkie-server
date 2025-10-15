@@ -655,63 +655,75 @@ io.on("connection", (socket) => {
     ack?.({ success: true, users });
   });
 
-  // ============================================================
-  // 🛰️ WebRTC — Señalización con filtrado ICE
-  // ============================================================
-  socket.on("webrtc_offer", (data = {}) => {
-    const { roomId, from, sdp, type } = data;
-    if (!roomId || !sdp) {
-      return console.warn(`${colors.yellow}⚠️ webrtc_offer sin roomId o sdp${colors.reset}`, data);
-    }
-    const peers = io.sockets.adapter.rooms.get(roomId)?.size || 0;
-    console.log(`${colors.magenta}📡 webrtc_offer${colors.reset} desde ${from} → sala ${roomId} (${peers} peer${peers === 1 ? "" : "s"})`);
-    socket.to(roomId).emit("webrtc_offer", { roomId, from, sdp, type: type || "offer" });
-  });
+// ============================================================
+// 🛰️ WebRTC — Señalización dirigida (no broadcast)
+// ============================================================
+socket.on("webrtc_offer", (data = {}) => {
+  const { roomId, from, to, sdp, type } = data;
+  if (!roomId || !sdp || !to) {
+    return console.warn(`⚠️ webrtc_offer sin roomId, to o sdp`, data);
+  }
 
-  socket.on("webrtc_answer", (data = {}) => {
-    const { roomId, from, sdp, type } = data;
-    if (!roomId || !sdp) {
-      return console.warn(`${colors.yellow}⚠️ webrtc_answer sin roomId o sdp${colors.reset}`, data);
-    }
-    const peers = io.sockets.adapter.rooms.get(roomId)?.size || 0;
-    console.log(`${colors.magenta}📡 webrtc_answer${colors.reset} desde ${from} → sala ${roomId} (${peers} peer${peers === 1 ? "" : "s"})`);
-    socket.to(roomId).emit("webrtc_answer", { roomId, from, sdp, type: type || "answer" });
-  });
+  const targetSocket = findSocketByUserId(to, roomId);
+  if (!targetSocket) {
+    return console.warn(`⚠️ No se encontró socket destino ${to} en sala ${roomId}`);
+  }
 
-  socket.on("webrtc_ice_candidate", (data = {}) => {
-    const { roomId, from, sdpMid, sdpMLineIndex, candidate } = data;
-    if (!roomId || !candidate) {
-      return console.warn(`${colors.yellow}⚠️ webrtc_ice_candidate inválido${colors.reset}`, data);
-    }
+  console.log(`📡 webrtc_offer desde ${from} → ${to} (${roomId})`);
+  targetSocket.emit("webrtc_offer", { from, sdp, type: type || "offer" });
+});
 
-    const candStr = candidate.candidate || candidate;
-    
-    // Funciones auxiliares para filtrado ICE
-    const isLocalCandidate = (candidateStr = "") => {
-      return (
-        candidateStr.includes("192.168.") ||
-        candidateStr.includes("10.") ||
-        candidateStr.includes("127.0.0.1") ||
-        candidateStr.includes("::1") ||
-        candidateStr.includes("fec0::") ||
-        candidateStr.includes("2802:")
-      );
-    };
+socket.on("webrtc_answer", (data = {}) => {
+  const { roomId, from, to, sdp, type } = data;
+  if (!roomId || !sdp || !to) {
+    return console.warn(`⚠️ webrtc_answer sin roomId, to o sdp`, data);
+  }
 
-    const isValidCandidateType = (candidateStr = "") => {
-      return candidateStr.includes("srflx") || candidateStr.includes("relay");
-    };
+  const targetSocket = findSocketByUserId(to, roomId);
+  if (!targetSocket) {
+    return console.warn(`⚠️ No se encontró socket destino ${to} en sala ${roomId}`);
+  }
 
-    if (isLocalCandidate(candStr) && !isValidCandidateType(candStr)) {
-      console.warn(`${colors.gray}⚠️ ICE local descartado:${colors.reset} ${candStr}`);
-      return;
-    }
+  console.log(`📡 webrtc_answer desde ${from} → ${to} (${roomId})`);
+  targetSocket.emit("webrtc_answer", { from, sdp, type: type || "answer" });
+});
 
-    const peers = io.sockets.adapter.rooms.get(roomId)?.size || 0;
-    console.log(`${colors.magenta}📡 webrtc_ice_candidate${colors.reset} válido desde ${from} → sala ${roomId} (${peers} peers)`);
+socket.on("webrtc_ice_candidate", (data = {}) => {
+  const { roomId, from, to, sdpMid, sdpMLineIndex, candidate } = data;
+  if (!roomId || !candidate || !to) {
+    return console.warn(`⚠️ webrtc_ice_candidate inválido`, data);
+  }
 
-    socket.to(roomId).emit("webrtc_ice_candidate", { roomId, from, sdpMid, sdpMLineIndex, candidate });
-  });
+  const candidateStr = candidate.candidate || candidate;
+  const isLocal = (c = "") =>
+    c.includes("192.168.") || c.includes("10.") || c.includes("127.0.0.1") || c.includes("::1");
+  const isValidType = (c = "") => c.includes("srflx") || c.includes("relay");
+
+  if (isLocal(candidateStr) && !isValidType(candidateStr)) {
+    console.warn(`⚙️ ICE local descartado: ${candidateStr}`);
+    return;
+  }
+
+  const targetSocket = findSocketByUserId(to, roomId);
+  if (!targetSocket) {
+    return console.warn(`⚠️ No se encontró socket destino ${to} en sala ${roomId}`);
+  }
+
+  console.log(`📡 webrtc_ice_candidate ${from} → ${to} (${roomId})`);
+  targetSocket.emit("webrtc_ice_candidate", { from, candidate: candidateStr, sdpMid, sdpMLineIndex });
+});
+
+// Helper
+function findSocketByUserId(userId, roomId) {
+  const room = io.sockets.adapter.rooms.get(roomId);
+  if (!room) return null;
+  for (const socketId of room) {
+    const s = io.sockets.sockets.get(socketId);
+    if (s?.userId === userId) return s;
+  }
+  return null;
+}
+
 
   // ============================================================
   // 🔄 (Opcional) Aviso de intento de reconexión del cliente
