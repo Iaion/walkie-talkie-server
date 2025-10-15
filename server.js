@@ -147,72 +147,6 @@ async function uploadAvatarFromDataUrl(userId, dataUrl) {
   return url;
 }
 
-  // ============================================================
-  // 🛰️ WebRTC — Señalización MULTI-PEER (oferta, respuesta e ICE)
-  // ============================================================
-  socket.on("webrtc_offer", (data = {}) => {
-    try {
-      const { roomId, from, sdp } = data || {};
-      if (!roomId || !from || !sdp) {
-        return console.warn(`${colors.yellow}⚠️ webrtc_offer inválido${colors.reset}`, data);
-      }
-
-      const peers = io.sockets.adapter.rooms.get(roomId)?.size || 0;
-      console.log(`${colors.magenta}📡 Offer${colors.reset} desde ${from} → sala ${roomId} (${peers} peers)`);
-
-      // Reenviar la oferta a todos los demás usuarios de la sala
-      socket.to(roomId).emit("webrtc_offer", { roomId, from, sdp });
-    } catch (err) {
-      console.error(`${colors.red}❌ Error en webrtc_offer:${colors.reset}`, err);
-    }
-  });
-
-  socket.on("webrtc_answer", (data = {}) => {
-    try {
-      const { roomId, from, sdp } = data || {};
-      if (!roomId || !from || !sdp) {
-        return console.warn(`${colors.yellow}⚠️ webrtc_answer inválido${colors.reset}`, data);
-      }
-
-      const peers = io.sockets.adapter.rooms.get(roomId)?.size || 0;
-      console.log(`${colors.magenta}📡 Answer${colors.reset} desde ${from} → sala ${roomId} (${peers} peers)`);
-
-      // Reenviar la respuesta a todos los demás usuarios de la sala
-      socket.to(roomId).emit("webrtc_answer", { roomId, from, sdp });
-    } catch (err) {
-      console.error(`${colors.red}❌ Error en webrtc_answer:${colors.reset}`, err);
-    }
-  });
-
-  socket.on("webrtc_ice_candidate", (data = {}) => {
-    try {
-      const { roomId, from, sdpMid, sdpMLineIndex, sdp } = data || {};
-      if (!roomId || !from || !sdpMid || !sdp) {
-        return console.warn(`${colors.yellow}⚠️ webrtc_ice_candidate inválido${colors.reset}`, data);
-      }
-
-      // 🔍 Filtrado de candidatos ICE locales o no útiles
-      if (isLocalCandidate(sdp) && !isValidCandidateType(sdp)) {
-        console.warn(`${colors.gray}⚠️ ICE local descartado:${colors.reset} ${sdp}`);
-        return;
-      }
-
-      const peers = io.sockets.adapter.rooms.get(roomId)?.size || 0;
-      console.log(`${colors.magenta}📡 ICE${colors.reset} válido desde ${from} → sala ${roomId} (${peers} peers)`);
-
-      // Reenviar a todos los demás usuarios del room
-      socket.to(roomId).emit("webrtc_ice_candidate", {
-        roomId,
-        from,
-        sdpMid,
-        sdpMLineIndex,
-        sdp,
-      });
-    } catch (err) {
-      console.error(`${colors.red}❌ Error en webrtc_ice_candidate:${colors.reset}`, err);
-    }
-  });
-
 // ============================================================
 // 🌐 Endpoints REST
 // ============================================================
@@ -751,6 +685,23 @@ io.on("connection", (socket) => {
     }
 
     const candStr = candidate.candidate || candidate;
+    
+    // Funciones auxiliares para filtrado ICE
+    const isLocalCandidate = (candidateStr = "") => {
+      return (
+        candidateStr.includes("192.168.") ||
+        candidateStr.includes("10.") ||
+        candidateStr.includes("127.0.0.1") ||
+        candidateStr.includes("::1") ||
+        candidateStr.includes("fec0::") ||
+        candidateStr.includes("2802:")
+      );
+    };
+
+    const isValidCandidateType = (candidateStr = "") => {
+      return candidateStr.includes("srflx") || candidateStr.includes("relay");
+    };
+
     if (isLocalCandidate(candStr) && !isValidCandidateType(candStr)) {
       console.warn(`${colors.gray}⚠️ ICE local descartado:${colors.reset} ${candStr}`);
       return;
