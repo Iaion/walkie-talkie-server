@@ -188,6 +188,8 @@ socket.on("user-connected", async (user, ack) => {
     return;
   }
 
+   
+  const username = user.username;
   const userId = user.id;
   // ✅ MUY IMPORTANTE: guardar en el propio socket
   socket.userId = userId;
@@ -243,6 +245,10 @@ socket.on("join_room", (data = {}, ack) => {
     return ack?.({ success: false, message: msg });
   }
 
+  // ✅ Guardar userId y username en el socket (IMPORTANTE para WebRTC)
+  socket.userId = userId;
+  socket.username = username;
+
   // Ya está este socket en la sala?
   const roomSet = io.sockets.adapter.rooms.get(roomName);
   if (roomSet && roomSet.has(socket.id)) {
@@ -256,19 +262,37 @@ socket.on("join_room", (data = {}, ack) => {
   // Mantené tus estructuras auxiliares
   const userEntry = connectedUsers.get(userId);
   rooms.get(roomName).users.add(userId);
+  socketToRoomMap.set(socket.id, roomName); // 🔥 trackear la sala actual del socket
+
   if (userEntry) {
     // opcional: trackear rooms por usuario
     userEntry.rooms = userEntry.rooms || new Set();
     userEntry.rooms.add(roomName);
   }
 
+  // ✅ Enviar la lista actualizada de usuarios de la sala al nuevo socket
   const users = getRoomUsers(roomName);
-  socket.emit("join_success", { room: roomName, roomId: roomName, userCount: users.length });
-  io.to(roomName).emit("user-joined-room", { roomId: roomName, username, userCount: users.length });
+  socket.emit("connected_users", users); // 👈 hace que el panel Handy se llene correctamente
+
+  // Notificar a todos en la sala
+  io.to(roomName).emit("user-joined-room", {
+    roomId: roomName,
+    username,
+    userCount: users.length
+  });
 
   console.log(`${colors.green}✅ ${username} se unió correctamente a ${roomName}${colors.reset}`);
-  ack?.({ success: true, room: roomName, roomId: roomName, message: `Te uniste a ${roomName}` });
+
+  // Confirmación al cliente
+  ack?.({
+    success: true,
+    room: roomName,
+    roomId: roomName,
+    message: `Te uniste a ${roomName}`,
+    userCount: users.length
+  });
 });
+
 
 
   // ============================================================
@@ -643,12 +667,46 @@ socket.on("join_room", (data = {}, ack) => {
     ack?.({ success: true, rooms: list });
   });
 
-  socket.on("get_users", (data = {}, ack) => {
-    const { roomId } = data;
-    const users = getRoomUsers(roomId || "general");
-    socket.emit("connected_users", users);
-    ack?.({ success: true, users });
+// 📋 Solicitud de lista de usuarios conectados (por sala)
+socket.on("get_users", (data = {}, ack) => {
+  let { roomId } = data || {};
+
+  // 🔍 Si no vino roomId, usamos la sala actual del socket
+  if (!roomId) {
+    roomId = socketToRoomMap.get(socket.id);
+    if (!roomId) {
+      // Si el socket aún no está en una sala, asumir "general"
+      roomId = "general";
+      console.warn(`${colors.yellow}⚠️ get_users sin roomId — usando sala por defecto 'general'${colors.reset}`);
+    }
+  }
+
+  // 🔐 Verificar que la sala existe
+  if (!rooms.has(roomId)) {
+    const msg = `❌ La sala '${roomId}' no existe`;
+    socket.emit("error", { message: msg });
+    return ack?.({ success: false, message: msg });
+  }
+
+  // ✅ Obtener los usuarios conectados en esa sala
+  const users = getRoomUsers(roomId);
+
+  // 📤 Enviar lista solo al socket que la pidió
+  socket.emit("connected_users", users);
+
+  // 📜 Log de diagnóstico
+  console.log(
+    `${colors.cyan}📋 Lista de usuarios enviada a ${socket.username || socket.id} en sala '${roomId}': ${users.length} usuarios${colors.reset}`
+  );
+
+  // ✅ Responder ACK
+  ack?.({
+    success: true,
+    roomId,
+    count: users.length,
+    users
   });
+});
 
 // ============================================================
 // 🛰️ WebRTC — Señalización dirigida (no broadcast)
