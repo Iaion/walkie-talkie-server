@@ -177,148 +177,143 @@ io.on("connection", (socket) => {
   // ============================================================
   // 🧩 Usuario conectado
   // ============================================================
-  socket.on("user-connected", async (user, ack) => {
-    console.log(`${colors.blue}📥 Evento → user-connected:${colors.reset}`, user);
+ 
+socket.on("user-connected", async (user, ack) => {
+  console.log(`${colors.blue}📥 Evento → user-connected:${colors.reset}`, user);
 
-    if (!user || !user.id || !user.username) {
-      const msg = "⚠️ Datos de usuario inválidos";
-      console.warn(`${colors.yellow}${msg}${colors.reset}`);
-      ack?.({ success: false, message: msg });
-      return;
-    }
+  if (!user || !user.id || !user.username) {
+    const msg = "⚠️ Datos de usuario inválidos";
+    console.warn(`${colors.yellow}${msg}${colors.reset}`);
+    ack?.({ success: false, message: msg });
+    return;
+  }
 
-    const userId = user.id;
-    socketToUserMap.set(socket.id, userId);
+  const userId = user.id;
+  // ✅ MUY IMPORTANTE: guardar en el propio socket
+  socket.userId = userId;
+  socket.username = user.username;
 
-    const existing = connectedUsers.get(userId);
-    if (existing) {
-      existing.sockets.add(socket.id);
-      existing.userData = { ...existing.userData, ...user, isOnline: true };
-    } else {
-      connectedUsers.set(userId, { userData: { ...user, isOnline: true }, sockets: new Set([socket.id]) });
-    }
+  socketToUserMap.set(socket.id, userId);
 
-    const lastRoom = userToRoomMap.get(userId);
-    if (lastRoom && rooms.has(lastRoom)) {
-      socket.join(lastRoom);
-      socketToRoomMap.set(socket.id, lastRoom);
-      rooms.get(lastRoom).users.add(userId);
-      socket.emit("join_success", { room: lastRoom, roomId: lastRoom, message: "Reingreso automático" });
-      console.log(`${colors.green}🔁 ${user.username} reingresó a ${lastRoom}${colors.reset}`);
-    }
+  const existing = connectedUsers.get(userId);
+  if (existing) {
+    existing.sockets.add(socket.id);
+    existing.userData = { ...existing.userData, ...user, isOnline: true };
+  } else {
+    connectedUsers.set(userId, { userData: { ...user, isOnline: true }, sockets: new Set([socket.id]) });
+  }
 
-    try {
-      const userDoc = db.collection(USERS_COLLECTION).doc(userId);
-      await userDoc.set({ ...user, isOnline: true, lastLogin: Date.now() }, { merge: true });
-      console.log(`${colors.green}🔑 Usuario sincronizado con Firebase: ${user.username}${colors.reset}`);
-    } catch (error) {
-      console.error(`${colors.red}❌ Error al registrar usuario:${colors.reset}`, error);
-    }
+  try {
+    const userDoc = db.collection(USERS_COLLECTION).doc(userId);
+    await userDoc.set({ ...user, isOnline: true, lastLogin: Date.now() }, { merge: true });
+    console.log(`${colors.green}🔑 Usuario sincronizado con Firebase: ${user.username}${colors.reset}`);
+  } catch (error) {
+    console.error(`${colors.red}❌ Error al registrar usuario:${colors.reset}`, error);
+  }
 
-    io.emit(
-      "connected_users",
-      Array.from(connectedUsers.values()).map((u) => ({ ...u.userData, socketCount: u.sockets.size }))
-    );
-    socket.emit("room_list", serializeRooms());
-    ack?.({ success: true });
-    console.log(`${colors.green}✅ ACK → user-connected confirmado${colors.reset}`);
-  });
+  io.emit(
+    "connected_users",
+    Array.from(connectedUsers.values()).map((u) => ({ ...u.userData, socketCount: u.sockets.size }))
+  );
+  socket.emit("room_list", serializeRooms());
+  ack?.({ success: true });
+  console.log(`${colors.green}✅ ACK → user-connected confirmado${colors.reset}`);
+});
+
 
   // ============================================================
   // 🚪 Unión de salas
   // ============================================================
-  socket.on("join_room", (data = {}, ack) => {
-    console.log(`${colors.magenta}🚪 Evento → join_room:${colors.reset}`, data);
+  // 🚪 Unión de salas (multi-room, sin expulsar la anterior)
+socket.on("join_room", (data = {}, ack) => {
+  console.log(`${colors.magenta}🚪 Evento → join_room:${colors.reset}`, data);
 
-    const roomName = data.room || data.roomId || "salas";
-    const { userId, username } = data;
+  const roomName = data.room || data.roomId || "salas";
+  const { userId, username } = data;
 
-    if (!roomName || !userId || !username) {
-      const msg = "❌ Datos de unión incompletos";
-      socket.emit("join_error", { message: msg });
-      ack?.({ success: false, message: msg });
-      return;
-    }
+  if (!roomName || !userId || !username) {
+    const msg = "❌ Datos de unión incompletos";
+    socket.emit("join_error", { message: msg });
+    return ack?.({ success: false, message: msg });
+  }
 
-    const alreadyInRoom = Array.from(connectedUsers.get(userId)?.sockets || []).some(
-      (sid) => socketToRoomMap.get(sid) === roomName
-    );
-    if (alreadyInRoom) {
-      console.warn(`${colors.yellow}⚠️ ${username} ya está en ${roomName}, ignorando join duplicado.${colors.reset}`);
-      return ack?.({ success: true, message: "Ya estás en esta sala" });
-    }
+  if (!rooms.has(roomName)) {
+    const msg = `❌ Sala ${roomName} no existe`;
+    socket.emit("join_error", { message: msg });
+    return ack?.({ success: false, message: msg });
+  }
 
-    if (!rooms.has(roomName)) {
-      const msg = `❌ Sala ${roomName} no existe`;
-      socket.emit("join_error", { message: msg });
-      ack?.({ success: false, message: msg });
-      return;
-    }
+  // Ya está este socket en la sala?
+  const roomSet = io.sockets.adapter.rooms.get(roomName);
+  if (roomSet && roomSet.has(socket.id)) {
+    console.warn(`${colors.yellow}⚠️ ${username} ya está en ${roomName}, ignorando join duplicado.${colors.reset}`);
+    return ack?.({ success: true, message: "Ya estás en esta sala" });
+  }
 
-    const prevRoomId = socketToRoomMap.get(socket.id);
-    if (prevRoomId && rooms.has(prevRoomId)) {
-      const prev = rooms.get(prevRoomId);
-      socket.leave(prevRoomId);
-      const stillInPrev = Array.from(connectedUsers.get(userId)?.sockets || []).some(
-        (sid) => socketToRoomMap.get(sid) === prevRoomId && sid !== socket.id
-      );
-      if (!stillInPrev) {
-        prev.users.delete(userId);
-        io.to(prevRoomId).emit("user-left-room", { roomId: prevRoomId, userCount: prev.users.size });
-      }
-    }
+  // ✅ Join SIN dejar otras salas
+  socket.join(roomName);
 
-    socket.join(roomName);
-    socketToRoomMap.set(socket.id, roomName);
-    userToRoomMap.set(userId, roomName);
-    rooms.get(roomName).users.add(userId);
+  // Mantené tus estructuras auxiliares
+  const userEntry = connectedUsers.get(userId);
+  rooms.get(roomName).users.add(userId);
+  if (userEntry) {
+    // opcional: trackear rooms por usuario
+    userEntry.rooms = userEntry.rooms || new Set();
+    userEntry.rooms.add(roomName);
+  }
 
-    const users = getRoomUsers(roomName);
-    socket.emit("join_success", { room: roomName, roomId: roomName, userCount: users.length });
-    io.to(roomName).emit("user-joined-room", { roomId: roomName, username, userCount: users.length });
+  const users = getRoomUsers(roomName);
+  socket.emit("join_success", { room: roomName, roomId: roomName, userCount: users.length });
+  io.to(roomName).emit("user-joined-room", { roomId: roomName, username, userCount: users.length });
 
-    console.log(`${colors.green}✅ ${username} se unió correctamente a ${roomName}${colors.reset}`);
-    ack?.({ success: true, room: roomName, roomId: roomName, message: `Te uniste a ${roomName}` });
-  });
+  console.log(`${colors.green}✅ ${username} se unió correctamente a ${roomName}${colors.reset}`);
+  ack?.({ success: true, room: roomName, roomId: roomName, message: `Te uniste a ${roomName}` });
+});
+
 
   // ============================================================
   // 🚪 Salir de sala
   // ============================================================
-  socket.on("leave_room", (data = {}, ack) => {
-    const { roomId, userId, username } = data || {};
-    const currentRoom = socketToRoomMap.get(socket.id) || roomId;
+ socket.on("leave_room", (data = {}, ack) => {
+  const { roomId, userId, username } = data || {};
+  const targetRoom = roomId; // ya viene de data; no usamos socketToRoomMap único
 
-    if (!currentRoom || !rooms.has(currentRoom) || !userId) {
-      const msg = "⚠️ leave_room: datos inválidos";
-      ack?.({ success: false, message: msg });
-      return;
+  if (!targetRoom || !rooms.has(targetRoom) || !userId) {
+    const msg = "⚠️ leave_room: datos inválidos";
+    ack?.({ success: false, message: msg });
+    return;
+  }
+
+  socket.leave(targetRoom);
+
+  // ¿Queda otro socket del mismo user en esa sala?
+  const roomSet = io.sockets.adapter.rooms.get(targetRoom);
+  const stillInRoom = roomSet
+    ? Array.from(roomSet).some((sid) => {
+        const s = io.sockets.sockets.get(sid);
+        return s?.userId === userId && sid !== socket.id;
+      })
+    : false;
+
+  if (!stillInRoom) {
+    const r = rooms.get(targetRoom);
+    r.users.delete(userId);
+
+    if (pttState[targetRoom] && pttState[targetRoom].speakerId === userId) {
+      pttState[targetRoom] = null;
+      io.to(targetRoom).emit("token_released", { roomId: targetRoom, currentSpeaker: null });
+      io.to(targetRoom).emit("current_speaker_update", null);
+      console.log(`${colors.red}🎙️ Token liberado (leave_room) por ${userId}${colors.reset}`);
     }
 
-    socket.leave(currentRoom);
-    socketToRoomMap.delete(socket.id);
+    io.to(targetRoom).emit("user-left-room", { roomId: targetRoom, username, userCount: r.users.size });
+  }
 
-    const hasAnotherSocketInRoom = Array.from(connectedUsers.get(userId)?.sockets || []).some(
-      (sid) => socketToRoomMap.get(sid) === currentRoom
-    );
+  socket.emit("left_room", { roomId: targetRoom });
+  ack?.({ success: true, roomId: targetRoom });
+  console.log(`${colors.gray}👋 ${username || userId} salió de ${targetRoom}${colors.reset}`);
+});
 
-    if (!hasAnotherSocketInRoom) {
-      const r = rooms.get(currentRoom);
-      r.users.delete(userId);
-
-      if (pttState[currentRoom] && pttState[currentRoom].speakerId === userId) {
-        pttState[currentRoom] = null;
-        io.to(currentRoom).emit("token_released", { roomId: currentRoom, currentSpeaker: null });
-        io.to(currentRoom).emit("current_speaker_update", null);
-        console.log(`${colors.red}🎙️ Token liberado (leave_room) por ${userId}${colors.reset}`);
-      }
-
-      io.to(currentRoom).emit("user-left-room", { roomId: currentRoom, username, userCount: r.users.size });
-    }
-
-    socket.emit("left_room", { roomId: currentRoom });
-    ack?.({ success: true, roomId: currentRoom });
-    console.log(`${colors.gray}👋 ${username || userId} salió de ${currentRoom}${colors.reset}`);
-  });
 
   // ============================================================
   // 💬 Mensajes de texto
@@ -703,6 +698,7 @@ function findSocketByUserId(userId, roomId) {
   }
   return null;
 }
+
 
 
   // ============================================================
