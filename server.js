@@ -893,6 +893,33 @@ function findSocketByUserId(userId, roomId) {
     );
   });
 });
+function getRoomUsers(roomId) {
+  const room = rooms.get(roomId);
+  if (!room) {
+    console.warn(`${colors.yellow}⚠️ getRoomUsers: Sala '${roomId}' no encontrada${colors.reset}`);
+    return [];
+  }
+  
+  console.log(`${colors.cyan}🔍 getRoomUsers('${roomId}') - Usuarios en room:${colors.reset}`, Array.from(room.users));
+  
+  const users = Array.from(room.users)
+    .map((userId) => {
+      const entry = connectedUsers.get(userId);
+      if (!entry) {
+        console.warn(`${colors.yellow}⚠️ Usuario ${userId} en sala ${roomId} pero no en connectedUsers${colors.reset}`);
+        return null;
+      }
+      return { 
+        ...entry.userData, 
+        isOnline: true,
+        socketCount: entry.sockets.size 
+      };
+    })
+    .filter(Boolean);
+
+  console.log(`${colors.green}✅ getRoomUsers('${roomId}') → ${users.length} usuarios${colors.reset}`);
+  return users;
+}
 
 // ============================================================
 // 🚀 Iniciar servidor
