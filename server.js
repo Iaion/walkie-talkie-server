@@ -438,21 +438,24 @@ socket.on("join_room", (data = {}, ack) => {
       console.error(`${colors.red}❌ Error al procesar audio:${colors.reset}`, err);
     }
   });
-  // ============================================================
-// 🧭 Helper para detectar automáticamente la sala de un socket
+// ============================================================
+// 🧭 Helper MEJORADO para detectar automáticamente la sala de un socket
 // ============================================================
 function inferRoomIdFromSocket(socket) {
-  // El socket siempre está en al menos 1 "room": su propio ID
   const joinedRooms = Array.from(socket.rooms || []).filter((r) => r !== socket.id);
-
-  // Si está en varias salas, elegimos prioridades conocidas
+  
+  // 🆕 PRIORIDAD: handy > general > otras salas
   if (joinedRooms.includes("handy")) return "handy";
   if (joinedRooms.includes("general")) return "general";
-
-  // Si tiene alguna otra, devolvemos la primera
-  if (joinedRooms.length > 0) return joinedRooms[0];
-
-  // Fallback
+  
+  // 🆕 Buscar cualquier sala que no sea el lobby "salas"
+  const nonLobbyRooms = joinedRooms.filter(room => room !== "salas");
+  if (nonLobbyRooms.length > 0) return nonLobbyRooms[0];
+  
+  // 🆕 Último recurso: si solo está en "salas", usar general
+  if (joinedRooms.includes("salas")) return "general";
+  
+  // Fallback absoluto
   return "general";
 }
 
@@ -710,32 +713,69 @@ function inferRoomIdFromSocket(socket) {
 // ============================================================
 // 📋 Obtener lista de usuarios conectados en una sala
 // ============================================================
+
 socket.on("get_users", (data = {}, ack) => {
   let { roomId } = data || {};
 
-  // 🔍 Si no se envió roomId, lo deducimos del socket
+  console.log(`${colors.cyan}📥 Evento → get_users:${colors.reset}`, data);
+
+  // 🆕 DETECCIÓN INTELIGENTE: Si no hay roomId, buscar la sala MÁS PROBABLE
   if (!roomId) {
-    roomId = inferRoomIdFromSocket(socket);
+    // Prioridad: 1. handy, 2. general, 3. primera sala disponible
+    const joinedRooms = Array.from(socket.rooms || []).filter((r) => r !== socket.id);
+    
+    if (joinedRooms.includes("handy")) {
+      roomId = "handy";
+    } else if (joinedRooms.includes("general")) {
+      roomId = "general";
+    } else if (joinedRooms.length > 0) {
+      roomId = joinedRooms[0]; // Primera sala disponible
+    } else {
+      roomId = "general"; // Fallback seguro
+    }
+    
+    console.log(`${colors.yellow}⚠️ get_users sin roomId, detectado automáticamente: '${roomId}'${colors.reset}`);
+  }
+
+  // 🆕 VERIFICAR que la sala existe
+  if (!rooms.has(roomId)) {
+    const msg = `❌ Sala '${roomId}' no existe`;
+    console.warn(`${colors.red}${msg}${colors.reset}`);
+    socket.emit("connected_users", []); // Enviar array vacío
+    return ack?.({ 
+      success: false, 
+      message: msg,
+      roomId: roomId,
+      count: 0 
+    });
   }
 
   const users = getRoomUsers(roomId);
-  const username =
-    connectedUsers.get(socketToUserMap.get(socket.id))?.userData?.username || socket.id;
+  const username = connectedUsers.get(socketToUserMap.get(socket.id))?.userData?.username || socket.id;
 
-  // 🔹 Enviar lista de usuarios solo a este socket
+  console.log(`${colors.green}📤 Enviando ${users.length} usuarios para sala '${roomId}' a ${username}${colors.reset}`);
+
+  // 🆕 ENVIAR SIEMPRE la lista, incluso si está vacía
   socket.emit("connected_users", users);
 
-  // 🔹 Confirmar con ACK para debugging del cliente
+  // 🆕 ACK detallado para debugging
   ack?.({
     success: true,
-    roomId,
+    roomId: roomId,
     count: users.length,
-    message: `Usuarios en sala ${roomId}: ${users.length}`,
+    message: `Usuarios en ${roomId}: ${users.length}`,
+    users: users.map(u => ({ id: u.id, username: u.username })) // 🆕 Solo datos básicos para debug
   });
 
-  console.log(
-    `📋 Lista de usuarios enviada a ${username} en sala '${roomId}': ${users.length} usuarios`
-  );
+  // 🆕 LOG detallado
+  console.log(`${colors.blue}📋 Sala '${roomId}': ${users.length} usuarios${colors.reset}`);
+  if (users.length > 0) {
+    users.forEach(user => {
+      console.log(`${colors.gray}   👤 ${user.username} (${user.id})${colors.reset}`);
+    });
+  } else {
+    console.log(`${colors.gray}   💡 Sala vacía${colors.reset}`);
+  }
 });
 
 
