@@ -716,7 +716,7 @@ function inferRoomIdFromSocket(socket) {
 
 socket.on("get_users", (data = {}, ack) => {
   let { roomId } = data || {};
-
+  console.log(`${colors.red}🔍 DEBUG GET_USERS - DATOS RECIBIDOS:${colors.reset}`, JSON.stringify(data, null, 2));
   console.log(`${colors.cyan}📥 Evento → get_users:${colors.reset}`, data);
 
   // 🆕 DETECCIÓN INTELIGENTE: Si no hay roomId, buscar la sala MÁS PROBABLE
