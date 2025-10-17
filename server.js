@@ -221,19 +221,16 @@ socket.on("user-connected", async (user, ack) => {
   ack?.({ success: true });
   console.log(`${colors.green}✅ ACK → user-connected confirmado${colors.reset}`);
 });
-
-
-  // ============================================================
-  // 🚪 Unión de salas
-  // ============================================================
-  // 🚪 Unión de salas (multi-room, sin expulsar la anterior)
 // ============================================================
 // 🚪 Unión de salas (multi-room, sin expulsar la anterior)
+// ============================================================
+// ============================================================
+// 🚪 Unión de salas (multi-room, sincronizada con connectedUsers)
 // ============================================================
 socket.on("join_room", (data = {}, ack) => {
   console.log(`${colors.magenta}🚪 Evento → join_room:${colors.reset}`, data);
 
-  const roomName = data.room || data.roomId || "salas";
+  const roomName = data.room || data.roomId || "general";
   const { userId, username } = data;
 
   if (!roomName || !userId || !username) {
@@ -248,55 +245,51 @@ socket.on("join_room", (data = {}, ack) => {
     return ack?.({ success: false, message: msg });
   }
 
-  // ✅ Guardar userId y username en el socket (IMPORTANTE para WebRTC)
+  // ✅ Guardar info básica en el socket
   socket.userId = userId;
   socket.username = username;
-
-  // 🧭 Guardar la última sala unida del socket (para inferRoomIdFromSocket)
   socket.lastJoinedRoom = roomName;
 
-  // Ya está este socket en la sala?
-  const roomSet = io.sockets.adapter.rooms.get(roomName);
-  if (roomSet && roomSet.has(socket.id)) {
-    console.warn(
-      `${colors.yellow}⚠️ ${username} ya está en ${roomName}, ignorando join duplicado.${colors.reset}`
-    );
-    return ack?.({ success: true, message: "Ya estás en esta sala" });
-  }
-
-  // ✅ Join SIN dejar otras salas
-  socket.join(roomName);
-
-  // Mantené tus estructuras auxiliares
-  const userEntry = connectedUsers.get(userId);
-  rooms.get(roomName).users.add(userId);
-  socketToRoomMap.set(socket.id, roomName); // 🔥 trackear la sala actual del socket
-
-  if (userEntry) {
-    // opcional: trackear rooms por usuario
+  // ============================================================
+  // 🔁 Sincronizar connectedUsers (crear si no existe)
+  // ============================================================
+  let userEntry = connectedUsers.get(userId);
+  if (!userEntry) {
+    userEntry = {
+      id: userId,
+      username,
+      isOnline: true,
+      rooms: new Set([roomName]),
+      socketId: socket.id,
+      lastSeen: Date.now(),
+    };
+    connectedUsers.set(userId, userEntry);
+    console.log(`${colors.cyan}🧩 Nuevo usuario agregado a connectedUsers:${colors.reset}`, username);
+  } else {
+    // Si ya existe, actualizar su socket y sala
+    userEntry.isOnline = true;
+    userEntry.username = username;
+    userEntry.socketId = socket.id;
     userEntry.rooms = userEntry.rooms || new Set();
     userEntry.rooms.add(roomName);
   }
 
   // ============================================================
-  // 📋 Enviar la lista actualizada de usuarios SOLO de esa sala
+  // 🧹 Si estaba en otra sala, quitarlo de ahí (evita "bienvenido a Handy" en general)
   // ============================================================
-  const users = getRoomUsers(roomName);
+  for (const [rName, room] of rooms.entries()) {
+    if (rName !== roomName && room.users.has(userId)) {
+      room.users.delete(userId);
+      console.log(`🧹 ${username} removido de sala anterior ${rName}`);
+    }
+  }
 
-  // Enviar la lista actualizada al socket que se unió
-  socket.emit("connected_users", users); // 👈 llena el panel Handy correctamente
-
-  // 🔄 Notificar a todos los usuarios en la sala
-  io.to(roomName).emit("user-joined-room", {
-    roomId: roomName,
-    username,
-    userCount: users.length,
-  });
-
-  console.log(
-    `${colors.green}✅ ${username} se unió correctamente a ${roomName}${colors.reset}`
-  );
-
+  // ============================================================
+  // 🚪 Unirse a la nueva sala
+  // ============================================================
+  socket.join(roomName);
+  rooms.get(roomName).users.add(userId);
+  socketToRoomMap.set(socket.id, roomName);
   // ============================================================
   // 📤 Confirmación al cliente
   // ============================================================
