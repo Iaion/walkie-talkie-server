@@ -1,7 +1,7 @@
-/// ============================================================
+// ============================================================
 // 🌐 Servidor Node.js con Socket.IO, Firebase Firestore y Storage + PTT + WebRTC
 // 💬 Compatible con tu app Android (SocketRepository, ChatViewModel, PTTManager)
-// 🛠 CORREGIDO: Gestión unificada de salas y usuarios
+// 🪲 Modo DEBUG EXTREMO: Logs detallados para cada paso de unión, envío y token
 // ============================================================
 
 const express = require("express");
@@ -64,52 +64,27 @@ const USERS_COLLECTION = "users";
 const MESSAGES_COLLECTION = "messages";
 
 // ============================================================
-// 📦 NUEVO SISTEMA UNIFICADO DE GESTIÓN DE SALAS
+// 📦 Estado en memoria
 // ============================================================
-const roomManager = {
-  // SocketId → Set<RoomIds>
-  socketRooms: new Map(),
-  // UserId → Set<RoomIds>  
-  userRooms: new Map(),
-  // RoomId → Set<UserId>
-  roomUsers: new Map()
-};
-
 const connectedUsers = new Map();
 const socketToUserMap = new Map();
+const socketToRoomMap = new Map();
+const userToRoomMap = new Map();
+const rooms = new Map();
 const pttState = {};
-const tokenTimers = {};
 
 // ============================================================
 // 🚪 Salas base
 // ============================================================
 function createRoom(id, name, description, type) {
-  return { 
-    id, 
-    name, 
-    description, 
-    users: new Set(), 
-    type, 
-    isPrivate: false 
-  };
+  return { id, name, description, users: new Set(), type, isPrivate: false };
 }
-
-const rooms = new Map();
 rooms.set("salas", createRoom("salas", "Lobby de Salas", "Pantalla principal", "lobby"));
-rooms.set("general", createRoom("general", "Chat General", "Sala pública", "main"));
-rooms.set("handy", createRoom("handy", "Radio Handy (PTT)", "Simulación de radio", "main"));
+rooms.set("general", createRoom("general", "Chat General", "Sala pública", "general"));
+rooms.set("handy", createRoom("handy", "Radio Handy (PTT)", "Simulación de radio", "ptt"));
 
 // ============================================================
-// 🏗️ TIPOS DE SALA JERÁRQUICOS
-// ============================================================
-const ROOM_TYPES = {
-  LOBBY: 'lobby',      // salas - siempre activa
-  MAIN: 'main',        // general, handy - sala principal
-  SUPPORT: 'support'   // salas temporales
-};
-
-// ============================================================
-// 🔧 FUNCIONES AUXILIARES MEJORADAS
+// 🔧 Helpers
 // ============================================================
 function serializeRoom(room) {
   return {
@@ -122,205 +97,34 @@ function serializeRoom(room) {
     isPrivate: !!room.isPrivate,
   };
 }
-
 function serializeRooms() {
   return Array.from(rooms.values()).map(serializeRoom);
 }
-
 function getRoomUsers(roomId) {
   const room = rooms.get(roomId);
-  if (!room) {
-    console.warn(`${colors.yellow}⚠️ getRoomUsers: Sala '${roomId}' no encontrada${colors.reset}`);
-    return [];
-  }
-  
-  console.log(`${colors.cyan}🔍 getRoomUsers('${roomId}') - Usuarios en room:${colors.reset}`, Array.from(room.users));
-  
-  const users = Array.from(room.users)
+  if (!room) return [];
+  return Array.from(room.users)
     .map((userId) => {
       const entry = connectedUsers.get(userId);
-      if (!entry) {
-        console.warn(`${colors.yellow}⚠️ Usuario ${userId} en sala ${roomId} pero no en connectedUsers${colors.reset}`);
-        return null;
-      }
-      return { 
-        ...entry.userData, 
-        isOnline: true,
-        socketCount: entry.sockets.size 
-      };
+      return entry ? { ...entry.userData, isOnline: true } : null;
     })
     .filter(Boolean);
-
-  console.log(`${colors.green}✅ getRoomUsers('${roomId}') → ${users.length} usuarios${colors.reset}`);
-  return users;
 }
 
-// 🎯 OBTENER SALA PRINCIPAL DE UN USUARIO
-function getUsersMainRoom(userId) {
-  const userRooms = roomManager.userRooms.get(userId) || new Set();
-  
-  // Prioridad: handy > general > primera sala principal disponible
-  if (userRooms.has('handy')) return 'handy';
-  if (userRooms.has('general')) return 'general';
-  
-  const mainRooms = Array.from(userRooms).filter(roomId => {
-    const room = rooms.get(roomId);
-    return room && room.type === 'main';
-  });
-  
-  return mainRooms[0] || 'general'; // Fallback seguro
-}
-
-// 🚪 FUNCIÓN PARA DEJAR SALA
-async function leaveRoom(socket, roomId) {
-  if (!rooms.has(roomId)) {
-    console.warn(`${colors.yellow}⚠️ leaveRoom: Sala ${roomId} no existe${colors.reset}`);
-    return;
-  }
-
-  const room = rooms.get(roomId);
-  const userId = socket.userId;
-  const username = socket.username;
-
-  console.log(`${colors.cyan}🚪 leaveRoom: ${username} dejando ${roomId}${colors.reset}`);
-
-  // Salir físicamente de la sala Socket.IO
-  socket.leave(roomId);
-
-  // Verificar si hay otros sockets del mismo usuario en la sala
-  const roomSockets = io.sockets.adapter.rooms.get(roomId) || new Set();
-  const userStillInRoom = Array.from(roomSockets).some(socketId => {
-    const s = io.sockets.sockets.get(socketId);
-    return s?.userId === userId;
-  });
-
-  if (!userStillInRoom) {
-    // Remover usuario de la sala
-    room.users.delete(userId);
-    
-    // Actualizar estructuras del roomManager
-    if (roomManager.socketRooms.has(socket.id)) {
-      roomManager.socketRooms.get(socket.id).delete(roomId);
-    }
-    
-    if (roomManager.userRooms.has(userId)) {
-      roomManager.userRooms.get(userId).delete(roomId);
-    }
-
-    // Liberar token PTT si era el speaker
-    if (pttState[roomId]?.speakerId === userId) {
-      console.log(`${colors.yellow}🎙️ Liberando token PTT por salir de sala${colors.reset}`);
-      clearTimeout(tokenTimers[roomId]);
-      pttState[roomId] = null;
-      io.to(roomId).emit("token_released", { roomId, currentSpeaker: null });
-      io.to(roomId).emit("current_speaker_update", null);
-    }
-
-    // Notificar a la sala que el usuario salió
-    io.to(roomId).emit("user_left_room", {
-      roomId: roomId,
-      username: username,
-      userCount: room.users.size
-    });
-
-    console.log(`${colors.green}✅ ${username} salió completamente de ${roomId}${colors.reset}`);
-  } else {
-    console.log(`${colors.gray}🔗 ${username} mantiene otros sockets en ${roomId}${colors.reset}`);
-  }
-}
-
-// ➕ FUNCIÓN PARA UNIRSE A SALA
-async function joinRoom(socket, roomId) {
-  if (!rooms.has(roomId)) {
-    throw new Error(`Sala ${roomId} no existe`);
-  }
-
-  const room = rooms.get(roomId);
-  const userId = socket.userId;
-  const username = socket.username;
-
-  console.log(`${colors.cyan}➕ joinRoom: ${username} uniéndose a ${roomId}${colors.reset}`);
-
-  // Unirse físicamente a la sala Socket.IO
-  socket.join(roomId);
-
-  // Agregar usuario a la sala
-  room.users.add(userId);
-
-  // Actualizar estructuras del roomManager
-  if (!roomManager.socketRooms.has(socket.id)) {
-    roomManager.socketRooms.set(socket.id, new Set());
-  }
-  roomManager.socketRooms.get(socket.id).add(roomId);
-
-  if (!roomManager.userRooms.has(userId)) {
-    roomManager.userRooms.set(userId, new Set());
-  }
-  roomManager.userRooms.get(userId).add(roomId);
-
-  console.log(`${colors.green}✅ ${username} unido exitosamente a ${roomId}${colors.reset}`);
-}
-
-// 🔄 FUNCIÓN PRINCIPAL PARA CAMBIAR DE SALA
-async function changeUserRoom(socket, targetRoomId) {
-  const userId = socket.userId;
-  const username = socket.username;
-  const currentRooms = roomManager.socketRooms.get(socket.id) || new Set();
-
-  console.log(`${colors.magenta}🔄 changeUserRoom: ${username} ${Array.from(currentRooms)} → ${targetRoomId}${colors.reset}`);
-
-  // 1️⃣ Salir de TODAS las salas principales anteriores (excepto lobby 'salas')
-  for (const roomId of currentRooms) {
-    if (roomId !== 'salas' && roomId !== targetRoomId) {
-      const room = rooms.get(roomId);
-      if (room && room.type === 'main') {
-        await leaveRoom(socket, roomId);
-      }
-    }
-  }
-
-  // 2️⃣ Unirse a la nueva sala
-  await joinRoom(socket, targetRoomId);
-  
-  // 3️⃣ Actualizar estado - mantener solo 'salas' y la nueva sala principal
-  roomManager.socketRooms.set(socket.id, new Set(['salas', targetRoomId]));
-  
-  console.log(`${colors.green}🎯 ${username} ahora en salas: salas + ${targetRoomId}${colors.reset}`);
-  
-  return targetRoomId;
-}
-
-// 🛰️ Helper WebRTC mejorado
-function findSocketByUserId(userId, roomId) {
-  const room = io.sockets.adapter.rooms.get(roomId);
-  if (!room) return null;
-  
-  for (const socketId of room) {
-    const s = io.sockets.sockets.get(socketId);
-    if (s?.userId === userId) return s;
-  }
-  return null;
-}
-
-// 🔧 Utilidades para DataURL
 function isHttpUrl(str) {
   return typeof str === "string" && /^https?:\/\//i.test(str);
 }
-
 function isDataUrl(str) {
   return typeof str === "string" && /^data:image\/[a-zA-Z0-9.+-]+;base64,/i.test(str);
 }
-
 function getMimeFromDataUrl(dataUrl) {
   const match = /^data:(image\/[a-zA-Z0-9.+-]+);base64,/.exec(dataUrl || "");
   return match ? match[1] : "image/jpeg";
 }
-
 function getBase64FromDataUrl(dataUrl) {
   const idx = (dataUrl || "").indexOf("base64,");
   return idx !== -1 ? dataUrl.substring(idx + 7) : null;
 }
-
 function isPTTRoomId(roomId) {
   const r = rooms.get(roomId);
   return (r && r.type === "ptt") || roomId === "handy";
@@ -335,11 +139,9 @@ async function uploadAvatarFromDataUrl(userId, dataUrl) {
   const buffer = Buffer.from(base64, "base64");
   const filePath = `avatars/${userId}/${Date.now()}_${uuidv4()}.${ext}`;
   const file = bucket.file(filePath);
-  
   console.log(`${colors.yellow}⬆️ Subiendo avatar → ${filePath} (${mime})${colors.reset}`);
   await file.save(buffer, { contentType: mime, resumable: false });
   await file.makePublic();
-  
   const url = file.publicUrl();
   console.log(`${colors.green}✅ Avatar subido y público:${colors.reset} ${url}`);
   return url;
@@ -349,7 +151,6 @@ async function uploadAvatarFromDataUrl(userId, dataUrl) {
 // 🌐 Endpoints REST
 // ============================================================
 app.get("/health", (_, res) => res.status(200).send("Servidor operativo 🚀"));
-
 app.get("/users", (_, res) =>
   res.json(
     Array.from(connectedUsers.values()).map((u) => ({
@@ -358,16 +159,17 @@ app.get("/users", (_, res) =>
     }))
   )
 );
-
 app.get("/rooms", (_, res) => res.json(serializeRooms()));
 
 // ============================================================
-// 🔊 CONFIGURACIÓN PTT
+// 🔊 FUNCIONALIDAD PTT (Push-To-Talk) con ACK, Keep-Alive, desconexión segura y reset global
 // ============================================================
+
 const TOKEN_TIMEOUT_MS = 10_000;
+const tokenTimers = {};
 
 // ============================================================
-// 🔌 Socket.IO - CONEXIÓN PRINCIPAL
+// 🔌 Socket.IO
 // ============================================================
 io.on("connection", (socket) => {
   console.log(`${colors.cyan}🔗 NUEVA CONEXIÓN SOCKET:${colors.reset} ${socket.id}`);
@@ -375,154 +177,188 @@ io.on("connection", (socket) => {
   // ============================================================
   // 🧩 Usuario conectado
   // ============================================================
-  socket.on("user-connected", async (user, ack) => {
-    console.log(`${colors.blue}📥 Evento → user-connected:${colors.reset}`, user);
+ 
+socket.on("user-connected", async (user, ack) => {
+  console.log(`${colors.blue}📥 Evento → user-connected:${colors.reset}`, user);
 
-    if (!user || !user.id || !user.username) {
-      const msg = "⚠️ Datos de usuario inválidos";
-      console.warn(`${colors.yellow}${msg}${colors.reset}`);
-      ack?.({ success: false, message: msg });
-      return;
-    }
+  if (!user || !user.id || !user.username) {
+    const msg = "⚠️ Datos de usuario inválidos";
+    console.warn(`${colors.yellow}${msg}${colors.reset}`);
+    ack?.({ success: false, message: msg });
+    return;
+  }
 
-    const username = user.username;
-    const userId = user.id;
-    
-    // ✅ Guardar en el socket
-    socket.userId = userId;
-    socket.username = username;
-    socketToUserMap.set(socket.id, userId);
+   
+  const username = user.username;
+  const userId = user.id;
+  // ✅ MUY IMPORTANTE: guardar en el propio socket
+  socket.userId = userId;
+  socket.username = user.username;
 
-    // ✅ Inicializar estructuras del roomManager
-    roomManager.socketRooms.set(socket.id, new Set(['salas']));
-    if (!roomManager.userRooms.has(userId)) {
-      roomManager.userRooms.set(userId, new Set(['salas']));
-    }
+  socketToUserMap.set(socket.id, userId);
 
-    const existing = connectedUsers.get(userId);
-    if (existing) {
-      existing.sockets.add(socket.id);
-      existing.userData = { ...existing.userData, ...user, isOnline: true };
-    } else {
-      connectedUsers.set(userId, { 
-        userData: { ...user, isOnline: true }, 
-        sockets: new Set([socket.id]) 
-      });
-    }
+  const existing = connectedUsers.get(userId);
+  if (existing) {
+    existing.sockets.add(socket.id);
+    existing.userData = { ...existing.userData, ...user, isOnline: true };
+  } else {
+    connectedUsers.set(userId, { userData: { ...user, isOnline: true }, sockets: new Set([socket.id]) });
+  }
 
-    // Unirse automáticamente al lobby 'salas'
-    socket.join('salas');
-    rooms.get('salas').users.add(userId);
+  try {
+    const userDoc = db.collection(USERS_COLLECTION).doc(userId);
+    await userDoc.set({ ...user, isOnline: true, lastLogin: Date.now() }, { merge: true });
+    console.log(`${colors.green}🔑 Usuario sincronizado con Firebase: ${user.username}${colors.reset}`);
+  } catch (error) {
+    console.error(`${colors.red}❌ Error al registrar usuario:${colors.reset}`, error);
+  }
 
-    try {
-      const userDoc = db.collection(USERS_COLLECTION).doc(userId);
-      await userDoc.set({ ...user, isOnline: true, lastLogin: Date.now() }, { merge: true });
-      console.log(`${colors.green}🔑 Usuario sincronizado con Firebase: ${username}${colors.reset}`);
-    } catch (error) {
-      console.error(`${colors.red}❌ Error al registrar usuario:${colors.reset}`, error);
-    }
+  io.emit(
+    "connected_users",
+    Array.from(connectedUsers.values()).map((u) => ({ ...u.userData, socketCount: u.sockets.size }))
+  );
+  socket.emit("room_list", serializeRooms());
+  ack?.({ success: true });
+  console.log(`${colors.green}✅ ACK → user-connected confirmado${colors.reset}`);
+});
 
-    // Emitir usuarios conectados globalmente
-    io.emit(
-      "connected_users",
-      Array.from(connectedUsers.values()).map((u) => ({
-        ...u.userData,
-        socketCount: u.sockets.size,
-      }))
+
+  // ============================================================
+  // 🚪 Unión de salas
+  // ============================================================
+  // 🚪 Unión de salas (multi-room, sin expulsar la anterior)
+// ============================================================
+// 🚪 Unión de salas (multi-room, sin expulsar la anterior)
+// ============================================================
+socket.on("join_room", (data = {}, ack) => {
+  console.log(`${colors.magenta}🚪 Evento → join_room:${colors.reset}`, data);
+
+  const roomName = data.room || data.roomId || "salas";
+  const { userId, username } = data;
+
+  if (!roomName || !userId || !username) {
+    const msg = "❌ Datos de unión incompletos";
+    socket.emit("join_error", { message: msg });
+    return ack?.({ success: false, message: msg });
+  }
+
+  if (!rooms.has(roomName)) {
+    const msg = `❌ Sala ${roomName} no existe`;
+    socket.emit("join_error", { message: msg });
+    return ack?.({ success: false, message: msg });
+  }
+
+  // ✅ Guardar userId y username en el socket (IMPORTANTE para WebRTC)
+  socket.userId = userId;
+  socket.username = username;
+
+  // 🧭 Guardar la última sala unida del socket (para inferRoomIdFromSocket)
+  socket.lastJoinedRoom = roomName;
+
+  // Ya está este socket en la sala?
+  const roomSet = io.sockets.adapter.rooms.get(roomName);
+  if (roomSet && roomSet.has(socket.id)) {
+    console.warn(
+      `${colors.yellow}⚠️ ${username} ya está en ${roomName}, ignorando join duplicado.${colors.reset}`
     );
+    return ack?.({ success: true, message: "Ya estás en esta sala" });
+  }
 
-    socket.emit("room_list", serializeRooms());
-    ack?.({ success: true });
-    console.log(`${colors.green}✅ ACK → user-connected confirmado${colors.reset}`);
+  // ✅ Join SIN dejar otras salas
+  socket.join(roomName);
+
+  // Mantené tus estructuras auxiliares
+  const userEntry = connectedUsers.get(userId);
+  rooms.get(roomName).users.add(userId);
+  socketToRoomMap.set(socket.id, roomName); // 🔥 trackear la sala actual del socket
+
+  if (userEntry) {
+    // opcional: trackear rooms por usuario
+    userEntry.rooms = userEntry.rooms || new Set();
+    userEntry.rooms.add(roomName);
+  }
+
+  // ============================================================
+  // 📋 Enviar la lista actualizada de usuarios SOLO de esa sala
+  // ============================================================
+  const users = getRoomUsers(roomName);
+
+  // Enviar la lista actualizada al socket que se unió
+  socket.emit("connected_users", users); // 👈 llena el panel Handy correctamente
+
+  // 🔄 Notificar a todos los usuarios en la sala
+  io.to(roomName).emit("user-joined-room", {
+    roomId: roomName,
+    username,
+    userCount: users.length,
+  });
+
+  console.log(
+    `${colors.green}✅ ${username} se unió correctamente a ${roomName}${colors.reset}`
+  );
+
+  // ============================================================
+  // 📤 Confirmación al cliente
+  // ============================================================
+  ack?.({
+    success: true,
+    room: roomName,
+    roomId: roomName,
+    message: `Te uniste a ${roomName}`,
+    userCount: users.length,
   });
 
   // ============================================================
-  // 🚪 UNIÓN DE SALAS - CORREGIDO
+  // 🆕 (Opcional pero útil) — Empujar la lista completa a todos
   // ============================================================
-  socket.on("join_room", async (data = {}, ack) => {
-    console.log(`${colors.magenta}🚪 Evento → join_room:${colors.reset}`, data);
+  io.to(roomName).emit("connected_users", users);
+});
 
-    const { roomId: targetRoom, userId, username } = data;
-    
-    // ✅ VALIDACIONES INICIALES
-    if (!targetRoom || !userId || !username) {
-      const error = "❌ Datos de unión incompletos";
-      console.warn(`${colors.red}${error}${colors.reset}`);
-      socket.emit("join_error", { message: error });
-      return ack?.({ success: false, message: error });
-    }
 
-    if (!rooms.has(targetRoom)) {
-      const error = `❌ Sala ${targetRoom} no existe`;
-      console.warn(`${colors.red}${error}${colors.reset}`);
-      socket.emit("join_error", { message: error });
-      return ack?.({ success: false, message: error });
-    }
-
-    // 🔄 CAMBIO DE SALA PRINCIPAL
-    try {
-      const finalRoomId = await changeUserRoom(socket, targetRoom);
-      
-      // 📊 OBTENER USUARIOS ACTUALIZADOS
-      const usersInRoom = getRoomUsers(finalRoomId);
-      
-      // 🎯 ENVÍO DE EVENTOS COHERENTES
-      // Solo al usuario que se unió
-      socket.emit("room_joined", {
-        success: true,
-        roomId: finalRoomId,
-        userCount: usersInRoom.length,
-        users: usersInRoom
-      });
-
-      // A todos en la sala (incluyéndolo)
-      io.to(finalRoomId).emit("room_users_updated", {
-        roomId: finalRoomId,
-        users: usersInRoom,
-        userCount: usersInRoom.length,
-        action: 'user_joined',
-        username: username
-      });
-
-      console.log(`${colors.green}✅ ${username} unido correctamente a ${finalRoomId}${colors.reset}`);
-      
-      ack?.({
-        success: true,
-        roomId: finalRoomId,
-        userCount: usersInRoom.length,
-        message: `Unido a ${finalRoomId}`
-      });
-
-    } catch (error) {
-      console.error(`${colors.red}❌ Error en join_room:${colors.reset}`, error);
-      socket.emit("join_error", { message: error.message });
-      ack?.({ success: false, message: error.message });
-    }
-  });
 
   // ============================================================
   // 🚪 Salir de sala
   // ============================================================
-  socket.on("leave_room", async (data = {}, ack) => {
-    const { roomId, userId, username } = data || {};
-    
-    if (!roomId || !userId) {
-      const msg = "⚠️ leave_room: datos inválidos";
-      console.warn(`${colors.yellow}${msg}${colors.reset}`);
-      return ack?.({ success: false, message: msg });
+ socket.on("leave_room", (data = {}, ack) => {
+  const { roomId, userId, username } = data || {};
+  const targetRoom = roomId; // ya viene de data; no usamos socketToRoomMap único
+
+  if (!targetRoom || !rooms.has(targetRoom) || !userId) {
+    const msg = "⚠️ leave_room: datos inválidos";
+    ack?.({ success: false, message: msg });
+    return;
+  }
+
+  socket.leave(targetRoom);
+
+  // ¿Queda otro socket del mismo user en esa sala?
+  const roomSet = io.sockets.adapter.rooms.get(targetRoom);
+  const stillInRoom = roomSet
+    ? Array.from(roomSet).some((sid) => {
+        const s = io.sockets.sockets.get(sid);
+        return s?.userId === userId && sid !== socket.id;
+      })
+    : false;
+
+  if (!stillInRoom) {
+    const r = rooms.get(targetRoom);
+    r.users.delete(userId);
+
+    if (pttState[targetRoom] && pttState[targetRoom].speakerId === userId) {
+      pttState[targetRoom] = null;
+      io.to(targetRoom).emit("token_released", { roomId: targetRoom, currentSpeaker: null });
+      io.to(targetRoom).emit("current_speaker_update", null);
+      console.log(`${colors.red}🎙️ Token liberado (leave_room) por ${userId}${colors.reset}`);
     }
 
-    try {
-      await leaveRoom(socket, roomId);
-      socket.emit("left_room", { roomId: roomId });
-      ack?.({ success: true, roomId: roomId });
-      
-      console.log(`${colors.green}✅ ${username || userId} salió exitosamente de ${roomId}${colors.reset}`);
-    } catch (error) {
-      console.error(`${colors.red}❌ Error en leave_room:${colors.reset}`, error);
-      ack?.({ success: false, message: error.message });
-    }
-  });
+    io.to(targetRoom).emit("user-left-room", { roomId: targetRoom, username, userCount: r.users.size });
+  }
+
+  socket.emit("left_room", { roomId: targetRoom });
+  ack?.({ success: true, roomId: targetRoom });
+  console.log(`${colors.gray}👋 ${username || userId} salió de ${targetRoom}${colors.reset}`);
+});
+
 
   // ============================================================
   // 💬 Mensajes de texto
@@ -533,14 +369,7 @@ io.on("connection", (socket) => {
       return ack?.({ success: false, message: "❌ Datos de mensaje inválidos" });
     }
 
-    const message = { 
-      id: uuidv4(), 
-      userId, 
-      username, 
-      roomId, 
-      text, 
-      timestamp: Date.now() 
-    };
+    const message = { id: uuidv4(), userId, username, roomId, text, timestamp: Date.now() };
 
     try {
       await db.collection(MESSAGES_COLLECTION).add(message);
@@ -609,52 +438,27 @@ io.on("connection", (socket) => {
       console.error(`${colors.red}❌ Error al procesar audio:${colors.reset}`, err);
     }
   });
+// ============================================================
+// 🧭 Helper MEJORADO para detectar automáticamente la sala de un socket
+// ============================================================
+function inferRoomIdFromSocket(socket) {
+  const joinedRooms = Array.from(socket.rooms || []).filter((r) => r !== socket.id);
+  
+  // 🆕 PRIORIDAD: handy > general > otras salas
+  if (joinedRooms.includes("handy")) return "handy";
+  if (joinedRooms.includes("general")) return "general";
+  
+  // 🆕 Buscar cualquier sala que no sea el lobby "salas"
+  const nonLobbyRooms = joinedRooms.filter(room => room !== "salas");
+  if (nonLobbyRooms.length > 0) return nonLobbyRooms[0];
+  
+  // 🆕 Último recurso: si solo está en "salas", usar general
+  if (joinedRooms.includes("salas")) return "general";
+  
+  // Fallback absoluto
+  return "general";
+}
 
-  // ============================================================
-  // 📋 Obtener lista de usuarios conectados en una sala - CORREGIDO
-  // ============================================================
-  socket.on("get_users", (data = {}, ack) => {
-    let { roomId } = data || {};
-    console.log(`${colors.cyan}📥 Evento → get_users:${colors.reset}`, data);
-
-    // 🎯 DETECCIÓN INTELIGENTE MEJORADA
-    if (!roomId) {
-      roomId = getUsersMainRoom(socket.userId);
-      console.log(`${colors.yellow}🎯 Sala detectada automáticamente: '${roomId}'${colors.reset}`);
-    }
-
-    // 🆕 VERIFICAR que la sala existe
-    if (!rooms.has(roomId)) {
-      const msg = `❌ Sala '${roomId}' no existe`;
-      console.warn(`${colors.red}${msg}${colors.reset}`);
-      socket.emit("connected_users", []); // Enviar array vacío
-      return ack?.({ 
-        success: false, 
-        message: msg,
-        roomId: roomId,
-        count: 0 
-      });
-    }
-
-    const users = getRoomUsers(roomId);
-    const username = socket.username || "Usuario";
-
-    console.log(`${colors.green}📤 Enviando ${users.length} usuarios para sala '${roomId}' a ${username}${colors.reset}`);
-
-    // 📤 RESPUESTA ESTANDARIZADA
-    const response = {
-      success: true,
-      roomId: roomId,
-      count: users.length,
-      users: users,
-      message: `Usuarios en ${roomId}: ${users.length}`
-    };
-
-    socket.emit("connected_users", response.users);
-    ack?.(response);
-    
-    console.log(`${colors.blue}📋 Sala '${roomId}': ${users.length} usuarios enviados a ${username}${colors.reset}`);
-  });
 
   // ============================================================
   // 👤 PERFIL: get_profile / update_profile
@@ -905,114 +709,181 @@ io.on("connection", (socket) => {
     ack?.({ success: true, rooms: list });
   });
 
-  // ============================================================
-  // 🛰️ WebRTC — Señalización dirigida
-  // ============================================================
-  socket.on("webrtc_offer", (data = {}) => {
-    const { roomId, from, to, sdp, type } = data;
-    if (!roomId || !sdp || !to) {
-      return console.warn(`⚠️ webrtc_offer sin roomId, to o sdp`, data);
+
+// ============================================================
+// 📋 Obtener lista de usuarios conectados en una sala
+// ============================================================
+
+socket.on("get_users", (data = {}, ack) => {
+  let { roomId } = data || {};
+  console.log(`${colors.red}🔍 DEBUG GET_USERS - DATOS RECIBIDOS:${colors.reset}`, JSON.stringify(data, null, 2));
+  console.log(`${colors.cyan}📥 Evento → get_users:${colors.reset}`, data);
+
+  // 🆕 DETECCIÓN INTELIGENTE: Si no hay roomId, buscar la sala MÁS PROBABLE
+  if (!roomId) {
+    // Prioridad: 1. handy, 2. general, 3. primera sala disponible
+    const joinedRooms = Array.from(socket.rooms || []).filter((r) => r !== socket.id);
+    
+    if (joinedRooms.includes("handy")) {
+      roomId = "handy";
+    } else if (joinedRooms.includes("general")) {
+      roomId = "general";
+    } else if (joinedRooms.length > 0) {
+      roomId = joinedRooms[0]; // Primera sala disponible
+    } else {
+      roomId = "general"; // Fallback seguro
     }
-    const target = findSocketByUserId(to, roomId);
-    if (!target) return console.warn(`⚠️ Destino ${to} no está en sala ${roomId}`);
-    console.log(`📡 webrtc_offer ${from} → ${to} (${roomId})`);
-    target.emit("webrtc_offer", { from, sdp, type: type || "offer" });
+    
+    console.log(`${colors.yellow}⚠️ get_users sin roomId, detectado automáticamente: '${roomId}'${colors.reset}`);
+  }
+
+  // 🆕 VERIFICAR que la sala existe
+  if (!rooms.has(roomId)) {
+    const msg = `❌ Sala '${roomId}' no existe`;
+    console.warn(`${colors.red}${msg}${colors.reset}`);
+    socket.emit("connected_users", []); // Enviar array vacío
+    return ack?.({ 
+      success: false, 
+      message: msg,
+      roomId: roomId,
+      count: 0 
+    });
+  }
+
+  const users = getRoomUsers(roomId);
+  const username = connectedUsers.get(socketToUserMap.get(socket.id))?.userData?.username || socket.id;
+
+  console.log(`${colors.green}📤 Enviando ${users.length} usuarios para sala '${roomId}' a ${username}${colors.reset}`);
+
+  // 🆕 ENVIAR SIEMPRE la lista, incluso si está vacía
+  socket.emit("connected_users", users);
+
+  // 🆕 ACK detallado para debugging
+  ack?.({
+    success: true,
+    roomId: roomId,
+    count: users.length,
+    message: `Usuarios en ${roomId}: ${users.length}`,
+    users: users.map(u => ({ id: u.id, username: u.username })) // 🆕 Solo datos básicos para debug
   });
 
-  socket.on("webrtc_answer", (data = {}) => {
-    const { roomId, from, to, sdp, type } = data;
-    if (!roomId || !sdp || !to) {
-      return console.warn(`⚠️ webrtc_answer sin roomId, to o sdp`, data);
-    }
-    const target = findSocketByUserId(to, roomId);
-    if (!target) return console.warn(`⚠️ Destino ${to} no está en sala ${roomId}`);
-    console.log(`📡 webrtc_answer ${from} → ${to} (${roomId})`);
-    target.emit("webrtc_answer", { from, sdp, type: type || "answer" });
-  });
+  // 🆕 LOG detallado
+  console.log(`${colors.blue}📋 Sala '${roomId}': ${users.length} usuarios${colors.reset}`);
+  if (users.length > 0) {
+    users.forEach(user => {
+      console.log(`${colors.gray}   👤 ${user.username} (${user.id})${colors.reset}`);
+    });
+  } else {
+    console.log(`${colors.gray}   💡 Sala vacía${colors.reset}`);
+  }
+});
 
-  socket.on("webrtc_ice_candidate", (data = {}) => {
-    const { roomId, from, to, sdpMid, sdpMLineIndex, candidate } = data;
-    if (!roomId || !candidate || !to) {
-      return console.warn(`⚠️ webrtc_ice_candidate inválido`, data);
-    }
-    const candidateStr = candidate.candidate || candidate;
-    const target = findSocketByUserId(to, roomId);
-    if (!target) return console.warn(`⚠️ Destino ${to} no está en sala ${roomId}`);
-    console.log(`📡 webrtc_ice_candidate ${from} → ${to} (${roomId})`);
-    target.emit("webrtc_ice_candidate", { from, candidate: candidateStr, sdpMid, sdpMLineIndex });
-  });
+
+// ============================================================
+// 🛰️ WebRTC — Señalización dirigida (no broadcast)
+// ============================================================
+socket.on("webrtc_offer", (data = {}) => {
+  const { roomId, from, to, sdp, type } = data;
+  if (!roomId || !sdp || !to) {
+    return console.warn(`⚠️ webrtc_offer sin roomId, to o sdp`, data);
+  }
+  const target = findSocketByUserId(to, roomId);
+  if (!target) return console.warn(`⚠️ Destino ${to} no está en sala ${roomId}`);
+  console.log(`📡 webrtc_offer ${from} → ${to} (${roomId})`);
+  target.emit("webrtc_offer", { from, sdp, type: type || "offer" });
+});
+
+socket.on("webrtc_answer", (data = {}) => {
+  const { roomId, from, to, sdp, type } = data;
+  if (!roomId || !sdp || !to) {
+    return console.warn(`⚠️ webrtc_answer sin roomId, to o sdp`, data);
+  }
+  const target = findSocketByUserId(to, roomId);
+  if (!target) return console.warn(`⚠️ Destino ${to} no está en sala ${roomId}`);
+  console.log(`📡 webrtc_answer ${from} → ${to} (${roomId})`);
+  target.emit("webrtc_answer", { from, sdp, type: type || "answer" });
+});
+
+socket.on("webrtc_ice_candidate", (data = {}) => {
+  const { roomId, from, to, sdpMid, sdpMLineIndex, candidate } = data;
+  if (!roomId || !candidate || !to) {
+    return console.warn(`⚠️ webrtc_ice_candidate inválido`, data);
+  }
+  const candidateStr = candidate.candidate || candidate; // aceptar string u objeto
+  // (Si querés filtrar, hacelo acá; si no, reenviá directo)
+  const target = findSocketByUserId(to, roomId);
+  if (!target) return console.warn(`⚠️ Destino ${to} no está en sala ${roomId}`);
+  console.log(`📡 webrtc_ice_candidate ${from} → ${to} (${roomId})`);
+  target.emit("webrtc_ice_candidate", { from, candidate: candidateStr, sdpMid, sdpMLineIndex });
+});
+
+// Helper: buscar la socket de un userId dentro de una sala
+function findSocketByUserId(userId, roomId) {
+  const room = io.sockets.adapter.rooms.get(roomId);
+  if (!room) return null;
+  for (const socketId of room) {
+    const s = io.sockets.sockets.get(socketId);
+    if (s?.userId === userId) return s;
+  }
+  return null;
+}
+
+
 
   // ============================================================
   // 🔄 (Opcional) Aviso de intento de reconexión del cliente
   // ============================================================
   socket.on("reconnect_attempt", () => {
     const userId = socketToUserMap.get(socket.id);
-    const mainRoom = getUsersMainRoom(userId);
-    console.log(`${colors.yellow}♻️ reconnect_attempt: user=${userId} mainRoom=${mainRoom}${colors.reset}`);
-    if (mainRoom) socket.emit("join_success", { room: mainRoom, roomId: mainRoom });
+    const roomId = socketToRoomMap.get(socket.id);
+    console.log(`${colors.yellow}♻️ reconnect_attempt: user=${userId} room=${roomId || "-"}${colors.reset}`);
+    if (roomId) socket.emit("join_success", { room: roomId, roomId });
   });
 
   // ============================================================
-  // 🔴 Desconexión unificada - CORREGIDA
+  // 🔴 Desconexión unificada
   // ============================================================
   socket.on("disconnect", (reason) => {
     const userId = socketToUserMap.get(socket.id);
-    const username = socket.username;
-    
-    console.log(`${colors.red}🔌 Socket desconectado:${colors.reset} ${socket.id} (${reason}) - User: ${username}`);
+    const roomId = socketToRoomMap.get(socket.id);
+    console.log(`${colors.red}🔌 Socket desconectado:${colors.reset} ${socket.id} (${reason})`);
 
-    // 1️⃣ Liberar tokens PTT
-    for (const [roomId, state] of Object.entries(pttState)) {
+    for (const [rid, state] of Object.entries(pttState)) {
       if (state && state.socketId === socket.id) {
-        console.log(`${colors.yellow}🎙️ Liberando token de ${roomId} por desconexión de ${state.speakerName}${colors.reset}`);
-        clearTimeout(tokenTimers[roomId]);
-        delete pttState[roomId];
-        io.to(roomId).emit("token_released", { roomId: roomId, currentSpeaker: null });
-        io.to(roomId).emit("current_speaker_update", null);
+        console.log(`${colors.yellow}🎙️ Liberando token de ${rid} por desconexión de ${state.speakerName}${colors.reset}`);
+        clearTimeout(tokenTimers[rid]);
+        delete pttState[rid];
+        io.to(rid).emit("token_released", { roomId: rid, currentSpeaker: null });
+        io.to(rid).emit("current_speaker_update", null);
       }
     }
 
-    // 2️⃣ Salir de todas las salas
-    const socketRooms = roomManager.socketRooms.get(socket.id) || new Set();
-    for (const roomId of socketRooms) {
-      if (rooms.has(roomId)) {
+    if (userId && roomId && rooms.has(roomId)) {
+      const stillConnected = Array.from(connectedUsers.get(userId)?.sockets || []).some(
+        (sid) => sid !== socket.id && socketToRoomMap.get(sid) === roomId
+      );
+
+      if (!stillConnected) {
         const room = rooms.get(roomId);
-        
-        // Verificar si hay otros sockets del mismo usuario en la sala
-        const roomSockets = io.sockets.adapter.rooms.get(roomId) || new Set();
-        const userStillInRoom = Array.from(roomSockets).some(socketId => {
-          const s = io.sockets.sockets.get(socketId);
-          return s?.userId === userId && socketId !== socket.id;
-        });
-
-        if (!userStillInRoom) {
-          room.users.delete(userId);
-          io.to(roomId).emit("user_left_room", { 
-            roomId, 
-            username: username, 
-            userCount: room.users.size 
-          });
-        }
+        room.users.delete(userId);
+        io.to(roomId).emit("user-left-room", { roomId, userCount: room.users.size });
       }
     }
 
-    // 3️⃣ Limpiar estructuras del usuario
     if (userId) {
       const entry = connectedUsers.get(userId);
       if (entry) {
         entry.sockets.delete(socket.id);
         if (entry.sockets.size === 0) {
           connectedUsers.delete(userId);
-          console.log(`${colors.red}🔴 Usuario ${username} completamente desconectado.${colors.reset}`);
+          console.log(`${colors.red}🔴 Usuario ${userId} completamente desconectado.${colors.reset}`);
         }
       }
     }
 
-    // 4️⃣ Limpiar roomManager
-    roomManager.socketRooms.delete(socket.id);
+    socketToRoomMap.delete(socket.id);
     socketToUserMap.delete(socket.id);
 
-    // 5️⃣ Actualizar lista global de usuarios
     io.emit(
       "connected_users",
       Array.from(connectedUsers.values()).map((u) => ({
@@ -1020,10 +891,35 @@ io.on("connection", (socket) => {
         socketCount: u.sockets.size,
       }))
     );
-
-    console.log(`${colors.green}🧹 Limpieza de desconexión completada para ${username}${colors.reset}`);
   });
 });
+function getRoomUsers(roomId) {
+  const room = rooms.get(roomId);
+  if (!room) {
+    console.warn(`${colors.yellow}⚠️ getRoomUsers: Sala '${roomId}' no encontrada${colors.reset}`);
+    return [];
+  }
+  
+  console.log(`${colors.cyan}🔍 getRoomUsers('${roomId}') - Usuarios en room:${colors.reset}`, Array.from(room.users));
+  
+  const users = Array.from(room.users)
+    .map((userId) => {
+      const entry = connectedUsers.get(userId);
+      if (!entry) {
+        console.warn(`${colors.yellow}⚠️ Usuario ${userId} en sala ${roomId} pero no en connectedUsers${colors.reset}`);
+        return null;
+      }
+      return { 
+        ...entry.userData, 
+        isOnline: true,
+        socketCount: entry.sockets.size 
+      };
+    })
+    .filter(Boolean);
+
+  console.log(`${colors.green}✅ getRoomUsers('${roomId}') → ${users.length} usuarios${colors.reset}`);
+  return users;
+}
 
 // ============================================================
 // 🚀 Iniciar servidor
@@ -1032,5 +928,4 @@ const PORT = process.env.PORT || 8080;
 server.listen(PORT, () => {
   console.log(`${colors.green}🚀 Servidor de chat+PTT+WebRTC corriendo en puerto ${PORT}${colors.reset}`);
   console.log(`${colors.cyan}🌐 http://localhost:${PORT}${colors.reset}`);
-  console.log(`${colors.magenta}🔄 Sistema de salas unificado ACTIVADO${colors.reset}`);
 });
