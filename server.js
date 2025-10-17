@@ -102,13 +102,30 @@ function serializeRooms() {
 }
 function getRoomUsers(roomId) {
   const room = rooms.get(roomId);
-  if (!room) return [];
-  return Array.from(room.users)
+  if (!room) {
+    console.warn(`${colors.yellow}⚠️ getRoomUsers: Sala '${roomId}' no encontrada${colors.reset}`);
+    return [];
+  }
+  
+  console.log(`${colors.cyan}🔍 getRoomUsers('${roomId}') - Usuarios en room:${colors.reset}`, Array.from(room.users));
+  
+  const users = Array.from(room.users)
     .map((userId) => {
       const entry = connectedUsers.get(userId);
-      return entry ? { ...entry.userData, isOnline: true } : null;
+      if (!entry) {
+        console.warn(`${colors.yellow}⚠️ Usuario ${userId} en sala ${roomId} pero no en connectedUsers${colors.reset}`);
+        return null;
+      }
+      return { 
+        ...entry.userData, 
+        isOnline: true,
+        socketCount: entry.sockets.size 
+      };
     })
     .filter(Boolean);
+
+  console.log(`${colors.green}✅ getRoomUsers('${roomId}') → ${users.length} usuarios${colors.reset}`);
+  return users;
 }
 
 function isHttpUrl(str) {
@@ -221,12 +238,10 @@ socket.on("user-connected", async (user, ack) => {
   ack?.({ success: true });
   console.log(`${colors.green}✅ ACK → user-connected confirmado${colors.reset}`);
 });
-// ============================================================
-// 🚪 Unión de salas (multi-room, sin expulsar la anterior)
-// ============================================================
-// ============================================================
-// 🚪 Unión de salas (multi-room, sincronizada con connectedUsers)
-// ============================================================
+
+  // ============================================================
+  // 🚪 Unión de salas (sincronizada con connectedUsers y rooms)
+  // ============================================================
 socket.on("join_room", (data = {}, ack) => {
   console.log(`${colors.magenta}🚪 Evento → join_room:${colors.reset}`, data);
 
@@ -249,33 +264,27 @@ socket.on("join_room", (data = {}, ack) => {
   socket.userId = userId;
   socket.username = username;
   socket.lastJoinedRoom = roomName;
+  socketToUserMap.set(socket.id, userId);
+  socketToRoomMap.set(socket.id, roomName);
 
   // ============================================================
-  // 🔁 Sincronizar connectedUsers (crear si no existe)
+  // 🔁 Sincronizar connectedUsers
   // ============================================================
-  let userEntry = connectedUsers.get(userId);
-  if (!userEntry) {
-    userEntry = {
-      id: userId,
-      username,
-      isOnline: true,
-      rooms: new Set([roomName]),
-      socketId: socket.id,
-      lastSeen: Date.now(),
+  let entry = connectedUsers.get(userId);
+  if (!entry) {
+    entry = {
+      userData: { id: userId, username, isOnline: true },
+      sockets: new Set([socket.id]),
     };
-    connectedUsers.set(userId, userEntry);
-    console.log(`${colors.cyan}🧩 Nuevo usuario agregado a connectedUsers:${colors.reset}`, username);
+    connectedUsers.set(userId, entry);
+    console.log(`${colors.cyan}🧩 Usuario agregado a connectedUsers:${colors.reset}`, username);
   } else {
-    // Si ya existe, actualizar su socket y sala
-    userEntry.isOnline = true;
-    userEntry.username = username;
-    userEntry.socketId = socket.id;
-    userEntry.rooms = userEntry.rooms || new Set();
-    userEntry.rooms.add(roomName);
+    entry.userData = { ...entry.userData, username, isOnline: true };
+    entry.sockets.add(socket.id);
   }
 
   // ============================================================
-  // 🧹 Si estaba en otra sala, quitarlo de ahí (evita "bienvenido a Handy" en general)
+  // 🧹 Removerlo de otras salas si estaba
   // ============================================================
   for (const [rName, room] of rooms.entries()) {
     if (rName !== roomName && room.users.has(userId)) {
@@ -289,25 +298,31 @@ socket.on("join_room", (data = {}, ack) => {
   // ============================================================
   socket.join(roomName);
   rooms.get(roomName).users.add(userId);
-  socketToRoomMap.set(socket.id, roomName);
+
   // ============================================================
-  // 📤 Confirmación al cliente
+  // 📋 Lista actualizada de usuarios de la sala
   // ============================================================
-  ack?.({
-    success: true,
-    room: roomName,
+  const users = getRoomUsers(roomName).map((u) => ({
+    ...u,
     roomId: roomName,
-    message: `Te uniste a ${roomName}`,
+  }));
+
+  socket.emit("connected_users", users);
+  io.to(roomName).emit("user-joined-room", {
+    roomId: roomName,
+    username,
     userCount: users.length,
   });
 
-  // ============================================================
-  // 🆕 (Opcional pero útil) — Empujar la lista completa a todos
-  // ============================================================
-  io.to(roomName).emit("connected_users", users);
+  console.log(`${colors.green}✅ ${username} se unió correctamente a ${roomName}${colors.reset}`);
+
+  ack?.({
+    success: true,
+    roomId: roomName,
+    userCount: users.length,
+    users,
+  });
 });
-
-
 
   // ============================================================
   // 🚪 Salir de sala
@@ -431,6 +446,7 @@ socket.on("join_room", (data = {}, ack) => {
       console.error(`${colors.red}❌ Error al procesar audio:${colors.reset}`, err);
     }
   });
+
 // ============================================================
 // 🧭 Helper MEJORADO para detectar automáticamente la sala de un socket
 // ============================================================
@@ -451,7 +467,6 @@ function inferRoomIdFromSocket(socket) {
   // Fallback absoluto
   return "general";
 }
-
 
   // ============================================================
   // 👤 PERFIL: get_profile / update_profile
@@ -702,75 +717,44 @@ function inferRoomIdFromSocket(socket) {
     ack?.({ success: true, rooms: list });
   });
 
-
 // ============================================================
 // 📋 Obtener lista de usuarios conectados en una sala
 // ============================================================
-
 socket.on("get_users", (data = {}, ack) => {
   let { roomId } = data || {};
-  console.log(`${colors.red}🔍 DEBUG GET_USERS - DATOS RECIBIDOS:${colors.reset}`, JSON.stringify(data, null, 2));
   console.log(`${colors.cyan}📥 Evento → get_users:${colors.reset}`, data);
 
-  // 🆕 DETECCIÓN INTELIGENTE: Si no hay roomId, buscar la sala MÁS PROBABLE
   if (!roomId) {
-    // Prioridad: 1. handy, 2. general, 3. primera sala disponible
-    const joinedRooms = Array.from(socket.rooms || []).filter((r) => r !== socket.id);
-    
-    if (joinedRooms.includes("handy")) {
-      roomId = "handy";
-    } else if (joinedRooms.includes("general")) {
-      roomId = "general";
-    } else if (joinedRooms.length > 0) {
-      roomId = joinedRooms[0]; // Primera sala disponible
-    } else {
-      roomId = "general"; // Fallback seguro
-    }
-    
+    roomId = inferRoomIdFromSocket(socket);
     console.log(`${colors.yellow}⚠️ get_users sin roomId, detectado automáticamente: '${roomId}'${colors.reset}`);
   }
 
-  // 🆕 VERIFICAR que la sala existe
   if (!rooms.has(roomId)) {
     const msg = `❌ Sala '${roomId}' no existe`;
     console.warn(`${colors.red}${msg}${colors.reset}`);
-    socket.emit("connected_users", []); // Enviar array vacío
-    return ack?.({ 
-      success: false, 
-      message: msg,
-      roomId: roomId,
-      count: 0 
-    });
+    socket.emit("connected_users", []);
+    return ack?.({ success: false, message: msg, roomId, count: 0 });
   }
 
-  const users = getRoomUsers(roomId);
-  const username = connectedUsers.get(socketToUserMap.get(socket.id))?.userData?.username || socket.id;
+  const users = getRoomUsers(roomId).map((u) => ({
+    ...u,
+    roomId, // 🔹 Importante
+  }));
 
+  const username = connectedUsers.get(socketToUserMap.get(socket.id))?.userData?.username || socket.id;
   console.log(`${colors.green}📤 Enviando ${users.length} usuarios para sala '${roomId}' a ${username}${colors.reset}`);
 
-  // 🆕 ENVIAR SIEMPRE la lista, incluso si está vacía
   socket.emit("connected_users", users);
-
-  // 🆕 ACK detallado para debugging
   ack?.({
     success: true,
-    roomId: roomId,
+    roomId,
     count: users.length,
-    message: `Usuarios en ${roomId}: ${users.length}`,
-    users: users.map(u => ({ id: u.id, username: u.username })) // 🆕 Solo datos básicos para debug
+    users: users.map((u) => ({ id: u.id, username: u.username })),
   });
 
-  // 🆕 LOG detallado
   console.log(`${colors.blue}📋 Sala '${roomId}': ${users.length} usuarios${colors.reset}`);
-  if (users.length > 0) {
-    users.forEach(user => {
-      console.log(`${colors.gray}   👤 ${user.username} (${user.id})${colors.reset}`);
-    });
-  } else {
-    console.log(`${colors.gray}   💡 Sala vacía${colors.reset}`);
-  }
+  users.forEach((user) => console.log(`${colors.gray}   👤 ${user.username} (${user.id})${colors.reset}`));
 });
-
 
 // ============================================================
 // 🛰️ WebRTC — Señalización dirigida (no broadcast)
@@ -820,8 +804,6 @@ function findSocketByUserId(userId, roomId) {
   }
   return null;
 }
-
-
 
   // ============================================================
   // 🔄 (Opcional) Aviso de intento de reconexión del cliente
@@ -886,33 +868,6 @@ function findSocketByUserId(userId, roomId) {
     );
   });
 });
-function getRoomUsers(roomId) {
-  const room = rooms.get(roomId);
-  if (!room) {
-    console.warn(`${colors.yellow}⚠️ getRoomUsers: Sala '${roomId}' no encontrada${colors.reset}`);
-    return [];
-  }
-  
-  console.log(`${colors.cyan}🔍 getRoomUsers('${roomId}') - Usuarios en room:${colors.reset}`, Array.from(room.users));
-  
-  const users = Array.from(room.users)
-    .map((userId) => {
-      const entry = connectedUsers.get(userId);
-      if (!entry) {
-        console.warn(`${colors.yellow}⚠️ Usuario ${userId} en sala ${roomId} pero no en connectedUsers${colors.reset}`);
-        return null;
-      }
-      return { 
-        ...entry.userData, 
-        isOnline: true,
-        socketCount: entry.sockets.size 
-      };
-    })
-    .filter(Boolean);
-
-  console.log(`${colors.green}✅ getRoomUsers('${roomId}') → ${users.length} usuarios${colors.reset}`);
-  return users;
-}
 
 // ============================================================
 // 🚀 Iniciar servidor
