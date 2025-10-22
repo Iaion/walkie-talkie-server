@@ -90,6 +90,48 @@ function getBase64FromDataUrl(dataUrl) {
   return idx !== -1 ? dataUrl.substring(idx + 7) : null;
 }
 
+// 🔥 NUEVO: Calcular distancia entre coordenadas (Haversine formula)
+function calculateDistance(lat1, lon1, lat2, lon2) {
+  const R = 6371; // Radio de la Tierra en km
+  const dLat = (lat2 - lat1) * Math.PI / 180;
+  const dLon = (lon2 - lon1) * Math.PI / 180;
+  const a = 
+    Math.sin(dLat/2) * Math.sin(dLat/2) +
+    Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * 
+    Math.sin(dLon/2) * Math.sin(dLon/2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+  return R * c;
+}
+
+// 🔥 NUEVO: Helper para encontrar usuarios cercanos
+function getNearbyUsers(alertLat, alertLng, radiusKm) {
+  const nearbySockets = [];
+  
+  connectedUsers.forEach((userData, userId) => {
+    // Si el usuario tiene ubicación guardada, verificar distancia
+    if (userData.userData.latitude && userData.userData.longitude) {
+      const distance = calculateDistance(
+        alertLat, alertLng,
+        userData.userData.latitude, userData.userData.longitude
+      );
+      
+      if (distance <= radiusKm) {
+        // Agregar todos los sockets de este usuario
+        userData.sockets.forEach(socketId => {
+          nearbySockets.push(socketId);
+        });
+      }
+    } else {
+      // Si no tiene ubicación, incluir por defecto (fallback)
+      userData.sockets.forEach(socketId => {
+        nearbySockets.push(socketId);
+      });
+    }
+  });
+  
+  return nearbySockets;
+}
+
 async function uploadAvatarFromDataUrl(userId, dataUrl) {
   const mime = getMimeFromDataUrl(dataUrl);
   const ext = mime.split("/")[1] || "jpg";
@@ -497,12 +539,12 @@ io.on("connection", (socket) => {
   // ============================================================
 
   // ============================================================
-  // 🚨 Enviar alerta de emergencia
+  // 🚨 Enviar alerta de emergencia - MEJORADO
   // ============================================================
   socket.on("emergency_alert", async (data = {}, ack) => {
     try {
-      const { userId, userName, latitude, longitude, timestamp } = data;
-      console.log(`${colors.red}🚨 Evento → emergency_alert:${colors.reset}`, { userId, userName, latitude, longitude });
+      const { userId, userName, latitude, longitude, timestamp, emergencyType = "general", vehicleImageUrl } = data;
+      console.log(`${colors.red}🚨 Evento → emergency_alert:${colors.reset}`, { userId, userName, latitude, longitude, emergencyType });
 
       if (!userId || !userName) {
         return ack?.({ success: false, message: "Datos de emergencia inválidos" });
@@ -514,7 +556,9 @@ io.on("connection", (socket) => {
         latitude,
         longitude,
         timestamp: timestamp || Date.now(),
-        socketId: socket.id
+        socketId: socket.id,
+        emergencyType,
+        vehicleImageUrl
       };
 
       // Guardar en memoria
@@ -532,14 +576,47 @@ io.on("connection", (socket) => {
         createdAt: Date.now()
       }, { merge: true });
 
-      // Notificar a TODOS los usuarios conectados (excepto al que envió la alerta)
-      socket.broadcast.emit("emergency_alert", emergencyData);
+      // 🔥 MEJORA: Notificar solo a usuarios cercanos (radio de 50km)
+      const nearbyUsers = getNearbyUsers(latitude, longitude, 50); // 50km radius
       
-      console.log(`${colors.red}🚨 ALERTA DE EMERGENCIA: ${userName} en (${latitude}, ${longitude})${colors.reset}`);
+      nearbyUsers.forEach(nearbySocketId => {
+        if (nearbySocketId !== socket.id) { // No notificar al emisor
+          io.to(nearbySocketId).emit("emergency_alert", emergencyData);
+        }
+      });
+
+      console.log(`${colors.red}🚨 ALERTA DE EMERGENCIA: ${userName} en (${latitude}, ${longitude}) - Notificando a ${nearbyUsers.length} usuarios cercanos${colors.reset}`);
       
-      ack?.({ success: true, message: "Alerta de emergencia enviada" });
+      ack?.({ success: true, message: "Alerta de emergencia enviada", notifiedUsers: nearbyUsers.length });
     } catch (error) {
       console.error(`${colors.red}❌ Error en emergency_alert:${colors.reset}`, error);
+      ack?.({ success: false, message: error.message });
+    }
+  });
+
+  // ============================================================
+  // 📍 Actualizar ubicación del usuario (para filtrado)
+  // ============================================================
+  socket.on("update_user_location", async (data = {}, ack) => {
+    try {
+      const { userId, latitude, longitude } = data;
+      console.log(`${colors.blue}📍 Evento → update_user_location:${colors.reset}`, { userId, latitude, longitude });
+
+      if (!userId) {
+        return ack?.({ success: false, message: "userId requerido" });
+      }
+
+      // Actualizar en memoria
+      const userEntry = connectedUsers.get(userId);
+      if (userEntry) {
+        userEntry.userData.latitude = latitude;
+        userEntry.userData.longitude = longitude;
+        userEntry.userData.lastLocationUpdate = Date.now();
+      }
+
+      ack?.({ success: true, message: "Ubicación actualizada" });
+    } catch (error) {
+      console.error(`${colors.red}❌ Error en update_user_location:${colors.reset}`, error);
       ack?.({ success: false, message: error.message });
     }
   });
@@ -604,6 +681,7 @@ io.on("connection", (socket) => {
       const emergencyAlert = emergencyAlerts.get(emergencyUserId);
       if (emergencyAlert && emergencyAlert.socketId) {
         io.to(emergencyAlert.socketId).emit("help_confirmed", {
+          emergencyUserId,
           helperId,
           helperName,
           latitude,
@@ -787,4 +865,5 @@ server.listen(PORT, () => {
   console.log(`${colors.blue}💬 Chat General activo${colors.reset}`);
   console.log(`${colors.red}🚨 Sistema de Emergencia activo${colors.reset}`);
   console.log(`${colors.green}🚗 Soporte para vehículos activo${colors.reset}`);
+  console.log(`${colors.magenta}📍 Filtrado por ubicación activo (50km)${colors.reset}`);
 });
