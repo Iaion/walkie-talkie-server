@@ -117,23 +117,78 @@ function getNearbyUsers(alertLat, alertLng, radiusKm) {
   return allSockets;
 }
 
-
+// ============================================================
+// 🖼️ Subida de avatar en base64 (Firebase Storage optimizada)
+// ============================================================
 async function uploadAvatarFromDataUrl(userId, dataUrl) {
-  const mime = getMimeFromDataUrl(dataUrl);
-  const ext = mime.split("/")[1] || "jpg";
-  const base64 = getBase64FromDataUrl(dataUrl);
-  if (!base64) throw new Error("Data URL inválida (sin base64)");
+  try {
+    if (!isDataUrl(dataUrl)) {
+      throw new Error("Formato de imagen inválido (no es DataURL)");
+    }
 
-  const buffer = Buffer.from(base64, "base64");
-  const filePath = `avatars/${userId}/${Date.now()}_${uuidv4()}.${ext}`;
-  const file = bucket.file(filePath);
-  console.log(`${colors.yellow}⬆️ Subiendo avatar → ${filePath} (${mime})${colors.reset}`);
-  await file.save(buffer, { contentType: mime, resumable: false });
-  await file.makePublic();
-  const url = file.publicUrl();
-  console.log(`${colors.green}✅ Avatar subido y público:${colors.reset} ${url}`);
-  return url;
+    // Detectar tipo MIME y extensión
+    const mime = getMimeFromDataUrl(dataUrl);
+    const ext = mime.split("/")[1] || "jpg";
+    const base64 = getBase64FromDataUrl(dataUrl);
+
+    if (!base64) throw new Error("Data URL inválida (sin base64)");
+
+    const buffer = Buffer.from(base64, "base64");
+
+    // 🔧 Generar ruta única en Storage
+    const filePath = `avatars/${userId}/${Date.now()}_${uuidv4()}.${ext}`;
+    const file = bucket.file(filePath);
+
+    console.log(
+      `${colors.yellow}⬆️ Subiendo avatar optimizado → ${filePath} (${mime})${colors.reset}`
+    );
+
+    // Guardar imagen (sin reanudación, directo)
+    await file.save(buffer, {
+      contentType: mime,
+      resumable: false,
+      gzip: true, // 🔧 Compresión automática
+      metadata: {
+        cacheControl: "public, max-age=31536000", // 1 año
+        metadata: { userId },
+      },
+    });
+
+    // Hacer el archivo público
+    await file.makePublic();
+    const publicUrl = file.publicUrl();
+
+    console.log(`${colors.green}✅ Avatar subido y público:${colors.reset} ${publicUrl}`);
+
+    // ============================================================
+    // 🧹 OPCIONAL: eliminar avatares viejos del usuario
+    // ============================================================
+    try {
+      const [files] = await bucket.getFiles({ prefix: `avatars/${userId}/` });
+      const sorted = files.sort(
+        (a, b) => b.metadata.timeCreated.localeCompare(a.metadata.timeCreated)
+      );
+      // Conserva solo el más reciente (índice 0)
+      const oldFiles = sorted.slice(1);
+      if (oldFiles.length > 0) {
+        await Promise.allSettled(oldFiles.map((f) => f.delete()));
+        console.log(
+          `${colors.gray}🧹 ${oldFiles.length} avatares antiguos eliminados (${userId})${colors.reset}`
+        );
+      }
+    } catch (cleanupErr) {
+      console.warn(
+        `${colors.yellow}⚠️ No se pudieron limpiar avatares antiguos:${colors.reset} ${cleanupErr.message}`
+      );
+    }
+
+    return publicUrl;
+  } catch (error) {
+    console.error(`${colors.red}❌ Error en uploadAvatarFromDataUrl:${colors.reset}`, error);
+    throw error;
+  }
 }
+
 
 // ============================================================
 // 🌐 Endpoints REST
@@ -463,66 +518,91 @@ io.on("connection", (socket) => {
   });
 
   socket.on("update_profile", async (data = {}, callback) => {
-    try {
-      console.log(`${colors.cyan}📥 Evento → update_profile${colors.reset}`, data);
-      const {
-        userId,
-        fullName = "",
-        username = "",
-        email = "",
-        phone = "",
-        avatarUri = "",
-      } = data;
+  try {
+    console.log(`${colors.cyan}📥 Evento → update_profile${colors.reset}`, data);
+    const {
+      userId,
+      fullName = "",
+      username = "",
+      email = "",
+      phone = "",
+      avatarUri = "",
+    } = data;
 
-      if (!userId) {
-        return callback?.({ success: false, message: "userId requerido" });
-      }
-
-      let finalAvatar = avatarUri || "";
-      if (isDataUrl(avatarUri)) {
-        finalAvatar = await uploadAvatarFromDataUrl(userId, avatarUri);
-      } else if (!avatarUri) {
-  // no llegó nada → mantener el avatar actual en Firestore
-  const prevUser = (await db.collection(USERS_COLLECTION).doc(userId).get()).data();
-  finalAvatar = prevUser?.avatarUri || "";
-} else if (avatarUri && !isHttpUrl(avatarUri)) {
-  finalAvatar = "";
-}
-
-      const updatedUser = {
-        id: userId,
-        fullName,
-        username,
-        email,
-        phone,
-        avatarUri: finalAvatar,
-        status: "Online",
-        presence: "Available",
-        updatedAt: Date.now(),
-      };
-
-      await db.collection(USERS_COLLECTION).doc(userId).set(updatedUser, { merge: true });
-
-      // Actualizar en memoria
-      const entry = connectedUsers.get(userId);
-      if (entry) {
-        entry.userData = { ...entry.userData, ...updatedUser };
-      }
-
-      console.log(`${colors.green}✅ Perfil actualizado para ${username}${colors.reset}`);
-      io.emit("user_updated", updatedUser);
-
-      callback?.({
-        success: true,
-        message: "Perfil actualizado correctamente",
-        user: updatedUser,
-      });
-
-    } catch (error) {
-      console.error(`${colors.red}❌ Error en update_profile:${colors.reset}`, error);
-      callback?.({ success: false, message: error.message });
+    if (!userId) {
+      return callback?.({ success: false, message: "userId requerido" });
     }
-  });
+
+    // ============================================================
+    // 🧠 MANTENER AVATAR PREVIO SI NO LLEGA NUEVO
+    // ============================================================
+    const prevSnap = await db.collection(USERS_COLLECTION).doc(userId).get();
+    const prevData = prevSnap.exists ? prevSnap.data() : {};
+    let finalAvatar = prevData?.avatarUri || "";
+
+    // ============================================================
+    // 🖼️ Lógica para decidir qué hacer con el nuevo avatarUri
+    // ============================================================
+    if (typeof avatarUri === "string" && avatarUri.trim() !== "") {
+      if (isDataUrl(avatarUri)) {
+        // 👉 Imagen codificada en base64 → subir a Firebase Storage
+        finalAvatar = await uploadAvatarFromDataUrl(userId, avatarUri);
+      } else if (isHttpUrl(avatarUri)) {
+        // 👉 Ya es una URL válida → conservarla
+        finalAvatar = avatarUri;
+      } else {
+        // 👉 Es un content:// u otra ruta local → ignorar, mantener el anterior
+        console.log(`${colors.gray}⚠️ URI local ignorada (${avatarUri})${colors.reset}`);
+      }
+    } else {
+      console.log(`${colors.yellow}🟡 No llegó avatar nuevo, se mantiene el anterior${colors.reset}`);
+    }
+
+    // ============================================================
+    // 📋 Armar objeto final del usuario actualizado
+    // ============================================================
+    const updatedUser = {
+      id: userId,
+      fullName,
+      username,
+      email,
+      phone,
+      avatarUri: finalAvatar,
+      status: "Online",
+      presence: "Available",
+      updatedAt: Date.now(),
+    };
+
+    // ============================================================
+    // ☁️ Guardar en Firestore (merge)
+    // ============================================================
+    await db.collection(USERS_COLLECTION).doc(userId).set(updatedUser, { merge: true });
+
+    // ============================================================
+    // 💾 Actualizar en memoria
+    // ============================================================
+    const entry = connectedUsers.get(userId);
+    if (entry) {
+      entry.userData = { ...entry.userData, ...updatedUser };
+    }
+
+    // ============================================================
+    // 🚀 Emitir cambios globalmente
+    // ============================================================
+    console.log(`${colors.green}✅ Perfil actualizado para ${username}${colors.reset}`);
+    io.emit("user_updated", updatedUser);
+
+    callback?.({
+      success: true,
+      message: "Perfil actualizado correctamente",
+      user: updatedUser,
+    });
+
+  } catch (error) {
+    console.error(`${colors.red}❌ Error en update_profile:${colors.reset}`, error);
+    callback?.({ success: false, message: error.message });
+  }
+});
 
   // ============================================================
   // 📋 Obtener usuarios conectados
