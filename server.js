@@ -48,6 +48,7 @@ try {
     credential: admin.credential.cert(serviceAccount),
     storageBucket: process.env.FIREBASE_STORAGE_BUCKET,
   });
+  admin.firestore().settings({ ignoreUndefinedProperties: true });
   console.log(`${colors.green}✅ Firebase inicializado correctamente.${colors.reset}`);
 } catch (err) {
   console.error(`${colors.red}❌ Error al inicializar Firebase:${colors.reset}`, err);
