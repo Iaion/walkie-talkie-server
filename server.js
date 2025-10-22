@@ -103,34 +103,19 @@ function calculateDistance(lat1, lon1, lat2, lon2) {
   return R * c;
 }
 
-// 🔥 NUEVO: Helper para encontrar usuarios cercanos
+// 🔥 NUEVO: Helper para obtener todos los usuarios conectados (sin límite de distancia)
 function getNearbyUsers(alertLat, alertLng, radiusKm) {
-  const nearbySockets = [];
-  
-  connectedUsers.forEach((userData, userId) => {
-    // Si el usuario tiene ubicación guardada, verificar distancia
-    if (userData.userData.latitude && userData.userData.longitude) {
-      const distance = calculateDistance(
-        alertLat, alertLng,
-        userData.userData.latitude, userData.userData.longitude
-      );
-      
-      if (distance <= radiusKm) {
-        // Agregar todos los sockets de este usuario
-        userData.sockets.forEach(socketId => {
-          nearbySockets.push(socketId);
-        });
-      }
-    } else {
-      // Si no tiene ubicación, incluir por defecto (fallback)
-      userData.sockets.forEach(socketId => {
-        nearbySockets.push(socketId);
-      });
-    }
+  const allSockets = [];
+
+  connectedUsers.forEach((userData) => {
+    userData.sockets.forEach(socketId => {
+      allSockets.push(socketId);
+    });
   });
-  
-  return nearbySockets;
+
+  return allSockets;
 }
+
 
 async function uploadAvatarFromDataUrl(userId, dataUrl) {
   const mime = getMimeFromDataUrl(dataUrl);
