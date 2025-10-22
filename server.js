@@ -481,9 +481,13 @@ io.on("connection", (socket) => {
       let finalAvatar = avatarUri || "";
       if (isDataUrl(avatarUri)) {
         finalAvatar = await uploadAvatarFromDataUrl(userId, avatarUri);
-      } else if (avatarUri && !isHttpUrl(avatarUri)) {
-        finalAvatar = "";
-      }
+      } else if (!avatarUri) {
+  // no llegó nada → mantener el avatar actual en Firestore
+  const prevUser = (await db.collection(USERS_COLLECTION).doc(userId).get()).data();
+  finalAvatar = prevUser?.avatarUri || "";
+} else if (avatarUri && !isHttpUrl(avatarUri)) {
+  finalAvatar = "";
+}
 
       const updatedUser = {
         id: userId,
