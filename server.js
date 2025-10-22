@@ -275,38 +275,60 @@ app.post("/vehiculo", async (req, res) => {
   }
 });
 
-// Subir foto de vehículo
+// ============================================================
+// 🚗 Subir foto de vehículo o casco + Guardar URL en Firestore
+// ============================================================
 app.post("/vehiculo/foto", async (req, res) => {
   try {
     const { userId, imageData, tipo } = req.body; // tipo: 'vehiculo' o 'casco'
-    
+
     if (!userId || !imageData || !isDataUrl(imageData)) {
       return res.status(400).json({ success: false, message: "Datos inválidos" });
     }
 
+    // Determinar tipo MIME y extensión
     const mime = getMimeFromDataUrl(imageData);
     const ext = mime.split("/")[1] || "jpg";
     const base64 = getBase64FromDataUrl(imageData);
-    
+
     const buffer = Buffer.from(base64, "base64");
     const filePath = `vehiculos/${userId}/${tipo}_${Date.now()}_${uuidv4()}.${ext}`;
     const file = bucket.file(filePath);
-    
+
     console.log(`${colors.yellow}⬆️ Subiendo foto de ${tipo} para usuario ${userId}${colors.reset}`);
-    
+
+    // Subir a Firebase Storage
     await file.save(buffer, { contentType: mime, resumable: false });
     await file.makePublic();
-    
+
     const url = file.publicUrl();
     console.log(`${colors.green}✅ Foto de ${tipo} subida: ${url}${colors.reset}`);
-    
-    res.json({ success: true, url });
+
+    // ============================================================
+    // 🧠 NUEVO: Guardar la URL en Firestore (colección "vehiculos")
+    // ============================================================
+    const updateData = tipo === "vehiculo"
+      ? { fotoVehiculoUri: url, updatedAt: Date.now() }
+      : { fotoCascoUri: url, updatedAt: Date.now() };
+
+    await db.collection(VEHICULOS_COLLECTION)
+      .doc(userId)
+      .set(updateData, { merge: true });
+
+    console.log(`${colors.green}☁️ Firestore actualizado con URL de ${tipo} para ${userId}${colors.reset}`);
+
+    // ✅ Responder con éxito
+    res.json({
+      success: true,
+      message: `Foto de ${tipo} subida y guardada correctamente`,
+      url
+    });
+
   } catch (error) {
     console.error(`${colors.red}❌ Error subiendo foto:${colors.reset}`, error);
     res.status(500).json({ success: false, message: error.message });
   }
 });
-
 // ============================================================
 // 🔌 Socket.IO - Chat General + Sistema de Emergencia
 // ============================================================
