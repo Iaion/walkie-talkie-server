@@ -627,64 +627,103 @@ io.on("connection", (socket) => {
   });
 
   // ============================================================
-  // 🚨 SISTEMA DE EMERGENCIA - NUEVOS EVENTOS
-  // ============================================================
+// 🚨 Enviar alerta de emergencia - MEJORADO CON VEHÍCULO
+// ============================================================
+socket.on("emergency_alert", async (data = {}, ack) => {
+  try {
+    const { userId, userName, latitude, longitude, timestamp, emergencyType = "general" } = data;
+    console.log(`${colors.red}🚨 Evento → emergency_alert:${colors.reset}`, { userId, userName, latitude, longitude, emergencyType });
 
-  // ============================================================
-  // 🚨 Enviar alerta de emergencia - MEJORADO
-  // ============================================================
-  socket.on("emergency_alert", async (data = {}, ack) => {
+    if (!userId || !userName) {
+      return ack?.({ success: false, message: "Datos de emergencia inválidos" });
+    }
+
+    // ============================================================
+    // 🚗 Obtener datos del vehículo del usuario
+    // ============================================================
+    let vehicleData = null;
     try {
-      const { userId, userName, latitude, longitude, timestamp, emergencyType = "general", vehicleImageUrl } = data;
-      console.log(`${colors.red}🚨 Evento → emergency_alert:${colors.reset}`, { userId, userName, latitude, longitude, emergencyType });
+      const vehiculoSnap = await db
+        .collection(VEHICULOS_COLLECTION)
+        .where("userId", "==", userId)
+        .limit(1)
+        .get();
 
-      if (!userId || !userName) {
-        return ack?.({ success: false, message: "Datos de emergencia inválidos" });
+      if (!vehiculoSnap.empty) {
+        const vehiculoDoc = vehiculoSnap.docs[0];
+        const vehiculo = vehiculoDoc.data();
+        vehicleData = {
+          marca: vehiculo.marca || "Desconocida",
+          modelo: vehiculo.modelo || "",
+          patente: vehiculo.patente || "N/A",
+          color: vehiculo.color || "",
+          fotoVehiculoUri: vehiculo.fotoVehiculoUri || "",
+        };
+        console.log(`${colors.green}✅ Vehículo asociado a emergencia:${colors.reset}`, vehicleData);
+      } else {
+        console.log(`${colors.yellow}⚠️ No se encontró vehículo registrado para ${userName}${colors.reset}`);
       }
+    } catch (vehErr) {
+      console.warn(`${colors.yellow}⚠️ Error obteniendo vehículo:${colors.reset}`, vehErr.message);
+    }
 
-      const emergencyData = {
-        userId,
-        userName,
-        latitude,
-        longitude,
-        timestamp: timestamp || Date.now(),
-        socketId: socket.id,
-        emergencyType,
-        vehicleImageUrl
-      };
+    // ============================================================
+    // 🚨 Crear objeto de emergencia completo
+    // ============================================================
+    const emergencyData = {
+      userId,
+      userName,
+      latitude,
+      longitude,
+      timestamp: timestamp || Date.now(),
+      socketId: socket.id,
+      emergencyType,
+      vehicleInfo: vehicleData, // ✅ Se incluye en el payload
+    };
 
-      // Guardar en memoria
-      emergencyAlerts.set(userId, emergencyData);
-      
-      // Crear conjunto de ayudantes para esta emergencia
-      if (!emergencyHelpers.has(userId)) {
-        emergencyHelpers.set(userId, new Set());
-      }
+    // Guardar en memoria
+    emergencyAlerts.set(userId, emergencyData);
 
-      // Guardar en Firebase
-      await db.collection(EMERGENCIAS_COLLECTION).doc(userId).set({
+    // Crear conjunto de ayudantes para esta emergencia
+    if (!emergencyHelpers.has(userId)) {
+      emergencyHelpers.set(userId, new Set());
+    }
+
+    // Guardar en Firebase
+    await db.collection(EMERGENCIAS_COLLECTION).doc(userId).set(
+      {
         ...emergencyData,
         status: "active",
-        createdAt: Date.now()
-      }, { merge: true });
+        createdAt: Date.now(),
+      },
+      { merge: true }
+    );
 
-      // 🔥 MEJORA: Notificar solo a usuarios cercanos (radio de 50km)
-      const nearbyUsers = getNearbyUsers(latitude, longitude, 50); // 50km radius
-      
-      nearbyUsers.forEach(nearbySocketId => {
-        if (nearbySocketId !== socket.id) { // No notificar al emisor
-          io.to(nearbySocketId).emit("emergency_alert", emergencyData);
-        }
-      });
+    // ============================================================
+    // 🔥 Notificar a usuarios cercanos (radio 50 km)
+    // ============================================================
+    const nearbyUsers = getNearbyUsers(latitude, longitude, 50);
+    nearbyUsers.forEach((nearbySocketId) => {
+      if (nearbySocketId !== socket.id) {
+        io.to(nearbySocketId).emit("emergency_alert", emergencyData);
+      }
+    });
 
-      console.log(`${colors.red}🚨 ALERTA DE EMERGENCIA: ${userName} en (${latitude}, ${longitude}) - Notificando a ${nearbyUsers.length} usuarios cercanos${colors.reset}`);
-      
-      ack?.({ success: true, message: "Alerta de emergencia enviada", notifiedUsers: nearbyUsers.length });
-    } catch (error) {
-      console.error(`${colors.red}❌ Error en emergency_alert:${colors.reset}`, error);
-      ack?.({ success: false, message: error.message });
-    }
-  });
+    console.log(
+      `${colors.red}🚨 ALERTA ENVIADA:${colors.reset} ${userName} (${latitude}, ${longitude}) - Notificando a ${nearbyUsers.length} usuarios`
+    );
+
+    ack?.({
+      success: true,
+      message: "Alerta de emergencia enviada correctamente",
+      vehicle: vehicleData,
+      notifiedUsers: nearbyUsers.length,
+    });
+  } catch (error) {
+    console.error(`${colors.red}❌ Error en emergency_alert:${colors.reset}`, error);
+    ack?.({ success: false, message: error.message });
+  }
+});
 
   // ============================================================
   // 📍 Actualizar ubicación del usuario (para filtrado)
