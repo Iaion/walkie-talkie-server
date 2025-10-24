@@ -627,29 +627,51 @@ io.on("connection", (socket) => {
   });
 
 // ============================================================
-// 🚨 Enviar alerta de emergencia - ACTUALIZADO CON AVATAR Y VEHÍCULO
+// 🚨 Enviar alerta de emergencia - VERSIÓN FINAL CORREGIDA
 // ============================================================
 socket.on("emergency_alert", async (data = {}, ack) => {
   try {
-    const { userId, userName, latitude, longitude, timestamp, emergencyType = "general" } = data;
-    console.log(`${colors.red}🚨 Evento → emergency_alert:${colors.reset}`, { userId, userName, latitude, longitude, emergencyType });
+    const {
+      userId,
+      userName,
+      latitude,
+      longitude,
+      timestamp,
+      emergencyType = "general",
+    } = data;
 
+    console.log(
+      `${colors.red}🚨 Evento → emergency_alert:${colors.reset}`,
+      { userId, userName, latitude, longitude, emergencyType }
+    );
+
+    // ============================================================
+    // 🧩 Validaciones básicas
+    // ============================================================
     if (!userId || !userName) {
-      return ack?.({ success: false, message: "Datos de emergencia inválidos" });
+      console.warn(`${colors.yellow}⚠️ Datos de usuario faltantes${colors.reset}`);
+      return ack?.({ success: false, message: "Datos de usuario inválidos" });
+    }
+
+    if (typeof latitude !== "number" || typeof longitude !== "number") {
+      console.warn(`${colors.yellow}⚠️ Coordenadas inválidas${colors.reset}`);
+      return ack?.({ success: false, message: "Ubicación inválida" });
     }
 
     // ============================================================
     // 🧩 Obtener avatar del usuario desde Firestore
     // ============================================================
     let avatarUrl = null;
+    let userSnap = null;
+
     try {
-      const userSnap = await db.collection(USERS_COLLECTION).doc(userId).get();
+      userSnap = await db.collection(USERS_COLLECTION).doc(userId).get();
       if (userSnap.exists) {
         const userData = userSnap.data();
         avatarUrl = userData?.avatarUri || null;
-        console.log(`${colors.green}✅ Avatar del usuario encontrado:${colors.reset} ${avatarUrl}`);
+        console.log(`${colors.green}✅ Avatar encontrado:${colors.reset} ${avatarUrl || "Sin imagen"}`);
       } else {
-        console.log(`${colors.yellow}⚠️ Usuario sin avatar en Firestore${colors.reset}`);
+        console.log(`${colors.yellow}⚠️ Usuario no encontrado en Firestore${colors.reset}`);
       }
     } catch (e) {
       console.warn(`${colors.yellow}⚠️ Error obteniendo avatar:${colors.reset} ${e.message}`);
@@ -678,10 +700,10 @@ socket.on("emergency_alert", async (data = {}, ack) => {
         };
         console.log(`${colors.green}✅ Vehículo asociado a emergencia:${colors.reset}`, vehicleData);
       } else {
-        console.log(`${colors.yellow}⚠️ No se encontró vehículo registrado para ${userName}${colors.reset}`);
+        console.log(`${colors.yellow}⚠️ No se encontró vehículo para ${userName}${colors.reset}`);
       }
     } catch (vehErr) {
-      console.warn(`${colors.yellow}⚠️ Error obteniendo vehículo:${colors.reset}`, vehErr.message);
+      console.warn(`${colors.yellow}⚠️ Error obteniendo vehículo:${colors.reset} ${vehErr.message}`);
     }
 
     // ============================================================
@@ -690,34 +712,44 @@ socket.on("emergency_alert", async (data = {}, ack) => {
     const emergencyData = {
       userId,
       userName,
-      avatarUrl, // ✅ NUEVO: se incluye foto del usuario
+      avatarUrl, // ✅ se incluye la foto del usuario
       latitude,
       longitude,
       timestamp: timestamp || Date.now(),
       socketId: socket.id,
       emergencyType,
+      status: "active",
       vehicleInfo: vehicleData,
     };
 
-    // Guardar en memoria y Firestore
+    // ============================================================
+    // 💾 Guardar en memoria y Firestore
+    // ============================================================
     emergencyAlerts.set(userId, emergencyData);
     if (!emergencyHelpers.has(userId)) {
       emergencyHelpers.set(userId, new Set());
     }
 
-    await db.collection(EMERGENCIAS_COLLECTION).doc(userId).set(
-      {
-        ...emergencyData,
-        status: "active",
-        createdAt: Date.now(),
-      },
-      { merge: true }
-    );
+    try {
+      await db
+        .collection(EMERGENCIAS_COLLECTION)
+        .doc(userId)
+        .set(
+          {
+            ...emergencyData,
+            createdAt: Date.now(),
+          },
+          { merge: true }
+        );
+      console.log(`${colors.green}✅ Emergencia registrada en Firestore${colors.reset}`);
+    } catch (fireErr) {
+      console.error(`${colors.red}❌ Error guardando emergencia:${colors.reset}`, fireErr.message);
+    }
 
     // ============================================================
     // 🔥 Notificar a los demás usuarios conectados
     // ============================================================
-    const nearbyUsers = getNearbyUsers(latitude, longitude, 50);
+    const nearbyUsers = getNearbyUsers(latitude, longitude, 50); // 50 km de radio
     nearbyUsers.forEach((nearbySocketId) => {
       if (nearbySocketId !== socket.id) {
         io.to(nearbySocketId).emit("emergency_alert", emergencyData);
@@ -725,9 +757,12 @@ socket.on("emergency_alert", async (data = {}, ack) => {
     });
 
     console.log(
-      `${colors.red}🚨 ALERTA ENVIADA:${colors.reset} ${userName} (${latitude}, ${longitude}) - Notificados ${nearbyUsers.length} usuarios`
+      `${colors.red}📢 ALERTA DIFUNDIDA:${colors.reset} ${userName} (${latitude}, ${longitude}) → ${nearbyUsers.length} usuarios notificados`
     );
 
+    // ============================================================
+    // ✅ Responder al emisor
+    // ============================================================
     ack?.({
       success: true,
       message: "Alerta de emergencia enviada correctamente",
@@ -739,6 +774,7 @@ socket.on("emergency_alert", async (data = {}, ack) => {
     ack?.({ success: false, message: error.message });
   }
 });
+
 
 
   // ============================================================
