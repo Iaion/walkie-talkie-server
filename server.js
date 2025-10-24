@@ -792,7 +792,7 @@ io.on("connection", (socket) => {
   });
 
 // ============================================================
-// 🚨 Enviar alerta de emergencia - VERSIÓN FINAL CORREGIDA
+// 🚨 Enviar alerta de emergencia - VERSIÓN COMPLETA CORREGIDA
 // ============================================================
 socket.on("emergency_alert", async (data = {}, ack) => {
   try {
@@ -824,26 +824,31 @@ socket.on("emergency_alert", async (data = {}, ack) => {
     }
 
     // ============================================================
-    // 🧩 Obtener avatar del usuario desde Firestore
+    // 🧩 Obtener avatar del usuario desde Firestore - VERSIÓN MEJORADA
     // ============================================================
     let avatarUrl = null;
-    let userSnap = null;
-
     try {
-      userSnap = await db.collection(USERS_COLLECTION).doc(userId).get();
-      if (userSnap.exists) {
-        const userData = userSnap.data();
+      const userDoc = await db.collection(USERS_COLLECTION).doc(userId).get();
+      if (userDoc.exists) {
+        const userData = userDoc.data();
         avatarUrl = userData?.avatarUri || null;
-        console.log(`${colors.green}✅ Avatar encontrado:${colors.reset} ${avatarUrl || "Sin imagen"}`);
+        
+        // 🔍 DEBUG DETALLADO del avatar
+        console.log(`${colors.green}✅ Avatar obtenido:${colors.reset}`, {
+          userId: userId,
+          avatarUrl: avatarUrl ? `✅ Presente (${avatarUrl.substring(0, 80)}...)` : "❌ Ausente",
+          esUrlValida: avatarUrl ? avatarUrl.startsWith('http') : false,
+          esFirebaseUrl: avatarUrl ? avatarUrl.includes('firebasestorage') : false
+        });
       } else {
-        console.log(`${colors.yellow}⚠️ Usuario no encontrado en Firestore${colors.reset}`);
+        console.log(`${colors.yellow}⚠️ Usuario no encontrado en Firestore: ${userId}${colors.reset}`);
       }
     } catch (e) {
       console.warn(`${colors.yellow}⚠️ Error obteniendo avatar:${colors.reset} ${e.message}`);
     }
 
     // ============================================================
-    // 🚗 Obtener datos del vehículo del usuario
+    // 🚗 Obtener datos del vehículo del usuario - VERSIÓN MEJORADA
     // ============================================================
     let vehicleData = null;
     try {
@@ -863,7 +868,15 @@ socket.on("emergency_alert", async (data = {}, ack) => {
           color: vehiculo.color || "",
           fotoVehiculoUri: vehiculo.fotoVehiculoUri || "",
         };
-        console.log(`${colors.green}✅ Vehículo asociado a emergencia:${colors.reset}`, vehicleData);
+        
+        // 🔍 DEBUG DETALLADO del vehículo
+        console.log(`${colors.green}✅ Vehículo asociado:${colors.reset}`, {
+          patente: vehicleData.patente,
+          marca: vehicleData.marca,
+          modelo: vehicleData.modelo,
+          fotoVehiculoUri: vehicleData.fotoVehiculoUri ? `✅ Presente` : "❌ Ausente",
+          esUrlValida: vehicleData.fotoVehiculoUri ? vehicleData.fotoVehiculoUri.startsWith('http') : false
+        });
       } else {
         console.log(`${colors.yellow}⚠️ No se encontró vehículo para ${userName}${colors.reset}`);
       }
@@ -872,12 +885,12 @@ socket.on("emergency_alert", async (data = {}, ack) => {
     }
 
     // ============================================================
-    // 🚨 Crear objeto completo de emergencia
+    // 🚨 Crear objeto completo de emergencia - VERSIÓN CORREGIDA
     // ============================================================
     const emergencyData = {
       userId,
       userName,
-      avatarUrl, // ✅ se incluye la foto del usuario
+      avatarUrl: avatarUrl, // ✅ CORREGIDO: usar el nombre correcto que espera Android
       latitude,
       longitude,
       timestamp: timestamp || Date.now(),
@@ -886,6 +899,14 @@ socket.on("emergency_alert", async (data = {}, ack) => {
       status: "active",
       vehicleInfo: vehicleData,
     };
+
+    // 🔍 DEBUG FINAL de los datos que se enviarán
+    console.log(`${colors.cyan}📦 DATOS DE EMERGENCIA A ENVIAR:${colors.reset}`, {
+      userName: emergencyData.userName,
+      avatarUrl: emergencyData.avatarUrl ? `✅ Presente` : "❌ Ausente",
+      vehicleInfo: emergencyData.vehicleInfo ? `✅ Presente` : "❌ Ausente",
+      vehicleImage: emergencyData.vehicleInfo?.fotoVehiculoUri ? `✅ Presente` : "❌ Ausente"
+    });
 
     // ============================================================
     // 💾 Guardar en memoria y Firestore
@@ -912,35 +933,61 @@ socket.on("emergency_alert", async (data = {}, ack) => {
     }
 
     // ============================================================
-    // 🔥 Notificar a los demás usuarios conectados
+    // 🔥 Notificar a los demás usuarios conectados - VERSIÓN MEJORADA
     // ============================================================
     const nearbyUsers = getNearbyUsers(latitude, longitude, 50); // 50 km de radio
+    
+    console.log(`${colors.blue}👥 Usuarios cercanos encontrados: ${nearbyUsers.length}${colors.reset}`);
+    
+    let notifiedCount = 0;
     nearbyUsers.forEach((nearbySocketId) => {
       if (nearbySocketId !== socket.id) {
+        // 🔍 DEBUG de lo que se envía a cada usuario
+        console.log(`${colors.magenta}📤 Enviando a socket: ${nearbySocketId}${colors.reset}`, {
+          userName: emergencyData.userName,
+          tieneAvatar: !!emergencyData.avatarUrl,
+          tieneVehiculo: !!emergencyData.vehicleInfo
+        });
+        
         io.to(nearbySocketId).emit("emergency_alert", emergencyData);
+        notifiedCount++;
       }
     });
 
     console.log(
-      `${colors.red}📢 ALERTA DIFUNDIDA:${colors.reset} ${userName} (${latitude}, ${longitude}) → ${nearbyUsers.length} usuarios notificados`
+      `${colors.red}📢 ALERTA DIFUNDIDA:${colors.reset} ${userName} → ${notifiedCount}/${nearbyUsers.length} usuarios notificados`
     );
 
     // ============================================================
-    // ✅ Responder al emisor
+    // ✅ Responder al emisor - VERSIÓN MEJORADA
     // ============================================================
-    ack?.({
+    const response = {
       success: true,
       message: "Alerta de emergencia enviada correctamente",
       vehicle: vehicleData,
-      notifiedUsers: nearbyUsers.length,
+      avatarUrl: avatarUrl, // ✅ Incluir info del avatar en la respuesta
+      notifiedUsers: notifiedCount,
+      totalNearbyUsers: nearbyUsers.length
+    };
+
+    console.log(`${colors.green}✅ Respuesta al emisor:${colors.reset}`, {
+      success: response.success,
+      notifiedUsers: response.notifiedUsers,
+      tieneAvatar: !!response.avatarUrl,
+      tieneVehiculo: !!response.vehicle
     });
+
+    ack?.(response);
+
   } catch (error) {
     console.error(`${colors.red}❌ Error en emergency_alert:${colors.reset}`, error);
-    ack?.({ success: false, message: error.message });
+    ack?.({ 
+      success: false, 
+      message: error.message,
+      errorDetails: "Error procesando alerta de emergencia"
+    });
   }
 });
-
-
 
   // ============================================================
   // 📍 Actualizar ubicación durante emergencia
