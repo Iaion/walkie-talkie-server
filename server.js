@@ -280,7 +280,9 @@ app.get("/vehiculo/:userId", async (req, res) => {
   }
 });
 
-// Guardar/actualizar vehículo
+// ============================================================
+// 🚗 Guardar/actualizar vehículo - VERSIÓN CORREGIDA
+// ============================================================
 app.post("/vehiculo", async (req, res) => {
   try {
     const vehiculoData = req.body;
@@ -288,7 +290,9 @@ app.post("/vehiculo", async (req, res) => {
       patente: vehiculoData.patente,
       marca: vehiculoData.marca,
       modelo: vehiculoData.modelo,
-      userId: vehiculoData.userId
+      userId: vehiculoData.userId,
+      fotoVehiculoUri: vehiculoData.fotoVehiculoUri ? "✅ Presente" : "❌ Ausente",
+      fotoCascoUri: vehiculoData.fotoCascoUri ? "✅ Presente" : "❌ Ausente"
     });
 
     if (!vehiculoData.userId) {
@@ -303,21 +307,53 @@ app.post("/vehiculo", async (req, res) => {
 
     let result;
     if (snapshot.empty) {
-      // Crear nuevo vehículo
-      result = await db.collection(VEHICULOS_COLLECTION).add({
+      // 🔥 CORREGIDO: Crear nuevo vehículo con datos completos
+      const nuevoVehiculo = {
         ...vehiculoData,
         createdAt: Date.now(),
-        updatedAt: Date.now()
-      });
+        updatedAt: Date.now(),
+        // ✅ Asegurar que las URLs de imágenes se guarden
+        fotoVehiculoUri: vehiculoData.fotoVehiculoUri || "",
+        fotoCascoUri: vehiculoData.fotoCascoUri || ""
+      };
+      
+      result = await db.collection(VEHICULOS_COLLECTION).add(nuevoVehiculo);
       console.log(`${colors.green}✅ Nuevo vehículo creado: ${vehiculoData.patente}${colors.reset}`);
-    } else {
-      // Actualizar vehículo existente
-      const existingDoc = snapshot.docs[0];
-      result = await existingDoc.ref.update({
-        ...vehiculoData,
-        updatedAt: Date.now()
+      
+      // 🔍 DEBUG: Verificar URLs en nuevo vehículo
+      console.log(`${colors.blue}🔍 URLs en nuevo vehículo:${colors.reset}`, {
+        fotoVehiculoUri: nuevoVehiculo.fotoVehiculoUri ? "✅ URL guardada" : "❌ Sin URL",
+        fotoCascoUri: nuevoVehiculo.fotoCascoUri ? "✅ URL guardada" : "❌ Sin URL"
       });
+    } else {
+      // 🔥 CORREGIDO: Actualizar vehículo existente SIN perder imágenes
+      const existingDoc = snapshot.docs[0];
+      const existingData = existingDoc.data();
+      
+      // 🖼️ PRESERVAR URLs existentes si no vienen nuevas
+      const updateData = {
+        ...vehiculoData,
+        updatedAt: Date.now(),
+        // ✅ Mantener URLs existentes si no se envían nuevas
+        fotoVehiculoUri: vehiculoData.fotoVehiculoUri || existingData.fotoVehiculoUri || "",
+        fotoCascoUri: vehiculoData.fotoCascoUri || existingData.fotoCascoUri || ""
+      };
+      
+      result = await existingDoc.ref.update(updateData);
       console.log(`${colors.green}✅ Vehículo actualizado: ${vehiculoData.patente}${colors.reset}`);
+      
+      // 🔍 DEBUG: Verificar URLs antes y después
+      console.log(`${colors.blue}🔍 URLs ANTES de actualizar:${colors.reset}`, {
+        fotoVehiculoUri: existingData.fotoVehiculoUri || "❌ No existía",
+        fotoCascoUri: existingData.fotoCascoUri || "❌ No existía"
+      });
+      
+      console.log(`${colors.blue}🔍 URLs DESPUÉS de actualizar:${colors.reset}`, {
+        fotoVehiculoUri: updateData.fotoVehiculoUri || "❌ Sin URL",
+        fotoCascoUri: updateData.fotoCascoUri || "❌ Sin URL",
+        esUrlFirebaseVehiculo: updateData.fotoVehiculoUri?.includes('firebasestorage') ? "✅ Firebase" : "❌ No Firebase",
+        esUrlFirebaseCasco: updateData.fotoCascoUri?.includes('firebasestorage') ? "✅ Firebase" : "❌ No Firebase"
+      });
     }
 
     res.json({ 
@@ -332,56 +368,185 @@ app.post("/vehiculo", async (req, res) => {
 });
 
 // ============================================================
-// 🚗 Subir foto de vehículo o casco + Guardar URL en Firestore
+// 🚗 Subir foto de vehículo o casco + Guardar URL en Firestore - VERSIÓN CORREGIDA
 // ============================================================
 app.post("/vehiculo/foto", async (req, res) => {
   try {
     const { userId, imageData, tipo } = req.body; // tipo: 'vehiculo' o 'casco'
 
     if (!userId || !imageData || !isDataUrl(imageData)) {
-      return res.status(400).json({ success: false, message: "Datos inválidos" });
+      return res.status(400).json({ 
+        success: false, 
+        message: "Datos inválidos: userId, imageData y tipo son requeridos" 
+      });
     }
+
+    if (tipo !== 'vehiculo' && tipo !== 'casco') {
+      return res.status(400).json({ 
+        success: false, 
+        message: "Tipo inválido. Debe ser 'vehiculo' o 'casco'" 
+      });
+    }
+
+    console.log(`${colors.yellow}⬆️ Subiendo foto de ${tipo} para usuario ${userId}${colors.reset}`);
 
     // Determinar tipo MIME y extensión
     const mime = getMimeFromDataUrl(imageData);
     const ext = mime.split("/")[1] || "jpg";
     const base64 = getBase64FromDataUrl(imageData);
 
+    if (!base64) {
+      return res.status(400).json({ 
+        success: false, 
+        message: "Formato de imagen inválido" 
+      });
+    }
+
     const buffer = Buffer.from(base64, "base64");
     const filePath = `vehiculos/${userId}/${tipo}_${Date.now()}_${uuidv4()}.${ext}`;
     const file = bucket.file(filePath);
 
-    console.log(`${colors.yellow}⬆️ Subiendo foto de ${tipo} para usuario ${userId}${colors.reset}`);
-
     // Subir a Firebase Storage
-    await file.save(buffer, { contentType: mime, resumable: false });
+    await file.save(buffer, { 
+      contentType: mime, 
+      resumable: false,
+      metadata: {
+        cacheControl: 'public, max-age=31536000',
+      }
+    });
     await file.makePublic();
 
     const url = file.publicUrl();
     console.log(`${colors.green}✅ Foto de ${tipo} subida: ${url}${colors.reset}`);
 
     // ============================================================
-    // 🧠 NUEVO: Guardar la URL en Firestore (colección "vehiculos")
+    // 🧠 CORREGIDO: Buscar el documento del vehículo y actualizar correctamente
     // ============================================================
-    const updateData = tipo === "vehiculo"
-      ? { fotoVehiculoUri: url, updatedAt: Date.now() }
-      : { fotoCascoUri: url, updatedAt: Date.now() };
+    try {
+      // Primero buscar el vehículo del usuario
+      const snapshot = await db.collection(VEHICULOS_COLLECTION)
+        .where("userId", "==", userId)
+        .limit(1)
+        .get();
 
-    await db.collection(VEHICULOS_COLLECTION)
-      .doc(userId)
-      .set(updateData, { merge: true });
+      if (snapshot.empty) {
+        // 🔥 CREAR NUEVO VEHÍCULO si no existe
+        const nuevoVehiculo = {
+          userId: userId,
+          fotoVehiculoUri: tipo === 'vehiculo' ? url : "",
+          fotoCascoUri: tipo === 'casco' ? url : "",
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+          isActive: true
+        };
+        
+        await db.collection(VEHICULOS_COLLECTION).add(nuevoVehiculo);
+        console.log(`${colors.green}✅ Nuevo vehículo creado para usuario ${userId} con foto de ${tipo}${colors.reset}`);
+      } else {
+        // 🔥 ACTUALIZAR VEHÍCULO EXISTENTE
+        const existingDoc = snapshot.docs[0];
+        const existingData = existingDoc.data();
+        
+        // 🖼️ PRESERVAR la otra foto si existe
+        const updateData = {
+          updatedAt: Date.now()
+        };
+        
+        if (tipo === 'vehiculo') {
+          updateData.fotoVehiculoUri = url;
+          // Mantener la foto del casco si existe
+          if (existingData.fotoCascoUri) {
+            updateData.fotoCascoUri = existingData.fotoCascoUri;
+          }
+        } else {
+          updateData.fotoCascoUri = url;
+          // Mantener la foto del vehículo si existe
+          if (existingData.fotoVehiculoUri) {
+            updateData.fotoVehiculoUri = existingData.fotoVehiculoUri;
+          }
+        }
+        
+        await existingDoc.ref.update(updateData);
+        console.log(`${colors.green}✅ Vehículo existente actualizado con foto de ${tipo}${colors.reset}`);
+        
+        // 🔍 DEBUG
+        console.log(`${colors.blue}🔍 Estado después de actualizar:${colors.reset}`, {
+          fotoVehiculoUri: updateData.fotoVehiculoUri || existingData.fotoVehiculoUri || "❌ Sin URL",
+          fotoCascoUri: updateData.fotoCascoUri || existingData.fotoCascoUri || "❌ Sin URL"
+        });
+      }
 
-    console.log(`${colors.green}☁️ Firestore actualizado con URL de ${tipo} para ${userId}${colors.reset}`);
+      console.log(`${colors.green}☁️ Firestore actualizado con URL de ${tipo} para ${userId}${colors.reset}`);
+
+    } catch (firestoreError) {
+      console.error(`${colors.red}❌ Error actualizando Firestore:${colors.reset}`, firestoreError);
+      // ⚠️ Pero aún así responder éxito porque la imagen se subió
+    }
 
     // ✅ Responder con éxito
     res.json({
       success: true,
       message: `Foto de ${tipo} subida y guardada correctamente`,
-      url
+      url: url,
+      tipo: tipo
     });
 
   } catch (error) {
     console.error(`${colors.red}❌ Error subiendo foto:${colors.reset}`, error);
+    res.status(500).json({ 
+      success: false, 
+      message: `Error subiendo foto: ${error.message}` 
+    });
+  }
+});
+
+// ============================================================
+// 🔍 Endpoint para debuggear vehículos (OPCIONAL PERO ÚTIL)
+// ============================================================
+app.get("/debug/vehiculo/:userId", async (req, res) => {
+  try {
+    const { userId } = req.params;
+    console.log(`${colors.cyan}🔍 DEBUG /debug/vehiculo/${userId}${colors.reset}`);
+
+    const snapshot = await db.collection(VEHICULOS_COLLECTION)
+      .where("userId", "==", userId)
+      .limit(1)
+      .get();
+
+    if (snapshot.empty) {
+      return res.json({ 
+        success: true, 
+        debug: { existe: false, message: "Vehículo no encontrado" } 
+      });
+    }
+
+    const vehiculoDoc = snapshot.docs[0];
+    const vehiculo = { id: vehiculoDoc.id, ...vehiculoDoc.data() };
+    
+    // Información detallada para debug
+    const debugInfo = {
+      existe: true,
+      patente: vehiculo.patente || "❌ No tiene",
+      userId: vehiculo.userId,
+      fotoVehiculoUri: {
+        valor: vehiculo.fotoVehiculoUri || "❌ Vacío",
+        esFirebaseUrl: vehiculo.fotoVehiculoUri?.includes('firebasestorage') ? "✅ Sí" : "❌ No",
+        longitud: vehiculo.fotoVehiculoUri?.length || 0,
+        esValida: vehiculo.fotoVehiculoUri?.startsWith('http') ? "✅ Sí" : "❌ No"
+      },
+      fotoCascoUri: {
+        valor: vehiculo.fotoCascoUri || "❌ Vacío",
+        esFirebaseUrl: vehiculo.fotoCascoUri?.includes('firebasestorage') ? "✅ Sí" : "❌ No",
+        longitud: vehiculo.fotoCascoUri?.length || 0,
+        esValida: vehiculo.fotoCascoUri?.startsWith('http') ? "✅ Sí" : "❌ No"
+      },
+      actualizado: new Date(vehiculo.updatedAt).toISOString()
+    };
+    
+    console.log(`${colors.green}🔍 DEBUG Vehículo:${colors.reset}`, debugInfo);
+    res.json({ success: true, debug: debugInfo, vehiculo });
+  } catch (error) {
+    console.error(`${colors.red}❌ Error en debug:${colors.reset}`, error);
     res.status(500).json({ success: false, message: error.message });
   }
 });
