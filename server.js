@@ -626,8 +626,8 @@ io.on("connection", (socket) => {
     console.log(`${colors.blue}📋 Chat General: ${users.length} usuarios conectados${colors.reset}`);
   });
 
-  // ============================================================
-// 🚨 Enviar alerta de emergencia - MEJORADO CON VEHÍCULO
+// ============================================================
+// 🚨 Enviar alerta de emergencia - ACTUALIZADO CON AVATAR Y VEHÍCULO
 // ============================================================
 socket.on("emergency_alert", async (data = {}, ack) => {
   try {
@@ -636,6 +636,23 @@ socket.on("emergency_alert", async (data = {}, ack) => {
 
     if (!userId || !userName) {
       return ack?.({ success: false, message: "Datos de emergencia inválidos" });
+    }
+
+    // ============================================================
+    // 🧩 Obtener avatar del usuario desde Firestore
+    // ============================================================
+    let avatarUrl = null;
+    try {
+      const userSnap = await db.collection(USERS_COLLECTION).doc(userId).get();
+      if (userSnap.exists) {
+        const userData = userSnap.data();
+        avatarUrl = userData?.avatarUri || null;
+        console.log(`${colors.green}✅ Avatar del usuario encontrado:${colors.reset} ${avatarUrl}`);
+      } else {
+        console.log(`${colors.yellow}⚠️ Usuario sin avatar en Firestore${colors.reset}`);
+      }
+    } catch (e) {
+      console.warn(`${colors.yellow}⚠️ Error obteniendo avatar:${colors.reset} ${e.message}`);
     }
 
     // ============================================================
@@ -668,28 +685,26 @@ socket.on("emergency_alert", async (data = {}, ack) => {
     }
 
     // ============================================================
-    // 🚨 Crear objeto de emergencia completo
+    // 🚨 Crear objeto completo de emergencia
     // ============================================================
     const emergencyData = {
       userId,
       userName,
+      avatarUrl, // ✅ NUEVO: se incluye foto del usuario
       latitude,
       longitude,
       timestamp: timestamp || Date.now(),
       socketId: socket.id,
       emergencyType,
-      vehicleInfo: vehicleData, // ✅ Se incluye en el payload
+      vehicleInfo: vehicleData,
     };
 
-    // Guardar en memoria
+    // Guardar en memoria y Firestore
     emergencyAlerts.set(userId, emergencyData);
-
-    // Crear conjunto de ayudantes para esta emergencia
     if (!emergencyHelpers.has(userId)) {
       emergencyHelpers.set(userId, new Set());
     }
 
-    // Guardar en Firebase
     await db.collection(EMERGENCIAS_COLLECTION).doc(userId).set(
       {
         ...emergencyData,
@@ -700,7 +715,7 @@ socket.on("emergency_alert", async (data = {}, ack) => {
     );
 
     // ============================================================
-    // 🔥 Notificar a usuarios cercanos (radio 50 km)
+    // 🔥 Notificar a los demás usuarios conectados
     // ============================================================
     const nearbyUsers = getNearbyUsers(latitude, longitude, 50);
     nearbyUsers.forEach((nearbySocketId) => {
@@ -710,7 +725,7 @@ socket.on("emergency_alert", async (data = {}, ack) => {
     });
 
     console.log(
-      `${colors.red}🚨 ALERTA ENVIADA:${colors.reset} ${userName} (${latitude}, ${longitude}) - Notificando a ${nearbyUsers.length} usuarios`
+      `${colors.red}🚨 ALERTA ENVIADA:${colors.reset} ${userName} (${latitude}, ${longitude}) - Notificados ${nearbyUsers.length} usuarios`
     );
 
     ack?.({
@@ -725,32 +740,6 @@ socket.on("emergency_alert", async (data = {}, ack) => {
   }
 });
 
-  // ============================================================
-  // 📍 Actualizar ubicación del usuario (para filtrado)
-  // ============================================================
-  socket.on("update_user_location", async (data = {}, ack) => {
-    try {
-      const { userId, latitude, longitude } = data;
-      console.log(`${colors.blue}📍 Evento → update_user_location:${colors.reset}`, { userId, latitude, longitude });
-
-      if (!userId) {
-        return ack?.({ success: false, message: "userId requerido" });
-      }
-
-      // Actualizar en memoria
-      const userEntry = connectedUsers.get(userId);
-      if (userEntry) {
-        userEntry.userData.latitude = latitude;
-        userEntry.userData.longitude = longitude;
-        userEntry.userData.lastLocationUpdate = Date.now();
-      }
-
-      ack?.({ success: true, message: "Ubicación actualizada" });
-    } catch (error) {
-      console.error(`${colors.red}❌ Error en update_user_location:${colors.reset}`, error);
-      ack?.({ success: false, message: error.message });
-    }
-  });
 
   // ============================================================
   // 📍 Actualizar ubicación durante emergencia
