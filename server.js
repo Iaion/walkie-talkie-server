@@ -189,7 +189,6 @@ async function uploadAvatarFromDataUrl(userId, dataUrl) {
   }
 }
 
-
 // ============================================================
 // 🌐 Endpoints REST
 // ============================================================
@@ -550,6 +549,7 @@ app.get("/debug/vehiculo/:userId", async (req, res) => {
     res.status(500).json({ success: false, message: error.message });
   }
 });
+
 // ============================================================
 // 🔌 Socket.IO - Chat General + Sistema de Emergencia
 // ============================================================
@@ -792,7 +792,7 @@ io.on("connection", (socket) => {
   });
 
 // ============================================================
-// 🚨 Enviar alerta de emergencia - VERSIÓN COMPLETA CORREGIDA
+// 🚨 Enviar alerta de emergencia - VERSIÓN COMPLETAMENTE CORREGIDA
 // ============================================================
 socket.on("emergency_alert", async (data = {}, ack) => {
   try {
@@ -831,12 +831,14 @@ socket.on("emergency_alert", async (data = {}, ack) => {
       const userDoc = await db.collection(USERS_COLLECTION).doc(userId).get();
       if (userDoc.exists) {
         const userData = userDoc.data();
-        avatarUrl = userData?.avatarUri || null;
+        // 🔥 CORRECCIÓN CRÍTICA: Buscar tanto avatarUri como avatarUrl para compatibilidad
+        avatarUrl = userData?.avatarUrl || userData?.avatarUri || null;
         
         // 🔍 DEBUG DETALLADO del avatar
         console.log(`${colors.green}✅ Avatar obtenido:${colors.reset}`, {
           userId: userId,
           avatarUrl: avatarUrl ? `✅ Presente (${avatarUrl.substring(0, 80)}...)` : "❌ Ausente",
+          campoEncontrado: userData?.avatarUrl ? 'avatarUrl' : userData?.avatarUri ? 'avatarUri' : 'ninguno',
           esUrlValida: avatarUrl ? avatarUrl.startsWith('http') : false,
           esFirebaseUrl: avatarUrl ? avatarUrl.includes('firebasestorage') : false
         });
@@ -890,7 +892,7 @@ socket.on("emergency_alert", async (data = {}, ack) => {
     const emergencyData = {
       userId,
       userName,
-      avatarUrl: avatarUrl, // ✅ CORREGIDO: usar el nombre correcto que espera Android
+      avatarUrl: avatarUrl, // ✅ CORREGIDO: usar avatarUrl que es lo que espera Android
       latitude,
       longitude,
       timestamp: timestamp || Date.now(),
@@ -903,7 +905,7 @@ socket.on("emergency_alert", async (data = {}, ack) => {
     // 🔍 DEBUG FINAL de los datos que se enviarán
     console.log(`${colors.cyan}📦 DATOS DE EMERGENCIA A ENVIAR:${colors.reset}`, {
       userName: emergencyData.userName,
-      avatarUrl: emergencyData.avatarUrl ? `✅ Presente` : "❌ Ausente",
+      avatarUrl: emergencyData.avatarUrl ? `✅ Presente (${emergencyData.avatarUrl.substring(0, 50)}...)` : "❌ Ausente",
       vehicleInfo: emergencyData.vehicleInfo ? `✅ Presente` : "❌ Ausente",
       vehicleImage: emergencyData.vehicleInfo?.fotoVehiculoUri ? `✅ Presente` : "❌ Ausente"
     });
@@ -1029,7 +1031,7 @@ socket.on("emergency_alert", async (data = {}, ack) => {
   });
 
   // ============================================================
-  // ✅ Confirmar ayuda a una emergencia
+  // ✅ Confirmar ayuda a una emergencia - VERSIÓN CORREGIDA
   // ============================================================
   socket.on("confirm_help", async (data = {}, ack) => {
     try {
@@ -1069,6 +1071,14 @@ socket.on("emergency_alert", async (data = {}, ack) => {
             timestamp: timestamp || Date.now()
           });
         }
+      });
+
+      // 🔥 NUEVO: Notificar a TODOS los usuarios que el ayudante confirmó (para cerrar notificaciones)
+      io.emit("helper_confirmed_notification", {
+        emergencyUserId,
+        helperId,
+        helperName,
+        timestamp: timestamp || Date.now()
       });
 
       console.log(`${colors.green}✅ ${helperName} confirmó ayuda para ${emergencyUserId}${colors.reset}`);
