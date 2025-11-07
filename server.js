@@ -69,6 +69,35 @@ const EMERGENCIAS_COLLECTION = "emergencias";
 const connectedUsers = new Map();
 const emergencyAlerts = new Map(); // userId -> emergencyData
 const emergencyHelpers = new Map(); // emergencyUserId -> Set(helperUserIds)
+const chatRooms = new Map(); // 🆕 Sistema de salas
+
+// ============================================================
+// 🏗️ Inicializar salas de chat por defecto
+// ============================================================
+function initializeDefaultRooms() {
+  const defaultRooms = [
+    { id: "general", name: "Chat General", type: "public", description: "Sala principal para conversaciones generales" },
+    { id: "ayuda", name: "Sala de Ayuda", type: "public", description: "Sala para pedir y ofrecer ayuda" },
+    { id: "handy", name: "Modo Handy", type: "ptt", description: "Sala para comunicación push-to-talk" }
+  ];
+
+  defaultRooms.forEach(room => {
+    chatRooms.set(room.id, {
+      ...room,
+      users: new Set(),
+      createdAt: Date.now(),
+      messageCount: 0
+    });
+  });
+
+  console.log(`${colors.green}✅ Salas por defecto inicializadas:${colors.reset}`);
+  defaultRooms.forEach(room => {
+    console.log(`${colors.blue}   - ${room.name} (${room.id})${colors.reset}`);
+  });
+}
+
+// Inicializar salas al arrancar
+initializeDefaultRooms();
 
 // ============================================================
 // 🔧 Helpers
@@ -115,6 +144,24 @@ function getNearbyUsers(alertLat, alertLng, radiusKm) {
   });
 
   return allSockets;
+}
+
+// 🆕 Función helper para actualizar lista de usuarios en sala
+function updateRoomUserList(roomId) {
+  const room = chatRooms.get(roomId);
+  if (!room) return;
+
+  const usersInRoom = Array.from(room.users).map(userId => {
+    const userInfo = connectedUsers.get(userId);
+    return userInfo ? userInfo.userData : null;
+  }).filter(Boolean);
+
+  // Enviar lista actualizada a todos en la sala
+  io.to(roomId).emit("room_users_updated", {
+    roomId: roomId,
+    users: usersInRoom,
+    userCount: usersInRoom.length
+  });
 }
 
 // ============================================================
@@ -202,6 +249,64 @@ app.get("/users", (_, res) =>
     }))
   )
 );
+
+// ============================================================
+// 🏪 Endpoints para Salas de Chat
+// ============================================================
+
+// Obtener todas las salas disponibles
+app.get("/rooms", (req, res) => {
+  try {
+    const roomsArray = Array.from(chatRooms.values()).map(room => ({
+      id: room.id,
+      name: room.name,
+      type: room.type,
+      description: room.description,
+      userCount: room.users.size,
+      messageCount: room.messageCount,
+      createdAt: room.createdAt
+    }));
+
+    res.json({
+      success: true,
+      rooms: roomsArray,
+      total: roomsArray.length
+    });
+  } catch (error) {
+    console.error(`${colors.red}❌ Error obteniendo salas:${colors.reset}`, error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// Obtener información de una sala específica
+app.get("/rooms/:roomId", (req, res) => {
+  try {
+    const { roomId } = req.params;
+    const room = chatRooms.get(roomId);
+
+    if (!room) {
+      return res.status(404).json({ success: false, message: "Sala no encontrada" });
+    }
+
+    const roomInfo = {
+      ...room,
+      userCount: room.users.size,
+      users: Array.from(room.users).map(userId => {
+        const user = connectedUsers.get(userId);
+        return user ? { 
+          id: user.userData.id, 
+          username: user.userData.username,
+          avatarUri: user.userData.avatarUri 
+        } : null;
+      }).filter(Boolean)
+    };
+
+    res.json({ success: true, room: roomInfo });
+  } catch (error) {
+    console.error(`${colors.red}❌ Error obteniendo sala:${colors.reset}`, error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
 
 // ============================================================
 // 🚨 ENDPOINTS PARA EMERGENCIAS
@@ -365,6 +470,7 @@ app.post("/vehiculo", async (req, res) => {
     res.status(500).json({ success: false, message: error.message });
   }
 });
+
 
 // ============================================================
 // 🚗 Subir foto de vehículo o casco + Guardar URL en Firestore - VERSIÓN CORREGIDA
@@ -557,7 +663,7 @@ io.on("connection", (socket) => {
   console.log(`${colors.cyan}🔗 NUEVA CONEXIÓN SOCKET:${colors.reset} ${socket.id}`);
 
   // ============================================================
-  // 🧩 Usuario conectado al chat general
+  // 🧩 Usuario conectado al chat general - MEJORADO
   // ============================================================
   socket.on("user-connected", async (user, ack) => {
     console.log(`${colors.blue}📥 Evento → user-connected:${colors.reset}`, user);
@@ -576,8 +682,16 @@ io.on("connection", (socket) => {
     socket.userId = userId;
     socket.username = username;
 
-    // Unir automáticamente al chat general
-    socket.join("general");
+    // Unir automáticamente al chat general por defecto
+    const defaultRoom = "general";
+    socket.join(defaultRoom);
+    socket.currentRoom = defaultRoom;
+
+    // Agregar usuario a la sala en memoria
+    const generalRoom = chatRooms.get(defaultRoom);
+    if (generalRoom) {
+      generalRoom.users.add(userId);
+    }
 
     // Actualizar estado de usuarios conectados
     const existing = connectedUsers.get(userId);
@@ -586,7 +700,7 @@ io.on("connection", (socket) => {
       existing.userData = { ...existing.userData, ...user, isOnline: true };
     } else {
       connectedUsers.set(userId, { 
-        userData: { ...user, isOnline: true }, 
+        userData: { ...user, isOnline: true, currentRoom: defaultRoom }, 
         sockets: new Set([socket.id]) 
       });
     }
@@ -609,32 +723,228 @@ io.on("connection", (socket) => {
       }))
     );
 
+    // Enviar información de salas disponibles al usuario
+    socket.emit("available_rooms", 
+      Array.from(chatRooms.values()).map(room => ({
+        id: room.id,
+        name: room.name,
+        type: room.type,
+        description: room.description,
+        userCount: room.users.size,
+        messageCount: room.messageCount
+      }))
+    );
+
     // Enviar mensaje de bienvenida
     socket.emit("join_success", { 
       room: "general", 
       message: `Bienvenido al chat general, ${username}!` 
     });
 
+    // Notificar a la sala general que llegó un nuevo usuario
+    socket.to(defaultRoom).emit("user_joined_room", {
+      userId: userId,
+      username: username,
+      roomId: defaultRoom,
+      message: `${username} se unió a la sala`,
+      timestamp: Date.now()
+    });
+
+    // Actualizar lista de usuarios en la sala
+    updateRoomUserList(defaultRoom);
+
     ack?.({ success: true });
     console.log(`${colors.green}✅ ${username} conectado al chat general${colors.reset}`);
   });
 
   // ============================================================
-  // 💬 Mensajes de texto en chat general
+  // 🔥 NUEVO: Unirse a sala (general o emergencia) - MEJORADO
+  // ============================================================
+  socket.on("join_room", async (data = {}, ack) => {
+    const { roomId, userId, username } = data;
+    
+    if (!roomId || !userId || !username) {
+      return ack?.({ 
+        success: false, 
+        message: "❌ Datos de sala inválidos" 
+      });
+    }
+
+    console.log(`${colors.blue}🚪 join_room:${colors.reset} ${username} → ${roomId}`);
+
+    try {
+      // Verificar que la sala existe
+      const targetRoom = chatRooms.get(roomId);
+      if (!targetRoom) {
+        return ack?.({ 
+          success: false, 
+          message: `❌ La sala ${roomId} no existe` 
+        });
+      }
+
+      // Dejar sala anterior si existe
+      if (socket.currentRoom) {
+        const previousRoom = chatRooms.get(socket.currentRoom);
+        if (previousRoom) {
+          previousRoom.users.delete(userId);
+          socket.leave(socket.currentRoom);
+          
+          // Notificar salida de la sala anterior
+          socket.to(socket.currentRoom).emit("user_left_room", {
+            userId: userId,
+            username: username,
+            roomId: socket.currentRoom,
+            message: `${username} salió de la sala`,
+            timestamp: Date.now()
+          });
+        }
+      }
+
+      // Unirse a nueva sala
+      socket.join(roomId);
+      socket.currentRoom = roomId;
+      targetRoom.users.add(userId);
+
+      // Actualizar estado del usuario
+      const userInfo = connectedUsers.get(userId);
+      if (userInfo) {
+        userInfo.userData.currentRoom = roomId;
+      }
+
+      // Enviar historial de mensajes de la sala
+      try {
+        const messagesSnapshot = await db.collection(MESSAGES_COLLECTION)
+          .where("roomId", "==", roomId)
+          .orderBy("timestamp", "desc")
+          .limit(50)
+          .get();
+
+        const messages = messagesSnapshot.docs.map(doc => ({
+          id: doc.id,
+          ...doc.data()
+        })).reverse();
+
+        socket.emit("room_messages", {
+          roomId: roomId,
+          messages: messages
+        });
+      } catch (dbError) {
+        console.warn(`${colors.yellow}⚠️ No se pudo cargar historial de mensajes:${colors.reset}`, dbError.message);
+      }
+
+      // Determinar tipo de sala
+      let roomType = "general";
+      if (roomId.startsWith("emergencia_")) {
+        roomType = "emergency";
+        console.log(`${colors.red}🚨 ${username} unido a sala de EMERGENCIA: ${roomId}${colors.reset}`);
+      } else if (roomId === "handy") {
+        roomType = "ptt";
+      }
+
+      // Enviar confirmación
+      ack?.({ 
+        success: true, 
+        roomId: roomId,
+        roomName: targetRoom.name,
+        message: `Unido a ${targetRoom.name}`,
+        type: roomType
+      });
+
+      // Notificar a otros en la sala
+      socket.to(roomId).emit("user_joined_room", {
+        userId: userId,
+        username: username,
+        roomId: roomId,
+        message: `${username} se unió a la sala`,
+        timestamp: Date.now()
+      });
+
+      // Actualizar lista de usuarios en sala
+      updateRoomUserList(roomId);
+
+      console.log(`${colors.green}✅ ${username} unido a sala: ${roomId}${colors.reset}`);
+
+    } catch (error) {
+      console.error(`${colors.red}❌ Error uniendo a sala:${colors.reset}`, error);
+      ack?.({ success: false, message: "Error al unirse a la sala" });
+    }
+  });
+
+  // ============================================================
+  // 🔥 NUEVO: Salir de sala - MEJORADO
+  // ============================================================
+  socket.on("leave_room", async (data = {}, ack) => {
+    const { roomId, userId } = data;
+    
+    if (!roomId) {
+      return ack?.({ success: false, message: "❌ Sala no especificada" });
+    }
+
+    console.log(`${colors.blue}🚪 leave_room:${colors.reset} ${socket.username} → ${roomId}`);
+
+    try {
+      const room = chatRooms.get(roomId);
+      if (!room) {
+        return ack?.({ success: false, message: "Sala no encontrada" });
+      }
+
+      // Salir de la sala
+      socket.leave(roomId);
+      room.users.delete(userId || socket.userId);
+      
+      // Limpiar sala actual si era la actual
+      if (socket.currentRoom === roomId) {
+        socket.currentRoom = null;
+      }
+
+      // Actualizar estado del usuario
+      const userInfo = connectedUsers.get(userId || socket.userId);
+      if (userInfo && userInfo.userData.currentRoom === roomId) {
+        userInfo.userData.currentRoom = null;
+      }
+
+      // Notificar a otros en la sala
+      socket.to(roomId).emit("user_left_room", {
+        userId: userId || socket.userId,
+        username: socket.username,
+        roomId: roomId,
+        message: `${socket.username} salió de la sala`,
+        timestamp: Date.now()
+      });
+
+      // Actualizar lista de usuarios en sala
+      updateRoomUserList(roomId);
+
+      ack?.({ success: true, message: `Salido de ${roomId}` });
+      console.log(`${colors.yellow}↩️ ${socket.username} salió de: ${roomId}${colors.reset}`);
+
+    } catch (error) {
+      console.error(`${colors.red}❌ Error saliendo de sala:${colors.reset}`, error);
+      ack?.({ success: false, message: "Error al salir de la sala" });
+    }
+  });
+
+  // ============================================================
+  // 💬 Mensajes de texto en cualquier sala - ACTUALIZADO
   // ============================================================
   socket.on("send_message", async (data = {}, ack) => {
-    const { userId, username, text } = data;
+    const { userId, username, text, roomId = socket.currentRoom || "general" } = data;
     
     if (!userId || !username || !text) {
       return ack?.({ success: false, message: "❌ Datos de mensaje inválidos" });
+    }
+
+    if (!socket.currentRoom || !chatRooms.has(roomId)) {
+      return ack?.({ success: false, message: "❌ No estás en una sala válida" });
     }
 
     const message = { 
       id: uuidv4(), 
       userId, 
       username, 
-      roomId: "general", 
+      roomId: roomId, 
       text, 
+      type: "text",
       timestamp: Date.now() 
     };
 
@@ -642,15 +952,157 @@ io.on("connection", (socket) => {
       // Guardar en Firebase
       await db.collection(MESSAGES_COLLECTION).add(message);
       
-      // Enviar a todos en el chat general
-      io.to("general").emit("new_message", message);
+      // Incrementar contador de mensajes en la sala
+      const room = chatRooms.get(roomId);
+      if (room) {
+        room.messageCount++;
+      }
+      
+      // Enviar a todos en la sala específica
+      io.to(roomId).emit("new_message", message);
       socket.emit("message_sent", message);
       
       ack?.({ success: true, id: message.id });
-      console.log(`${colors.green}💬 ${username} → Chat General: ${text}${colors.reset}`);
+
+      // Log especial para emergencias
+      if (roomId.startsWith("emergencia_")) {
+        console.log(`${colors.red}🚨 ${username} → EMERGENCIA ${roomId}: ${text}${colors.reset}`);
+      } else {
+        console.log(`${colors.green}💬 ${username} → ${roomId}: ${text}${colors.reset}`);
+      }
+
     } catch (err) {
       ack?.({ success: false, message: "Error guardando mensaje" });
       console.error(`${colors.red}❌ Error al guardar mensaje:${colors.reset}`, err);
+    }
+  });
+
+  // ============================================================
+  // 🎧 Mensajes de audio en cualquier sala - NUEVO
+  // ============================================================
+  socket.on("audio_message", async (data = {}, ack) => {
+    try {
+      const { userId, username, audioUrl, roomId = socket.currentRoom || "general" } = data;
+      
+      console.log(`${colors.magenta}🎧 Evento → audio_message:${colors.reset}`, { 
+        userId, 
+        username, 
+        roomId,
+        audioUrl: audioUrl ? `✅ Presente` : "❌ Ausente" 
+      });
+
+      if (!userId || !username || !audioUrl) {
+        return ack?.({ success: false, message: "❌ Datos de audio inválidos" });
+      }
+
+      if (!socket.currentRoom || !chatRooms.has(roomId)) {
+        return ack?.({ success: false, message: "❌ No estás en una sala válida" });
+      }
+
+      const message = { 
+        id: uuidv4(), 
+        userId, 
+        username, 
+        roomId: roomId, 
+        audioUrl: audioUrl,
+        type: "audio",
+        content: "[Audio]",
+        timestamp: Date.now() 
+      };
+
+      try {
+        // Guardar en Firebase
+        await db.collection(MESSAGES_COLLECTION).add(message);
+        
+        // Incrementar contador de mensajes en la sala
+        const room = chatRooms.get(roomId);
+        if (room) {
+          room.messageCount++;
+        }
+        
+        // Enviar a todos en la sala específica
+        io.to(roomId).emit("audio_message", message);
+        socket.emit("message_sent", message);
+        
+        ack?.({ success: true, id: message.id });
+
+        // Log especial para emergencias
+        if (roomId.startsWith("emergencia_")) {
+          console.log(`${colors.red}🚨 ${username} → EMERGENCIA ${roomId}: [Audio]${colors.reset}`);
+        } else {
+          console.log(`${colors.magenta}🎧 ${username} → ${roomId}: [Audio]${colors.reset}`);
+        }
+
+      } catch (err) {
+        ack?.({ success: false, message: "Error guardando mensaje de audio" });
+        console.error(`${colors.red}❌ Error al guardar mensaje de audio:${colors.reset}`, err);
+      }
+
+    } catch (error) {
+      console.error(`${colors.red}❌ Error en audio_message:${colors.reset}`, error);
+      ack?.({ success: false, message: error.message });
+    }
+  });
+
+  // ============================================================
+  // 🔥 NUEVO: Solicitar lista de usuarios en sala
+  // ============================================================
+  socket.on("request_user_list", (data = {}, ack) => {
+    const { roomId } = data;
+    
+    if (!roomId) {
+      return ack?.({ success: false, message: "❌ Sala no especificada" });
+    }
+
+    try {
+      const room = chatRooms.get(roomId);
+      if (!room) {
+        return ack?.({ success: false, message: "Sala no encontrada" });
+      }
+
+      const usersInRoom = Array.from(room.users).map(userId => {
+        const userInfo = connectedUsers.get(userId);
+        return userInfo ? userInfo.userData : null;
+      }).filter(Boolean);
+
+      ack?.({ 
+        success: true, 
+        roomId: roomId,
+        users: usersInRoom 
+      });
+
+      console.log(`${colors.blue}👥 Lista usuarios en ${roomId}:${colors.reset} ${usersInRoom.length} usuarios`);
+
+    } catch (error) {
+      console.error(`${colors.red}❌ Error obteniendo lista de usuarios:${colors.reset}`, error);
+      ack?.({ success: false, message: "Error obteniendo usuarios" });
+    }
+  });
+
+  // ============================================================
+  // 🔥 NUEVO: Solicitar salas disponibles
+  // ============================================================
+  socket.on("request_available_rooms", (data = {}, ack) => {
+    try {
+      const roomsArray = Array.from(chatRooms.values()).map(room => ({
+        id: room.id,
+        name: room.name,
+        type: room.type,
+        description: room.description,
+        userCount: room.users.size,
+        messageCount: room.messageCount
+      }));
+
+      ack?.({ 
+        success: true, 
+        rooms: roomsArray 
+      });
+
+      console.log(`${colors.blue}🏪 Salas disponibles enviadas:${colors.reset} ${roomsArray.length} salas`);
+
+    } catch (error) {
+      console.error(`${colors.red}❌ Error obteniendo salas:${colors.reset}`, error);
+      ack?.({ success: false, message: "Error obteniendo salas" });
     }
   });
 
@@ -935,6 +1387,35 @@ socket.on("emergency_alert", async (data = {}, ack) => {
     }
 
     // ============================================================
+    // 🆕 Crear sala de emergencia automáticamente
+    // ============================================================
+    const emergencyRoomId = `emergencia_${userId}_${Date.now()}`;
+    const emergencyRoom = {
+      id: emergencyRoomId,
+      name: `Emergencia ${userName}`,
+      type: "emergency",
+      description: `Sala de emergencia para ${userName}`,
+      users: new Set([userId]), // El usuario en emergencia se une automáticamente
+      createdAt: Date.now(),
+      messageCount: 0,
+      emergencyData: data
+    };
+
+    chatRooms.set(emergencyRoomId, emergencyRoom);
+
+    // Unir al usuario a su sala de emergencia
+    socket.join(emergencyRoomId);
+    socket.currentRoom = emergencyRoomId;
+
+    // Notificar a todos sobre la nueva sala de emergencia
+    io.emit("new_room_created", {
+      ...emergencyRoom,
+      userCount: 1
+    });
+
+    console.log(`${colors.red}🚨 Sala de emergencia creada: ${emergencyRoomId}${colors.reset}`);
+
+    // ============================================================
     // 🔥 Notificar a los demás usuarios conectados - VERSIÓN MEJORADA
     // ============================================================
     const nearbyUsers = getNearbyUsers(latitude, longitude, 50); // 50 km de radio
@@ -951,7 +1432,10 @@ socket.on("emergency_alert", async (data = {}, ack) => {
           tieneVehiculo: !!emergencyData.vehicleInfo
         });
         
-        io.to(nearbySocketId).emit("emergency_alert", emergencyData);
+        io.to(nearbySocketId).emit("emergency_alert", {
+          ...emergencyData,
+          emergencyRoomId: emergencyRoomId // 🆕 Incluir ID de sala de emergencia
+        });
         notifiedCount++;
       }
     });
@@ -969,14 +1453,16 @@ socket.on("emergency_alert", async (data = {}, ack) => {
       vehicle: vehicleData,
       avatarUrl: avatarUrl, // ✅ Incluir info del avatar en la respuesta
       notifiedUsers: notifiedCount,
-      totalNearbyUsers: nearbyUsers.length
+      totalNearbyUsers: nearbyUsers.length,
+      emergencyRoomId: emergencyRoomId // 🆕 Incluir ID de sala de emergencia
     };
 
     console.log(`${colors.green}✅ Respuesta al emisor:${colors.reset}`, {
       success: response.success,
       notifiedUsers: response.notifiedUsers,
       tieneAvatar: !!response.avatarUrl,
-      tieneVehiculo: !!response.vehicle
+      tieneVehiculo: !!response.vehicle,
+      emergencyRoomId: response.emergencyRoomId
     });
 
     ack?.(response);
@@ -1125,7 +1611,7 @@ socket.on("emergency_alert", async (data = {}, ack) => {
   });
 
   // ============================================================
-  // 🛑 Cancelar emergencia
+  // 🛑 Cancelar emergencia - MEJORADO
   // ============================================================
   socket.on("cancel_emergency", async (data = {}, ack) => {
     try {
@@ -1134,6 +1620,40 @@ socket.on("emergency_alert", async (data = {}, ack) => {
 
       if (!userId) {
         return ack?.({ success: false, message: "userId requerido" });
+      }
+
+      // 🆕 Buscar y eliminar sala de emergencia asociada
+      let emergencyRoomId = null;
+      for (const [roomId, room] of chatRooms.entries()) {
+        if (room.type === "emergency" && room.users.has(userId)) {
+          emergencyRoomId = roomId;
+          break;
+        }
+      }
+
+      if (emergencyRoomId) {
+        // Notificar a usuarios en la sala
+        io.to(emergencyRoomId).emit("emergency_room_closed", {
+          roomId: emergencyRoomId,
+          message: "Emergencia resuelta - Sala cerrada"
+        });
+
+        // Forzar a todos a salir de la sala
+        const room = chatRooms.get(emergencyRoomId);
+        if (room) {
+          room.users.forEach(userId => {
+            const userSockets = connectedUsers.get(userId);
+            if (userSockets) {
+              userSockets.sockets.forEach(socketId => {
+                io.sockets.sockets.get(socketId)?.leave(emergencyRoomId);
+              });
+            }
+          });
+        }
+
+        // Eliminar sala
+        chatRooms.delete(emergencyRoomId);
+        console.log(`${colors.blue}🛑 Sala de emergencia eliminada: ${emergencyRoomId}${colors.reset}`);
       }
 
       // Remover de memoria
@@ -1194,11 +1714,12 @@ socket.on("emergency_alert", async (data = {}, ack) => {
   });
 
   // ============================================================
-  // 🔴 Desconexión
+  // 🔴 Desconexión - MEJORADO
   // ============================================================
   socket.on("disconnect", (reason) => {
     const userId = socket.userId;
     const username = socket.username;
+    const currentRoom = socket.currentRoom;
     
     console.log(`${colors.red}🔌 Socket desconectado:${colors.reset} ${username || socket.id} (${reason})`);
 
@@ -1209,6 +1730,11 @@ socket.on("emergency_alert", async (data = {}, ack) => {
         if (entry.sockets.size === 0) {
           connectedUsers.delete(userId);
           
+          // 🆕 Remover usuario de todas las salas
+          chatRooms.forEach(room => {
+            room.users.delete(userId);
+          });
+
           // Si el usuario tenía una emergencia activa, cancelarla
           if (emergencyAlerts.has(userId)) {
             emergencyAlerts.delete(userId);
@@ -1220,9 +1746,23 @@ socket.on("emergency_alert", async (data = {}, ack) => {
           console.log(`${colors.red}🔴 Usuario ${username} completamente desconectado.${colors.reset}`);
         }
       }
+
+      // 🆕 Notificar salida de la sala actual
+      if (currentRoom) {
+        socket.to(currentRoom).emit("user_left_room", {
+          userId: userId,
+          username: username,
+          roomId: currentRoom,
+          message: `${username} se desconectó`,
+          timestamp: Date.now()
+        });
+
+        // 🆕 Actualizar lista de usuarios en la sala
+        updateRoomUserList(currentRoom);
+      }
     }
 
-    // Actualizar lista de usuarios para todos
+    // Actualizar lista global de usuarios
     io.emit(
       "connected_users",
       Array.from(connectedUsers.values()).map((u) => ({
@@ -1240,8 +1780,13 @@ const PORT = process.env.PORT || 8080;
 server.listen(PORT, () => {
   console.log(`${colors.green}🚀 Servidor de chat corriendo en puerto ${PORT}${colors.reset}`);
   console.log(`${colors.cyan}🌐 http://localhost:${PORT}${colors.reset}`);
-  console.log(`${colors.blue}💬 Chat General activo${colors.reset}`);
+  console.log(`${colors.blue}💬 Sistema de salas activo${colors.reset}`);
+  console.log(`${colors.green}🏪 Salas disponibles:${colors.reset}`);
+  Array.from(chatRooms.values()).forEach(room => {
+    console.log(`${colors.green}   - ${room.name} (${room.id})${colors.reset}`);
+  });
   console.log(`${colors.red}🚨 Sistema de Emergencia activo${colors.reset}`);
   console.log(`${colors.green}🚗 Soporte para vehículos activo${colors.reset}`);
+  console.log(`${colors.magenta}🎧 Soporte para audio activo${colors.reset}`);
   console.log(`${colors.magenta}📍 Filtrado por ubicación activo (50km)${colors.reset}`);
 });
