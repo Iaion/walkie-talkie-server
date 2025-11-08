@@ -163,6 +163,38 @@ function updateRoomUserList(roomId) {
     userCount: usersInRoom.length
   });
 }
+// ============================================================
+// 🔧 Helpers de emisión por userId → socketIds
+// ============================================================
+function emitToUser(userId, event, payload) {
+  const entry = connectedUsers.get(userId);
+  if (!entry) return 0; // usuario offline o sin sockets
+  let count = 0;
+  entry.sockets.forEach((sid) => {
+    const s = io.sockets.sockets.get(sid);
+    if (s) {
+      s.emit(event, payload);
+      count++;
+    }
+  });
+  return count; // cantidad de sockets notificados
+}
+
+function emitToUserExcept(userId, exceptSocketId, event, payload) {
+  const entry = connectedUsers.get(userId);
+  if (!entry) return 0;
+  let count = 0;
+  entry.sockets.forEach((sid) => {
+    if (sid === exceptSocketId) return;
+    const s = io.sockets.sockets.get(sid);
+    if (s) {
+      s.emit(event, payload);
+      count++;
+    }
+  });
+  return count;
+}
+
 
 // ============================================================
 // 🖼️ Subida de avatar en base64 (Firebase Storage optimizada)
@@ -1478,102 +1510,107 @@ socket.on("emergency_alert", async (data = {}, ack) => {
 });
 
   // ============================================================
-  // 📍 Actualizar ubicación durante emergencia
-  // ============================================================
-  socket.on("update_emergency_location", async (data = {}, ack) => {
-    try {
-      const { userId, userName, latitude, longitude, timestamp } = data;
-      console.log(`${colors.blue}📍 Evento → update_emergency_location:${colors.reset}`, { userId, userName, latitude, longitude });
+// 📍 Actualizar ubicación durante emergencia (userId → sockets)
+// ============================================================
+socket.on("update_emergency_location", async (data = {}, ack) => {
+  try {
+    const { userId, userName, latitude, longitude, timestamp } = data;
+    console.log(`${colors.blue}📍 Evento → update_emergency_location:${colors.reset}`, { userId, userName, latitude, longitude });
 
-      if (!userId) {
-        return ack?.({ success: false, message: "userId requerido" });
-      }
-
-      // Actualizar en memoria
-      const existingAlert = emergencyAlerts.get(userId);
-      if (existingAlert) {
-        existingAlert.latitude = latitude;
-        existingAlert.longitude = longitude;
-        existingAlert.timestamp = timestamp || Date.now();
-      }
-
-      // Notificar a los ayudantes
-      const helpers = emergencyHelpers.get(userId) || new Set();
-      helpers.forEach(helperId => {
-        io.to(helperId).emit("helper_location_update", {
-          userId,
-          userName,
-          latitude,
-          longitude,
-          timestamp: timestamp || Date.now()
-        });
-      });
-
-      ack?.({ success: true, message: "Ubicación actualizada" });
-    } catch (error) {
-      console.error(`${colors.red}❌ Error en update_emergency_location:${colors.reset}`, error);
-      ack?.({ success: false, message: error.message });
+    if (!userId) {
+      return ack?.({ success: false, message: "userId requerido" });
     }
-  });
 
-  // ============================================================
-  // ✅ Confirmar ayuda a una emergencia - VERSIÓN CORREGIDA
-  // ============================================================
-  socket.on("confirm_help", async (data = {}, ack) => {
-    try {
-      const { emergencyUserId, helperId, helperName, latitude, longitude, timestamp } = data;
-      console.log(`${colors.green}✅ Evento → confirm_help:${colors.reset}`, { emergencyUserId, helperId, helperName });
+    // Actualizar en memoria
+    const existingAlert = emergencyAlerts.get(userId);
+    if (existingAlert) {
+      existingAlert.latitude = latitude;
+      existingAlert.longitude = longitude;
+      existingAlert.timestamp = timestamp || Date.now();
+    }
 
-      if (!emergencyUserId || !helperId) {
-        return ack?.({ success: false, message: "Datos de ayuda inválidos" });
-      }
-
-      // Agregar ayudante a la emergencia
-      const helpers = emergencyHelpers.get(emergencyUserId) || new Set();
-      helpers.add(helperId);
-      emergencyHelpers.set(emergencyUserId, helpers);
-
-      // Notificar al usuario en emergencia
-      const emergencyAlert = emergencyAlerts.get(emergencyUserId);
-      if (emergencyAlert && emergencyAlert.socketId) {
-        io.to(emergencyAlert.socketId).emit("help_confirmed", {
-          emergencyUserId,
-          helperId,
-          helperName,
-          latitude,
-          longitude,
-          timestamp: timestamp || Date.now()
-        });
-      }
-
-      // Notificar a todos los ayudantes
-      helpers.forEach(hId => {
-        if (hId !== helperId) {
-          io.to(hId).emit("helper_location_update", {
-            userId: helperId,
-            userName: helperName,
-            latitude,
-            longitude,
-            timestamp: timestamp || Date.now()
-          });
-        }
-      });
-
-      // 🔥 NUEVO: Notificar a TODOS los usuarios que el ayudante confirmó (para cerrar notificaciones)
-      io.emit("helper_confirmed_notification", {
-        emergencyUserId,
-        helperId,
-        helperName,
+    // Notificar a los ayudantes (userIds → TODOS sus sockets)
+    const helpers = emergencyHelpers.get(userId) || new Set();
+    helpers.forEach(helperUserId => {
+      emitToUser(helperUserId, "helper_location_update", {
+        userId,
+        userName,
+        latitude,
+        longitude,
         timestamp: timestamp || Date.now()
       });
+    });
 
-      console.log(`${colors.green}✅ ${helperName} confirmó ayuda para ${emergencyUserId}${colors.reset}`);
-      ack?.({ success: true, message: "Ayuda confirmada" });
-    } catch (error) {
-      console.error(`${colors.red}❌ Error en confirm_help:${colors.reset}`, error);
-      ack?.({ success: false, message: error.message });
+    ack?.({ success: true, message: "Ubicación actualizada" });
+  } catch (error) {
+    console.error(`${colors.red}❌ Error en update_emergency_location:${colors.reset}`, error);
+    ack?.({ success: false, message: error.message });
+  }
+});
+
+  // ============================================================
+// ✅ Confirmar ayuda a una emergencia (userId → sockets)
+// ============================================================
+socket.on("confirm_help", async (data = {}, ack) => {
+  try {
+    const { emergencyUserId, helperId, helperName, latitude, longitude, timestamp } = data;
+    console.log(`${colors.green}✅ Evento → confirm_help:${colors.reset}`, { emergencyUserId, helperId, helperName });
+
+    if (!emergencyUserId || !helperId) {
+      return ack?.({ success: false, message: "Datos de ayuda inválidos" });
     }
-  });
+
+    // Agregar ayudante a la emergencia (guardamos userIds)
+    const helpers = emergencyHelpers.get(emergencyUserId) || new Set();
+    helpers.add(helperId);
+    emergencyHelpers.set(emergencyUserId, helpers);
+
+    // Notificar al usuario en emergencia (preferimos socketId si lo tenemos)
+    const emergencyAlert = emergencyAlerts.get(emergencyUserId);
+    const payloadConfirmed = {
+      emergencyUserId,
+      helperId,
+      helperName,
+      latitude,
+      longitude,
+      timestamp: timestamp || Date.now()
+    };
+
+    if (emergencyAlert && emergencyAlert.socketId) {
+      io.to(emergencyAlert.socketId).emit("help_confirmed", payloadConfirmed);
+    } else {
+      // Fallback por userId → TODOS sus sockets
+      emitToUser(emergencyUserId, "help_confirmed", payloadConfirmed);
+    }
+
+    // Notificar a todos los ayudantes (menos el que recién confirmó) con su ubicación
+    helpers.forEach(hUserId => {
+      if (hUserId !== helperId) {
+        emitToUser(hUserId, "helper_location_update", {
+          userId: helperId,
+          userName: helperName,
+          latitude,
+          longitude,
+          timestamp: timestamp || Date.now()
+        });
+      }
+    });
+
+    // Notificación global para cerrar banners/toasts en otros clientes
+    io.emit("helper_confirmed_notification", {
+      emergencyUserId,
+      helperId,
+      helperName,
+      timestamp: timestamp || Date.now()
+    });
+
+    console.log(`${colors.green}✅ ${helperName} confirmó ayuda para ${emergencyUserId}${colors.reset}`);
+    ack?.({ success: true, message: "Ayuda confirmada" });
+  } catch (error) {
+    console.error(`${colors.red}❌ Error en confirm_help:${colors.reset}`, error);
+    ack?.({ success: false, message: error.message });
+  }
+});
 
   // ============================================================
   // ❌ Rechazar ayuda a una emergencia
@@ -1640,16 +1677,16 @@ socket.on("emergency_alert", async (data = {}, ack) => {
 
         // Forzar a todos a salir de la sala
         const room = chatRooms.get(emergencyRoomId);
-        if (room) {
-          room.users.forEach(userId => {
-            const userSockets = connectedUsers.get(userId);
-            if (userSockets) {
-              userSockets.sockets.forEach(socketId => {
-                io.sockets.sockets.get(socketId)?.leave(emergencyRoomId);
-              });
-            }
-          });
-        }
+       if (room) {
+  room.users.forEach(roomUserId => {
+    const userEntry = connectedUsers.get(roomUserId);
+    if (userEntry) {
+      userEntry.sockets.forEach(socketId => {
+        io.sockets.sockets.get(socketId)?.leave(emergencyRoomId);
+      });
+    }
+  });
+}
 
         // Eliminar sala
         chatRooms.delete(emergencyRoomId);
