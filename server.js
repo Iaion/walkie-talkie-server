@@ -1010,71 +1010,146 @@ io.on("connection", (socket) => {
   });
 
   // ============================================================
-  // 🎧 Mensajes de audio en cualquier sala - NUEVO
-  // ============================================================
-  socket.on("audio_message", async (data = {}, ack) => {
-    try {
-      const { userId, username, audioUrl, roomId = socket.currentRoom || "general" } = data;
-      
-      console.log(`${colors.magenta}🎧 Evento → audio_message:${colors.reset}`, { 
-        userId, 
-        username, 
-        roomId,
-        audioUrl: audioUrl ? `✅ Presente` : "❌ Ausente" 
-      });
+// 🎧 Mensajes de audio en cualquier sala — acepta URL o base64
+// ============================================================
+socket.on("audio_message", async (data = {}, ack) => {
+  try {
+    const { userId, username } = data;
+    let { roomId = socket.currentRoom || "general" } = data;
 
-      if (!userId || !username || !audioUrl) {
-        return ack?.({ success: false, message: "❌ Datos de audio inválidos" });
-      }
+    console.log(`${colors.magenta}🎧 Evento → audio_message${colors.reset}`, {
+      userId, username, roomId,
+      hasAudioUrl: !!data.audioUrl,
+      hasAudioData: !!data.audioData,
+      hasAudioDataUrl: !!data.audioDataUrl
+    });
 
-      if (!socket.currentRoom || !chatRooms.has(roomId)) {
-        return ack?.({ success: false, message: "❌ No estás en una sala válida" });
-      }
-
-      const message = { 
-        id: uuidv4(), 
-        userId, 
-        username, 
-        roomId: roomId, 
-        audioUrl: audioUrl,
-        type: "audio",
-        content: "[Audio]",
-        timestamp: Date.now() 
-      };
-
-      try {
-        // Guardar en Firebase
-        await db.collection(MESSAGES_COLLECTION).add(message);
-        
-        // Incrementar contador de mensajes en la sala
-        const room = chatRooms.get(roomId);
-        if (room) {
-          room.messageCount++;
-        }
-        
-        // Enviar a todos en la sala específica
-        io.to(roomId).emit("audio_message", message);
-        socket.emit("message_sent", message);
-        
-        ack?.({ success: true, id: message.id });
-
-        // Log especial para emergencias
-        if (roomId.startsWith("emergencia_")) {
-          console.log(`${colors.red}🚨 ${username} → EMERGENCIA ${roomId}: [Audio]${colors.reset}`);
-        } else {
-          console.log(`${colors.magenta}🎧 ${username} → ${roomId}: [Audio]${colors.reset}`);
-        }
-
-      } catch (err) {
-        ack?.({ success: false, message: "Error guardando mensaje de audio" });
-        console.error(`${colors.red}❌ Error al guardar mensaje de audio:${colors.reset}`, err);
-      }
-
-    } catch (error) {
-      console.error(`${colors.red}❌ Error en audio_message:${colors.reset}`, error);
-      ack?.({ success: false, message: error.message });
+    if (!userId || !username) {
+      return ack?.({ success: false, message: "❌ userId/username inválidos" });
     }
-  });
+
+    if (!chatRooms.has(roomId)) {
+      return ack?.({ success: false, message: "❌ No estás en una sala válida" });
+    }
+
+    // ============================================================
+    // 1) Normalizar: obtener una URL pública a partir de audioUrl o audioData/base64
+    // ============================================================
+    let finalAudioUrl = data.audioUrl || null;
+
+    // (A) Si ya viene una URL lista, usamos esa
+    if (finalAudioUrl && /^https?:\/\//i.test(finalAudioUrl)) {
+      console.log(`${colors.green}✅ audioUrl directo provisto${colors.reset}`);
+    }
+
+    // (B) Si viene un DataURL completo (data:audio/...)
+    else if (typeof data.audioDataUrl === "string" && data.audioDataUrl.startsWith("data:audio/")) {
+      const mime = (data.audioDataUrl.match(/^data:(audio\/[a-zA-Z0-9.+-]+);base64,/) || [])[1] || "audio/mpeg";
+      const base64 = data.audioDataUrl.split("base64,")[1] || "";
+      finalAudioUrl = await saveBase64AudioToFirebase({ base64, mime, userId, roomId });
+    }
+
+    // (C) Si viene audioData (solo base64) + mime y/o ext
+    else if (typeof data.audioData === "string" && data.audioData.length > 0) {
+      const mime = typeof data.mime === "string" && data.mime.startsWith("audio/") ? data.mime : "audio/mpeg";
+      finalAudioUrl = await saveBase64AudioToFirebase({
+        base64: data.audioData,
+        mime,
+        userId,
+        roomId,
+        ext: data.ext // opcional: "m4a","mp3","webm","ogg"
+      });
+    }
+
+    if (!finalAudioUrl) {
+      return ack?.({ success: false, message: "❌ No se pudo obtener URL de audio" });
+    }
+
+    // ============================================================
+    // 2) Construir el mensaje y persistir
+    // ============================================================
+    const message = {
+      id: uuidv4(),
+      userId,
+      username,
+      roomId,
+      type: "audio",
+      audioUrl: finalAudioUrl,
+      content: "[Audio]",
+      durationMs: typeof data.durationMs === "number" ? data.durationMs : undefined,
+      timestamp: Date.now(),
+    };
+
+    // Guardar en Firestore
+    await db.collection(MESSAGES_COLLECTION).add(message);
+
+    // Incrementar contador de mensajes de la sala
+    const room = chatRooms.get(roomId);
+    if (room) room.messageCount++;
+
+    // Emitir a la sala
+    io.to(roomId).emit("audio_message", message);
+    socket.emit("message_sent", { id: message.id, ...message });
+
+    // Logs diferenciados
+    if (roomId.startsWith("emergencia_")) {
+      console.log(`${colors.red}🚨 ${username} → EMERGENCIA ${roomId}: [Audio]${colors.reset}`);
+    } else {
+      console.log(`${colors.magenta}🎧 ${username} → ${roomId}: [Audio] URL=${finalAudioUrl}${colors.reset}`);
+    }
+
+    ack?.({ success: true, id: message.id, audioUrl: finalAudioUrl });
+
+  } catch (err) {
+    console.error(`${colors.red}❌ Error en audio_message:${colors.reset}`, err);
+    ack?.({ success: false, message: "Error guardando mensaje de audio" });
+  }
+});
+
+// ============================================================
+// 💾 Helper: guardar base64 en Firebase Storage y devolver URL
+// ============================================================
+async function saveBase64AudioToFirebase({ base64, mime = "audio/mpeg", userId, roomId, ext }) {
+  try {
+    const buffer = Buffer.from(base64, "base64");
+    // tamaño básico de seguridad (25 MB JSON en Express; vos ya configuraste 25MB)
+    if (buffer.length > 20 * 1024 * 1024) { // 20MB hard stop
+      throw new Error("Archivo de audio demasiado grande (>20MB)");
+    }
+
+    // Extensión por mime si no viene
+    let extension = ext;
+    if (!extension) {
+      if (mime.includes("mpeg") || mime.includes("mp3")) extension = "mp3";
+      else if (mime.includes("mp4") || mime.includes("aac") || mime.includes("m4a")) extension = "m4a";
+      else if (mime.includes("webm")) extension = "webm";
+      else if (mime.includes("ogg") || mime.includes("opus")) extension = "ogg";
+      else extension = "mp3";
+    }
+
+    const objectPath = `audios/${roomId}/${userId}/${Date.now()}_${uuidv4()}.${extension}`;
+    const file = bucket.file(objectPath);
+
+    await file.save(buffer, {
+      contentType: mime,
+      resumable: false,
+      gzip: false, // audio ya comprimido
+      metadata: {
+        cacheControl: "public, max-age=31536000",
+        metadata: { userId, roomId },
+      },
+    });
+
+    await file.makePublic();
+    const url = file.publicUrl();
+    console.log(`${colors.green}✅ Audio subido a Storage:${colors.reset} ${url}`);
+    return url;
+  } catch (e) {
+    console.error(`${colors.red}❌ Error guardando audio en Storage:${colors.reset}`, e);
+    throw e;
+  }
+}
+
 
   // ============================================================
   // 🔥 NUEVO: Solicitar lista de usuarios en sala
