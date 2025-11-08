@@ -1590,7 +1590,7 @@ socket.on("emergency_alert", async (data = {}, ack) => {
 socket.on("update_emergency_location", async (data = {}, ack) => {
   try {
     const { userId, userName, latitude, longitude, timestamp } = data;
-    console.log(`${colors.blue}📍 Evento → update_emergency_location:${colors.reset}`, { userId, userName, latitude, longitude });
+   // console.log(`${colors.blue}📍 Evento → update_emergency_location:${colors.reset}`, { userId, userName, latitude, longitude });
 
     if (!userId) {
       return ack?.({ success: false, message: "userId requerido" });
