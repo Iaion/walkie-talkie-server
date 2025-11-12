@@ -64,12 +64,19 @@ const VEHICULOS_COLLECTION = "vehiculos";
 const EMERGENCIAS_COLLECTION = "emergencias";
 
 // ============================================================
-// 📦 Estado en memoria
+// 📦 Estado en memoria (ampliado)
 // ============================================================
 const connectedUsers = new Map();
-const emergencyAlerts = new Map(); // userId -> emergencyData
-const emergencyHelpers = new Map(); // emergencyUserId -> Set(helperUserIds)
-const chatRooms = new Map(); // 🆕 Sistema de salas
+/*
+  connectedUsers.set(userId, {
+    userData: { ...user, isOnline: true, currentRoom, lastKnownLocation?: { lat, lng, ts } },
+    sockets: Set<string>
+  })
+*/
+const emergencyAlerts = new Map();         // userId -> emergencyData
+const emergencyHelpers = new Map();        // emergencyUserId -> Set(helperUserIds)
+const chatRooms = new Map();               // rooms en memoria
+const emergencyUserRoom = new Map();       // 🆕 userIdEmergencia -> emergencyRoomId (lookup rápido)
 
 // ============================================================
 // 🏗️ Inicializar salas de chat por defecto
@@ -133,17 +140,27 @@ function calculateDistance(lat1, lon1, lat2, lon2) {
   return R * c;
 }
 
-// 🔥 NUEVO: Helper para obtener todos los usuarios conectados (sin límite de distancia)
-function getNearbyUsers(alertLat, alertLng, radiusKm) {
-  const allSockets = [];
+// 🔥 Helper: Sockets de usuarios dentro de un radio (km) según lastKnownLocation
+function getNearbyUsers(alertLat, alertLng, radiusKm = 50) {
+  const socketsWithin = [];
 
-  connectedUsers.forEach((userData) => {
-    userData.sockets.forEach(socketId => {
-      allSockets.push(socketId);
-    });
+  connectedUsers.forEach(({ userData, sockets }) => {
+    const loc = userData?.lastKnownLocation;
+    if (loc && typeof loc.lat === "number" && typeof loc.lng === "number") {
+      const d = calculateDistance(alertLat, alertLng, loc.lat, loc.lng);
+      if (d <= radiusKm) {
+        sockets.forEach((sid) => socketsWithin.push(sid));
+      }
+    }
   });
 
-  return allSockets;
+  // 🔁 Fallback: si no hay nadie con ubicación conocida, notificar a todos
+  if (socketsWithin.length === 0) {
+    connectedUsers.forEach(({ sockets }) => {
+      sockets.forEach((sid) => socketsWithin.push(sid));
+    });
+  }
+  return socketsWithin;
 }
 
 // 🆕 Función helper para actualizar lista de usuarios en sala
@@ -163,6 +180,7 @@ function updateRoomUserList(roomId) {
     userCount: usersInRoom.length
   });
 }
+
 // ============================================================
 // 🔧 Helpers de emisión por userId → socketIds
 // ============================================================
@@ -194,7 +212,6 @@ function emitToUserExcept(userId, exceptSocketId, event, payload) {
   });
   return count;
 }
-
 
 // ============================================================
 // 🖼️ Subida de avatar en base64 (Firebase Storage optimizada)
@@ -503,7 +520,6 @@ app.post("/vehiculo", async (req, res) => {
   }
 });
 
-
 // ============================================================
 // 🚗 Subir foto de vehículo o casco + Guardar URL en Firestore - VERSIÓN CORREGIDA
 // ============================================================
@@ -725,15 +741,31 @@ io.on("connection", (socket) => {
       generalRoom.users.add(userId);
     }
 
-    // Actualizar estado de usuarios conectados
+    // Actualizar estado de usuarios conectados (con lastKnownLocation opcional)
+    const now = Date.now();
+    const incomingLoc = (typeof user.lat === "number" && typeof user.lng === "number")
+      ? { lat: user.lat, lng: user.lng, ts: now }
+      : undefined;
+
     const existing = connectedUsers.get(userId);
     if (existing) {
       existing.sockets.add(socket.id);
-      existing.userData = { ...existing.userData, ...user, isOnline: true };
+      existing.userData = {
+        ...existing.userData,
+        ...user,
+        isOnline: true,
+        currentRoom: defaultRoom,
+        lastKnownLocation: incomingLoc || existing.userData.lastKnownLocation
+      };
     } else {
-      connectedUsers.set(userId, { 
-        userData: { ...user, isOnline: true, currentRoom: defaultRoom }, 
-        sockets: new Set([socket.id]) 
+      connectedUsers.set(userId, {
+        userData: {
+          ...user,
+          isOnline: true,
+          currentRoom: defaultRoom,
+          lastKnownLocation: incomingLoc
+        },
+        sockets: new Set([socket.id])
       });
     }
 
@@ -787,6 +819,32 @@ io.on("connection", (socket) => {
 
     ack?.({ success: true });
     console.log(`${colors.green}✅ ${username} conectado al chat general${colors.reset}`);
+  });
+
+  // ============================================================
+  // 📍 Actualizar ubicación general del usuario (no-emergencia)
+  // ============================================================
+  socket.on("update_location", (data = {}, ack) => {
+    try {
+      const { userId, lat, lng, timestamp } = data;
+      if (!userId || typeof lat !== "number" || typeof lng !== "number") {
+        return ack?.({ success: false, message: "Datos inválidos" });
+      }
+      const entry = connectedUsers.get(userId);
+      if (entry) {
+        entry.userData.lastKnownLocation = {
+          lat,
+          lng,
+          ts: typeof timestamp === "number" ? timestamp : Date.now()
+        };
+        ack?.({ success: true });
+      } else {
+        ack?.({ success: false, message: "Usuario no conectado" });
+      }
+    } catch (e) {
+      console.error("❌ update_location error:", e);
+      ack?.({ success: false, message: e.message });
+    }
   });
 
   // ============================================================
@@ -1150,7 +1208,6 @@ async function saveBase64AudioToFirebase({ base64, mime = "audio/mpeg", userId, 
   }
 }
 
-
   // ============================================================
   // 🔥 NUEVO: Solicitar lista de usuarios en sala
   // ============================================================
@@ -1494,85 +1551,71 @@ socket.on("emergency_alert", async (data = {}, ack) => {
     }
 
     // ============================================================
-    // 🆕 Crear sala de emergencia automáticamente
+    // 🆕 Crear sala de emergencia (id estable por usuario mientras dure la emergencia)
     // ============================================================
-    const emergencyRoomId = `emergencia_${userId}_${Date.now()}`;
+    const createdAt = Date.now();
+    const emergencyRoomId = `emergencia_${userId}_${createdAt}`;
+
     const emergencyRoom = {
       id: emergencyRoomId,
       name: `Emergencia ${userName}`,
       type: "emergency",
       description: `Sala de emergencia para ${userName}`,
-      users: new Set([userId]), // El usuario en emergencia se une automáticamente
-      createdAt: Date.now(),
+      users: new Set([userId]),
+      createdAt,
       messageCount: 0,
       emergencyData: data
     };
 
     chatRooms.set(emergencyRoomId, emergencyRoom);
+    emergencyUserRoom.set(userId, emergencyRoomId); // 🗺️ Lookup rápido
 
-    // Unir al usuario a su sala de emergencia
+    // Unir al usuario emisor
     socket.join(emergencyRoomId);
     socket.currentRoom = emergencyRoomId;
 
-    // Notificar a todos sobre la nueva sala de emergencia
+    // Anunciar nueva sala
     io.emit("new_room_created", {
-      ...emergencyRoom,
-      userCount: 1
+      id: emergencyRoom.id,
+      name: emergencyRoom.name,
+      type: emergencyRoom.type,
+      description: emergencyRoom.description,
+      userCount: emergencyRoom.users.size,
+      messageCount: emergencyRoom.messageCount,
+      createdAt: emergencyRoom.createdAt
     });
 
     console.log(`${colors.red}🚨 Sala de emergencia creada: ${emergencyRoomId}${colors.reset}`);
 
-    // ============================================================
-    // 🔥 Notificar a los demás usuarios conectados - VERSIÓN MEJORADA
-    // ============================================================
-    const nearbyUsers = getNearbyUsers(latitude, longitude, 50); // 50 km de radio
-    
-    console.log(`${colors.blue}👥 Usuarios cercanos encontrados: ${nearbyUsers.length}${colors.reset}`);
-    
+    // 🔥 Notificar a usuarios cercanos (50 km) o a todos si nadie tiene ubicación
+    const nearbyUsers = getNearbyUsers(latitude, longitude, 50);
+    console.log(`${colors.blue}👥 Usuarios a notificar: ${nearbyUsers.length}${colors.reset}`);
+
     let notifiedCount = 0;
     nearbyUsers.forEach((nearbySocketId) => {
       if (nearbySocketId !== socket.id) {
-        // 🔍 DEBUG de lo que se envía a cada usuario
-        console.log(`${colors.magenta}📤 Enviando a socket: ${nearbySocketId}${colors.reset}`, {
-          userName: emergencyData.userName,
-          tieneAvatar: !!emergencyData.avatarUrl,
-          tieneVehiculo: !!emergencyData.vehicleInfo
-        });
-        
         io.to(nearbySocketId).emit("emergency_alert", {
           ...emergencyData,
-          emergencyRoomId: emergencyRoomId // 🆕 Incluir ID de sala de emergencia
+          emergencyRoomId
         });
         notifiedCount++;
       }
     });
 
     console.log(
-      `${colors.red}📢 ALERTA DIFUNDIDA:${colors.reset} ${userName} → ${notifiedCount}/${nearbyUsers.length} usuarios notificados`
+      `${colors.red}📢 ALERTA DIFUNDIDA:${colors.reset} ${userName} → ${notifiedCount}/${nearbyUsers.length} usuarios`
     );
 
-    // ============================================================
-    // ✅ Responder al emisor - VERSIÓN MEJORADA
-    // ============================================================
-    const response = {
+    // ✅ Ack con info clave
+    ack?.({
       success: true,
       message: "Alerta de emergencia enviada correctamente",
       vehicle: vehicleData,
-      avatarUrl: avatarUrl, // ✅ Incluir info del avatar en la respuesta
+      avatarUrl: avatarUrl,
       notifiedUsers: notifiedCount,
       totalNearbyUsers: nearbyUsers.length,
-      emergencyRoomId: emergencyRoomId // 🆕 Incluir ID de sala de emergencia
-    };
-
-    console.log(`${colors.green}✅ Respuesta al emisor:${colors.reset}`, {
-      success: response.success,
-      notifiedUsers: response.notifiedUsers,
-      tieneAvatar: !!response.avatarUrl,
-      tieneVehiculo: !!response.vehicle,
-      emergencyRoomId: response.emergencyRoomId
+      emergencyRoomId
     });
-
-    ack?.(response);
 
   } catch (error) {
     console.error(`${colors.red}❌ Error en emergency_alert:${colors.reset}`, error);
@@ -1734,16 +1777,10 @@ socket.on("confirm_help", async (data = {}, ack) => {
         return ack?.({ success: false, message: "userId requerido" });
       }
 
-      // 🆕 Buscar y eliminar sala de emergencia asociada
-      let emergencyRoomId = null;
-      for (const [roomId, room] of chatRooms.entries()) {
-        if (room.type === "emergency" && room.users.has(userId)) {
-          emergencyRoomId = roomId;
-          break;
-        }
-      }
+      // Buscar sala por índice directo
+      const emergencyRoomId = emergencyUserRoom.get(userId);
 
-      if (emergencyRoomId) {
+      if (emergencyRoomId && chatRooms.has(emergencyRoomId)) {
         // Notificar a usuarios en la sala
         io.to(emergencyRoomId).emit("emergency_room_closed", {
           roomId: emergencyRoomId,
@@ -1752,19 +1789,25 @@ socket.on("confirm_help", async (data = {}, ack) => {
 
         // Forzar a todos a salir de la sala
         const room = chatRooms.get(emergencyRoomId);
-       if (room) {
-  room.users.forEach(roomUserId => {
-    const userEntry = connectedUsers.get(roomUserId);
-    if (userEntry) {
-      userEntry.sockets.forEach(socketId => {
-        io.sockets.sockets.get(socketId)?.leave(emergencyRoomId);
-      });
-    }
-  });
-}
+        if (room) {
+          room.users.forEach(roomUserId => {
+            const entry = connectedUsers.get(roomUserId);
+            if (entry) {
+              entry.sockets.forEach(socketId => {
+                io.sockets.sockets.get(socketId)?.leave(emergencyRoomId);
+              });
+            }
+            // Limpiar estado de sala del usuario si coincide
+            const entry2 = connectedUsers.get(roomUserId);
+            if (entry2 && entry2.userData?.currentRoom === emergencyRoomId) {
+              entry2.userData.currentRoom = null;
+            }
+          });
+        }
 
-        // Eliminar sala
+        // Eliminar sala y mapping
         chatRooms.delete(emergencyRoomId);
+        emergencyUserRoom.delete(userId);
         console.log(`${colors.blue}🛑 Sala de emergencia eliminada: ${emergencyRoomId}${colors.reset}`);
       }
 
@@ -1853,6 +1896,13 @@ socket.on("confirm_help", async (data = {}, ack) => {
             emergencyHelpers.delete(userId);
             io.emit("emergency_cancelled", { userId });
             console.log(`${colors.red}🚨 Emergencia cancelada por desconexión de ${username}${colors.reset}`);
+          }
+
+          // Si tenía sala de emergencia propia, borrarla
+          const er = emergencyUserRoom.get(userId);
+          if (er && chatRooms.has(er)) {
+            chatRooms.delete(er);
+            emergencyUserRoom.delete(userId);
           }
           
           console.log(`${colors.red}🔴 Usuario ${username} completamente desconectado.${colors.reset}`);
