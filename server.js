@@ -117,22 +117,41 @@ const utils = {
   // Usuarios cercanos
   getNearbyUsers: (alertLat, alertLng, radiusKm = 50) => {
     const socketsWithin = [];
-    state.connectedUsers.forEach(({ userData, sockets }) => {
+    
+    console.log(`${colors.blue}📍 Buscando usuarios cercanos a:${colors.reset}`, { alertLat, alertLng, radiusKm });
+    console.log(`${colors.blue}📊 Total de usuarios conectados:${colors.reset} ${state.connectedUsers.size}`);
+    
+    state.connectedUsers.forEach(({ userData, sockets }, userId) => {
       const loc = userData?.lastKnownLocation;
+      console.log(`${colors.gray}👤 Usuario ${userId}:${colors.reset}`, {
+        tieneUbicacion: !!loc,
+        ubicacion: loc,
+        sockets: Array.from(sockets || [])
+      });
+      
       if (loc && typeof loc.lat === "number" && typeof loc.lng === "number") {
         const d = utils.calculateDistance(alertLat, alertLng, loc.lat, loc.lng);
+        console.log(`${colors.gray}   📏 Distancia: ${d.toFixed(2)}km${colors.reset}`);
         if (d <= radiusKm) {
           sockets.forEach((sid) => socketsWithin.push(sid));
+          console.log(`${colors.green}   ✅ DENTRO del radio${colors.reset}`);
+        } else {
+          console.log(`${colors.yellow}   ❌ FUERA del radio${colors.reset}`);
         }
+      } else {
+        console.log(`${colors.yellow}   ⚠️ SIN ubicación válida${colors.reset}`);
       }
     });
 
     // Fallback: si no hay nadie con ubicación, notificar a todos
     if (socketsWithin.length === 0) {
+      console.log(`${colors.yellow}⚠️ No hay usuarios con ubicación, notificando a TODOS${colors.reset}`);
       state.connectedUsers.forEach(({ sockets }) => {
         sockets.forEach((sid) => socketsWithin.push(sid));
       });
     }
+    
+    console.log(`${colors.blue}👥 Sockets a notificar:${colors.reset} ${socketsWithin.length}`);
     return socketsWithin;
   },
 
@@ -478,10 +497,39 @@ app.get("/vehicles/:userId", async (req, res) => {
       .where("isActive", "==", true)
       .get();
 
-    const vehicles = snapshot.empty ? [] : snapshot.docs.map(doc => ({
-      id: doc.id,
-      ...doc.data()
-    }));
+    const vehicles = snapshot.empty ? [] : snapshot.docs.map(doc => {
+      const data = doc.data();
+      return {
+        id: doc.id,
+        // Compatibilidad: nuevos nombres + viejos nombres
+        type: data.type || data.tipo,
+        name: data.name || data.nombre,
+        brand: data.brand || data.marca,
+        model: data.model || data.modelo,
+        year: data.year,
+        color: data.color,
+        licensePlate: data.licensePlate || data.patente,
+        photoUri: data.photoUri || data.fotoVehiculoUri,
+        isPrimary: data.isPrimary,
+        isActive: data.isActive,
+        userId: data.userId,
+        createdAt: data.createdAt,
+        updatedAt: data.updatedAt,
+        // Campos específicos por tipo
+        ...(data.type === 'CAR' && {
+          doors: data.doors
+        }),
+        ...(data.type === 'MOTORCYCLE' && {
+          cylinderCapacity: data.cylinderCapacity,
+          mileage: data.mileage
+        }),
+        ...(data.type === 'BICYCLE' && {
+          frameSerialNumber: data.frameSerialNumber,
+          hasElectricMotor: data.hasElectricMotor,
+          frameSize: data.frameSize
+        })
+      };
+    });
     
     console.log(`${colors.green}✅ ${vehicles.length} vehículos encontrados para usuario ${userId}${colors.reset}`);
     res.json({ 
@@ -510,7 +558,37 @@ app.get("/vehicles/:userId/:vehicleId", async (req, res) => {
       });
     }
 
-    const vehicle = { id: doc.id, ...doc.data() };
+    const data = doc.data();
+    const vehicle = { 
+      id: doc.id,
+      // Compatibilidad: nuevos nombres + viejos nombres
+      type: data.type || data.tipo,
+      name: data.name || data.nombre,
+      brand: data.brand || data.marca,
+      model: data.model || data.modelo,
+      year: data.year,
+      color: data.color,
+      licensePlate: data.licensePlate || data.patente,
+      photoUri: data.photoUri || data.fotoVehiculoUri,
+      isPrimary: data.isPrimary,
+      isActive: data.isActive,
+      userId: data.userId,
+      createdAt: data.createdAt,
+      updatedAt: data.updatedAt,
+      // Campos específicos por tipo
+      ...(data.type === 'CAR' && {
+        doors: data.doors
+      }),
+      ...(data.type === 'MOTORCYCLE' && {
+        cylinderCapacity: data.cylinderCapacity,
+        mileage: data.mileage
+      }),
+      ...(data.type === 'BICYCLE' && {
+        frameSerialNumber: data.frameSerialNumber,
+        hasElectricMotor: data.hasElectricMotor,
+        frameSize: data.frameSize
+      })
+    };
     
     if (vehicle.userId !== userId) {
       return res.status(403).json({ 
@@ -1388,7 +1466,7 @@ io.on("connection", (socket) => {
   });
 
   // ============================================================
-  // 🚨 SISTEMA DE EMERGENCIAS
+  // 🚨 SISTEMA DE EMERGENCIAS - ACTUALIZADO
   // ============================================================
   socket.on("emergency_alert", async (data = {}, ack) => {
     try {
@@ -1401,7 +1479,10 @@ io.on("connection", (socket) => {
         emergencyType = "general",
       } = data;
 
-      console.log(`${colors.red}🚨 Evento → emergency_alert:${colors.reset}`, { userId, userName, latitude, longitude, emergencyType });
+      console.log(
+        `${colors.red}🚨 Evento → emergency_alert:${colors.reset}`,
+        { userId, userName, latitude, longitude, emergencyType }
+      );
 
       if (!userId || !userName) {
         console.warn(`${colors.yellow}⚠️ Datos de usuario faltantes${colors.reset}`);
@@ -1413,23 +1494,31 @@ io.on("connection", (socket) => {
         return ack?.({ success: false, message: "Ubicación inválida" });
       }
 
+      // ========================================================
+      // 👤 AVATAR DEL USUARIO
+      // ========================================================
       let avatarUrl = null;
       try {
         const userDoc = await db.collection(COLLECTIONS.USERS).doc(userId).get();
         if (userDoc.exists) {
           const userData = userDoc.data();
           avatarUrl = userData?.avatarUrl || userData?.avatarUri || null;
-          
+
           console.log(`${colors.green}✅ Avatar obtenido:${colors.reset}`, {
             userId: userId,
             avatarUrl: avatarUrl ? `✅ Presente` : "❌ Ausente",
-            esUrlValida: avatarUrl ? avatarUrl.startsWith('http') : false
+            esUrlValida: avatarUrl ? avatarUrl.startsWith("http") : false,
           });
         }
       } catch (e) {
-        console.warn(`${colors.yellow}⚠️ Error obteniendo avatar:${colors.reset} ${e.message}`);
+        console.warn(
+          `${colors.yellow}⚠️ Error obteniendo avatar:${colors.reset} ${e.message}`
+        );
       }
 
+      // ========================================================
+      // 🚗 VEHÍCULO PRIMARIO ASOCIADO (con compatibilidad vieja/nueva)
+      // ========================================================
       let vehicleData = null;
       try {
         const vehiculoSnap = await db
@@ -1442,40 +1531,58 @@ io.on("connection", (socket) => {
 
         if (!vehiculoSnap.empty) {
           const vehiculoDoc = vehiculoSnap.docs[0];
-          const vehiculo = vehiculoDoc.data();
-          
+          const vehiculo = vehiculoDoc.data() || {};
+
+          const typeRaw = vehiculo.type || vehiculo.tipo || null;
+
           vehicleData = {
             id: vehiculoDoc.id,
-            type: vehiculo.type,
-            name: vehiculo.name,
-            brand: vehiculo.brand,
-            model: vehiculo.model,
-            year: vehiculo.year,
-            color: vehiculo.color,
-            licensePlate: vehiculo.licensePlate,
-            photoUri: vehiculo.photoUri,
-            ...(vehiculo.type === 'CAR' && { doors: vehiculo.doors }),
-            ...(vehiculo.type === 'MOTORCYCLE' && {
-              cylinderCapacity: vehiculo.cylinderCapacity,
-              mileage: vehiculo.mileage
+            type: typeRaw,
+            // nombres comunes
+            name: vehiculo.name || vehiculo.nombre || null,
+            brand: vehiculo.brand || vehiculo.marca || null,
+            model: vehiculo.model || vehiculo.modelo || null,
+            year: vehiculo.year || null,
+            color: vehiculo.color || null,
+            licensePlate: vehiculo.licensePlate || vehiculo.patente || null,
+            photoUri: vehiculo.photoUri || vehiculo.fotoVehiculoUri || null,
+            // extras por tipo (si existen)
+            ...(typeRaw === "CAR" && {
+              doors: vehiculo.doors,
             }),
-            ...(vehiculo.type === 'BICYCLE' && {
+            ...(typeRaw === "MOTORCYCLE" && {
+              cylinderCapacity: vehiculo.cylinderCapacity,
+              mileage: vehiculo.mileage,
+            }),
+            ...(typeRaw === "BICYCLE" && {
               frameSerialNumber: vehiculo.frameSerialNumber,
               hasElectricMotor: vehiculo.hasElectricMotor,
-              frameSize: vehiculo.frameSize
-            })
+              frameSize: vehiculo.frameSize,
+            }),
           };
-          
+
           console.log(`${colors.green}✅ Vehículo primario asociado:${colors.reset}`, {
+            id: vehicleData.id,
             tipo: vehicleData.type,
             nombre: vehicleData.name,
-            marca: vehicleData.brand
+            marca: vehicleData.brand,
+            patente: vehicleData.licensePlate,
+            fotoUri: vehicleData.photoUri ? "✅" : "❌",
           });
+        } else {
+          console.log(
+            `${colors.yellow}⚠️ Usuario sin vehículo primario activo${colors.reset}`
+          );
         }
       } catch (vehErr) {
-        console.warn(`${colors.yellow}⚠️ Error obteniendo vehículo:${colors.reset} ${vehErr.message}`);
+        console.warn(
+          `${colors.yellow}⚠️ Error obteniendo vehículo:${colors.reset} ${vehErr.message}`
+        );
       }
 
+      // ========================================================
+      // 🧩 DATOS COMPLETOS DE EMERGENCIA
+      // ========================================================
       const emergencyData = {
         userId,
         userName,
@@ -1494,6 +1601,7 @@ io.on("connection", (socket) => {
         state.emergencyHelpers.set(userId, new Set());
       }
 
+      // Guardar en Firestore
       try {
         await db
           .collection(COLLECTIONS.EMERGENCIES)
@@ -1505,11 +1613,19 @@ io.on("connection", (socket) => {
             },
             { merge: true }
           );
-        console.log(`${colors.green}✅ Emergencia registrada en Firestore${colors.reset}`);
+        console.log(
+          `${colors.green}✅ Emergencia registrada en Firestore${colors.reset}`
+        );
       } catch (fireErr) {
-        console.error(`${colors.red}❌ Error guardando emergencia:${colors.reset}`, fireErr.message);
+        console.error(
+          `${colors.red}❌ Error guardando emergencia:${colors.reset}`,
+          fireErr.message
+        );
       }
 
+      // ========================================================
+      // 💬 CREAR SALA DE EMERGENCIA
+      // ========================================================
       const createdAt = Date.now();
       const emergencyRoomId = `emergencia_${userId}_${createdAt}`;
 
@@ -1521,7 +1637,7 @@ io.on("connection", (socket) => {
         users: new Set([userId]),
         createdAt,
         messageCount: 0,
-        emergencyData: data
+        emergencyData: emergencyData,
       };
 
       state.chatRooms.set(emergencyRoomId, emergencyRoom);
@@ -1537,27 +1653,53 @@ io.on("connection", (socket) => {
         description: emergencyRoom.description,
         userCount: emergencyRoom.users.size,
         messageCount: emergencyRoom.messageCount,
-        createdAt: emergencyRoom.createdAt
+        createdAt: emergencyRoom.createdAt,
       });
 
-      console.log(`${colors.red}🚨 Sala de emergencia creada: ${emergencyRoomId}${colors.reset}`);
+      console.log(
+        `${colors.red}🚨 Sala de emergencia creada: ${emergencyRoomId}${colors.reset}`
+      );
+
+      // ========================================================
+      // 📍 DEBUG DE USUARIOS CONECTADOS + FILTRO POR UBICACIÓN
+      // ========================================================
+      console.log(
+        "📊 connectedUsers size:",
+        state.connectedUsers.size
+      );
+      console.log(
+        "📊 connectedUsers detalle:",
+        Array.from(state.connectedUsers.entries()).map(([uid, info]) => ({
+          userId: uid,
+          sockets: Array.from(info.sockets || []),
+          lastKnownLocation: info.userData?.lastKnownLocation || null,
+        }))
+      );
 
       const nearbyUsers = utils.getNearbyUsers(latitude, longitude, 50);
-      console.log(`${colors.blue}👥 Usuarios a notificar: ${nearbyUsers.length}${colors.reset}`);
+      console.log(
+        `${colors.blue}👥 Usuarios a notificar: ${nearbyUsers.length}${colors.reset}`
+      );
 
+      // ========================================================
+      // 📢 ENVIAR ALERTA A USUARIOS CERCANOS
+      // ========================================================
       let notifiedCount = 0;
       nearbyUsers.forEach((nearbySocketId) => {
         if (nearbySocketId !== socket.id) {
           io.to(nearbySocketId).emit("emergency_alert", {
             ...emergencyData,
-            emergencyRoomId
+            emergencyRoomId,
           });
           notifiedCount++;
         }
       });
 
-      console.log(`${colors.red}📢 ALERTA DIFUNDIDA:${colors.reset} ${userName} → ${notifiedCount}/${nearbyUsers.length} usuarios`);
+      console.log(
+        `${colors.red}📢 ALERTA DIFUNDIDA:${colors.reset} ${userName} → ${notifiedCount}/${nearbyUsers.length} usuarios`
+      );
 
+      // Respuesta al cliente que originó la emergencia
       ack?.({
         success: true,
         message: "Alerta de emergencia enviada correctamente",
@@ -1565,15 +1707,17 @@ io.on("connection", (socket) => {
         avatarUrl: avatarUrl,
         notifiedUsers: notifiedCount,
         totalNearbyUsers: nearbyUsers.length,
-        emergencyRoomId
+        emergencyRoomId,
       });
-
     } catch (error) {
-      console.error(`${colors.red}❌ Error en emergency_alert:${colors.reset}`, error);
-      ack?.({ 
-        success: false, 
+      console.error(
+        `${colors.red}❌ Error en emergency_alert:${colors.reset}`,
+        error
+      );
+      ack?.({
+        success: false,
         message: error.message,
-        errorDetails: "Error procesando alerta de emergencia"
+        errorDetails: "Error procesando alerta de emergencia",
       });
     }
   });
