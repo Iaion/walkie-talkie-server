@@ -1699,6 +1699,11 @@ io.on("connection", (socket) => {
         `${colors.red}📢 ALERTA DIFUNDIDA:${colors.reset} ${userName} → ${notifiedCount}/${nearbyUsers.length} usuarios`
       );
 
+      io.emit("emergency_alert", {
+  ...emergencyData,
+  emergencyRoomId,
+});
+
       // Respuesta al cliente que originó la emergencia
       ack?.({
         success: true,
