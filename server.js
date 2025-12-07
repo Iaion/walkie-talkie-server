@@ -1009,112 +1009,91 @@ io.on("connection", (socket) => {
   // ============================================================
   // 🚪 MANEJO DE SALAS
   // ============================================================
-  socket.on("join_room", async (data = {}, ack) => {
+socket.on("join_room", async (data = {}, ack) => {
+  try {
     const { roomId, userId, username } = data;
-    
-    if (!roomId || !userId || !username) {
-      return ack?.({ 
-        success: false, 
-        message: "❌ Datos de sala inválidos" 
-      });
+
+    if (!roomId || !userId) {
+      ack?.({ success: false, message: "roomId y userId son requeridos" });
+      return;
     }
 
-    console.log(`${colors.blue}🚪 join_room:${colors.reset} ${username} → ${roomId}`);
+    const targetRoom = state.chatRooms.get(roomId);
+    if (!targetRoom) {
+      ack?.({ success: false, message: `Sala ${roomId} no encontrada`, roomId });
+      return;
+    }
 
-    try {
-      const targetRoom = state.chatRooms.get(roomId);
-      if (!targetRoom) {
-        return ack?.({ 
-          success: false, 
-          message: `❌ La sala ${roomId} no existe` 
-        });
+    // 🔹 Dejar sala anterior si existe
+    if (socket.currentRoom && socket.currentRoom !== roomId) {
+      const previousRoom = state.chatRooms.get(socket.currentRoom);
+      if (previousRoom) {
+        previousRoom.users.delete(userId);
       }
 
-      // Dejar sala anterior si existe
-      if (socket.currentRoom) {
-        const previousRoom = state.chatRooms.get(socket.currentRoom);
-        if (previousRoom) {
-          previousRoom.users.delete(userId);
-          socket.leave(socket.currentRoom);
-          
-          socket.to(socket.currentRoom).emit("user_left_room", {
-            userId: userId,
-            username: username,
-            roomId: socket.currentRoom,
-            message: `${username} salió de la sala`,
-            timestamp: Date.now()
-          });
-        }
-      }
+      socket.leave(socket.currentRoom);
 
-      // Unirse a nueva sala
-      socket.join(roomId);
-      socket.currentRoom = roomId;
-      targetRoom.users.add(userId);
-
-      // Actualizar estado del usuario
-      const userInfo = state.connectedUsers.get(userId);
-      if (userInfo) {
-        userInfo.userData.currentRoom = roomId;
-      }
-
-      // Enviar historial de mensajes
-      try {
-        const messagesSnapshot = await db.collection(COLLECTIONS.MESSAGES)
-          .where("roomId", "==", roomId)
-          .orderBy("timestamp", "desc")
-          .limit(50)
-          .get();
-
-        const messages = messagesSnapshot.docs.map(doc => ({
-          id: doc.id,
-          ...doc.data()
-        })).reverse();
-
-        socket.emit("room_messages", {
-          roomId: roomId,
-          messages: messages
-        });
-      } catch (dbError) {
-        console.warn(`${colors.yellow}⚠️ No se pudo cargar historial de mensajes:${colors.reset}`, dbError.message);
-      }
-
-      // Determinar tipo de sala
-      let roomType = "general";
-      if (roomId.startsWith("emergencia_")) {
-        roomType = "emergency";
-        console.log(`${colors.red}🚨 ${username} unido a sala de EMERGENCIA: ${roomId}${colors.reset}`);
-      } else if (roomId === "handy") {
-        roomType = "ptt";
-      }
-
-      ack?.({ 
-        success: true, 
-        roomId: roomId,
-        roomName: targetRoom.name,
-        message: `Unido a ${targetRoom.name}`,
-        type: roomType
-      });
-
-      // Notificar a otros en la sala
-      socket.to(roomId).emit("user_joined_room", {
-        userId: userId,
-        username: username,
-        roomId: roomId,
-        message: `${username} se unió a la sala`,
+      socket.to(socket.currentRoom).emit("user_left_room", {
+        userId,
+        username,
+        roomId: socket.currentRoom,
+        message: `${username} salió de la sala`,
         timestamp: Date.now()
       });
 
-      // Actualizar lista de usuarios en sala
-      utils.updateRoomUserList(roomId);
-
-      console.log(`${colors.green}✅ ${username} unido a sala: ${roomId}${colors.reset}`);
-
-    } catch (error) {
-      console.error(`${colors.red}❌ Error uniendo a sala:${colors.reset}`, error);
-      ack?.({ success: false, message: "Error al unirse a la sala" });
+      utils.updateRoomUserList(socket.currentRoom);
     }
-  });
+
+    // 🔹 Unirse a nueva sala
+    socket.join(roomId);
+    socket.currentRoom = roomId;
+    targetRoom.users.add(userId);
+
+    // 🔹 Enviar historial de mensajes
+    try {
+      const messagesSnapshot = await db.collection(COLLECTIONS.MESSAGES)
+        .where("roomId", "==", roomId)
+        .orderBy("timestamp", "desc")
+        .limit(50)
+        .get();
+
+      const messages = messagesSnapshot.docs.map(doc => ({
+        id: doc.id,
+        ...doc.data(),
+      })).reverse();
+
+      socket.emit("room_messages", {
+        roomId,
+        messages,
+      });
+    } catch (dbError) {
+      console.warn(`${colors.yellow}⚠️ No se pudo cargar historial de mensajes:${colors.reset}`, dbError.message);
+    }
+
+    // 🔹 Notificar a otros en la sala
+    socket.to(roomId).emit("user_joined_room", {
+      userId,
+      username,
+      roomId,
+      message: `${username} se unió a la sala`,
+      timestamp: Date.now(),
+    });
+
+    // 🔹 Actualizar lista de usuarios
+    utils.updateRoomUserList(roomId);
+
+    // ✅ AHORA SÍ: responder a Android
+    ack?.({
+      success: true,
+      roomId,
+      message: `Unido a sala ${roomId}`,
+    });
+
+  } catch (err) {
+    console.error("❌ Error en join_room:", err);
+    ack?.({ success: false, message: "Error interno en join_room" });
+  }
+});
 
   socket.on("leave_room", async (data = {}, ack) => {
     const { roomId, userId } = data;
@@ -1446,24 +1425,27 @@ io.on("connection", (socket) => {
     }
   });
 
-  socket.on("get_users", (data = {}, ack) => {
-    console.log(`${colors.cyan}📥 Evento → get_users${colors.reset}`);
+ socket.on("get_users", (data = {}, ack) => {
+  // Reusar la lógica de request_user_list
+  const { roomId } = data;
+  const room = state.chatRooms.get(roomId);
+  if (!room) {
+    ack?.({ success: false, message: "Sala no encontrada" });
+    return;
+  }
 
-    const users = Array.from(state.connectedUsers.values()).map((u) => ({
-      ...u.userData,
-      roomId: "general",
-    }));
+  const usersInRoom = Array.from(room.users).map(userId => {
+    const userInfo = state.connectedUsers.get(userId);
+    return userInfo ? userInfo.userData : null;
+  }).filter(Boolean);
 
-    socket.emit("connected_users", users);
-    ack?.({
-      success: true,
-      roomId: "general",
-      count: users.length,
-      users: users.map((u) => ({ id: u.id, username: u.username })),
-    });
-
-    console.log(`${colors.blue}📋 Chat General: ${users.length} usuarios conectados${colors.reset}`);
+  ack?.({
+    success: true,
+    roomId,
+    users: usersInRoom,
   });
+});
+
 
   // ============================================================
   // 🚨 SISTEMA DE EMERGENCIAS - ACTUALIZADO
@@ -1627,7 +1609,7 @@ io.on("connection", (socket) => {
       // 💬 CREAR SALA DE EMERGENCIA
       // ========================================================
       const createdAt = Date.now();
-      const emergencyRoomId = `emergencia_${userId}_${createdAt}`;
+      const emergencyRoomId = `emergencia_${userId}`;
 
       const emergencyRoom = {
         id: emergencyRoomId,
