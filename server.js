@@ -1625,8 +1625,10 @@ socket.on("join_room", async (data = {}, ack) => {
       state.chatRooms.set(emergencyRoomId, emergencyRoom);
       state.emergencyUserRoom.set(userId, emergencyRoomId);
 
-      socket.join(emergencyRoomId);
-      socket.currentRoom = emergencyRoomId;
+      socket.emit("emergency_room_created", {
+      emergencyUserId: userId,
+      emergencyRoomId,
+      });
 
       io.emit("new_room_created", {
         id: emergencyRoom.id,
