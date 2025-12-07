@@ -1006,12 +1006,21 @@ io.on("connection", (socket) => {
     }
   });
 
+  
+
   // ============================================================
   // 🚪 MANEJO DE SALAS
   // ============================================================
 socket.on("join_room", async (data = {}, ack) => {
   try {
     const { roomId, userId, username } = data;
+    
+    console.log("🧩 join_room recibido:", {
+      roomId,
+      userId,
+      username,
+      socketId: socket.id,
+    });
 
     if (!roomId || !userId) {
       ack?.({ success: false, message: "roomId y userId son requeridos" });
