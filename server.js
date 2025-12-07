@@ -1753,91 +1753,269 @@ socket.on("join_room", async (data = {}, ack) => {
     }
   });
 
-  socket.on("confirm_help", async (data = {}, ack) => {
-    try {
-      const { emergencyUserId, helperId, helperName, latitude, longitude, timestamp } = data;
-      console.log(`${colors.green}✅ Evento → confirm_help:${colors.reset}`, { emergencyUserId, helperId, helperName });
+  // ✅ CONFIRMAR AYUDA + UNIR AYUDANTE A LA SALA DE EMERGENCIA
+socket.on("confirm_help", async (data = {}, ack) => {
+  try {
+    const {
+      emergencyUserId,
+      helperId,
+      helperName,
+      latitude,
+      longitude,
+      timestamp,
+    } = data;
 
-      if (!emergencyUserId || !helperId) {
-        return ack?.({ success: false, message: "Datos de ayuda inválidos" });
-      }
+    console.log(
+      `${colors.green}✅ Evento → confirm_help:${colors.reset}`,
+      { emergencyUserId, helperId, helperName }
+    );
 
-      const helpers = state.emergencyHelpers.get(emergencyUserId) || new Set();
-      helpers.add(helperId);
-      state.emergencyHelpers.set(emergencyUserId, helpers);
-
-      const emergencyAlert = state.emergencyAlerts.get(emergencyUserId);
-      const payloadConfirmed = {
-        emergencyUserId,
-        helperId,
-        helperName,
-        latitude,
-        longitude,
-        timestamp: timestamp || Date.now()
-      };
-
-      if (emergencyAlert && emergencyAlert.socketId) {
-        io.to(emergencyAlert.socketId).emit("help_confirmed", payloadConfirmed);
-      } else {
-        utils.emitToUser(emergencyUserId, "help_confirmed", payloadConfirmed);
-      }
-
-      helpers.forEach(hUserId => {
-        if (hUserId !== helperId) {
-          utils.emitToUser(hUserId, "helper_location_update", {
-            userId: helperId,
-            userName: helperName,
-            latitude,
-            longitude,
-            timestamp: timestamp || Date.now()
-          });
-        }
-      });
-
-      io.emit("helper_confirmed_notification", {
-        emergencyUserId,
-        helperId,
-        helperName,
-        timestamp: timestamp || Date.now()
-      });
-
-      console.log(`${colors.green}✅ ${helperName} confirmó ayuda para ${emergencyUserId}${colors.reset}`);
-      ack?.({ success: true, message: "Ayuda confirmada" });
-    } catch (error) {
-      console.error(`${colors.red}❌ Error en confirm_help:${colors.reset}`, error);
-      ack?.({ success: false, message: error.message });
+    if (!emergencyUserId || !helperId) {
+      return ack?.({ success: false, message: "Datos de ayuda inválidos" });
     }
-  });
 
-  socket.on("reject_help", async (data = {}, ack) => {
-    try {
-      const { emergencyUserId, helperId, helperName } = data;
-      console.log(`${colors.yellow}❌ Evento → reject_help:${colors.reset}`, { emergencyUserId, helperId, helperName });
+    // =========================================================
+    // 🧩 1) Registrar helper en memoria
+    // =========================================================
+    const helpers = state.emergencyHelpers.get(emergencyUserId) || new Set();
+    helpers.add(helperId);
+    state.emergencyHelpers.set(emergencyUserId, helpers);
 
-      if (!emergencyUserId || !helperId) {
-        return ack?.({ success: false, message: "Datos inválidos" });
-      }
+    const emergencyAlert = state.emergencyAlerts.get(emergencyUserId);
+    const now = timestamp || Date.now();
 
-      const helpers = state.emergencyHelpers.get(emergencyUserId);
-      if (helpers) {
-        helpers.delete(helperId);
-      }
+    const payloadConfirmed = {
+      emergencyUserId,
+      helperId,
+      helperName,
+      latitude,
+      longitude,
+      timestamp: now,
+    };
 
-      const emergencyAlert = state.emergencyAlerts.get(emergencyUserId);
-      if (emergencyAlert && emergencyAlert.socketId) {
-        io.to(emergencyAlert.socketId).emit("help_rejected", {
-          helperId,
-          helperName
+    // Avisar al dueño de la emergencia
+    if (emergencyAlert && emergencyAlert.socketId) {
+      io.to(emergencyAlert.socketId).emit("help_confirmed", payloadConfirmed);
+    } else {
+      // fallback: emitir por userId
+      utils.emitToUser(emergencyUserId, "help_confirmed", payloadConfirmed);
+    }
+
+    // Avisar a otros helpers sobre la ubicación de este helper
+    helpers.forEach((hUserId) => {
+      if (hUserId !== helperId) {
+        utils.emitToUser(hUserId, "helper_location_update", {
+          userId: helperId,
+          userName: helperName,
+          latitude,
+          longitude,
+          timestamp: now,
         });
       }
+    });
 
-      console.log(`${colors.yellow}❌ ${helperName} rechazó ayuda para ${emergencyUserId}${colors.reset}`);
-      ack?.({ success: true, message: "Ayuda rechazada" });
-    } catch (error) {
-      console.error(`${colors.red}❌ Error en reject_help:${colors.reset}`, error);
-      ack?.({ success: false, message: error.message });
+    // Notificación global (ej. para badges)
+    io.emit("helper_confirmed_notification", {
+      emergencyUserId,
+      helperId,
+      helperName,
+      timestamp: now,
+    });
+
+    console.log(
+      `${colors.green}✅ ${helperName} confirmó ayuda para ${emergencyUserId}${colors.reset}`
+    );
+
+    // =========================================================
+    // 🧩 2) Unir AYUDANTE a la sala de emergencia
+    // =========================================================
+
+    // Buscar sala de emergencia asociada a ese usuario
+    const emergencyRoomId = state.emergencyUserRoom.get(emergencyUserId);
+
+    if (!emergencyRoomId) {
+      console.warn(
+        `${colors.yellow}⚠️ No se encontró sala de emergencia para usuario:${colors.reset}`,
+        emergencyUserId
+      );
+      ack?.({
+        success: true,
+        message:
+          "Ayuda confirmada, pero la sala de emergencia no fue encontrada",
+      });
+      return;
     }
-  });
+
+    // Obtener/crear la sala en memoria
+    let room = state.chatRooms.get(emergencyRoomId);
+    if (!room) {
+      console.warn(
+        `${colors.yellow}⚠️ Sala de emergencia no existía en chatRooms, creando...:${colors.reset}`,
+        emergencyRoomId
+      );
+      room = {
+        id: emergencyRoomId,
+        name: `Emergencia ${emergencyUserId}`,
+        type: "emergency",
+        description: `Sala de emergencia para usuario ${emergencyUserId}`,
+        users: new Set(),
+        createdAt: Date.now(),
+        messageCount: 0,
+      };
+      state.chatRooms.set(emergencyRoomId, room);
+    }
+
+    // 🔹 Salir de sala anterior si corresponde
+    if (socket.currentRoom && socket.currentRoom !== emergencyRoomId) {
+      const previousRoom = state.chatRooms.get(socket.currentRoom);
+      if (previousRoom) {
+        previousRoom.users.delete(helperId || socket.userId);
+      }
+
+      socket.leave(socket.currentRoom);
+
+      socket.to(socket.currentRoom).emit("user_left_room", {
+        userId: helperId || socket.userId,
+        username: helperName || socket.username,
+        roomId: socket.currentRoom,
+        message: `${helperName || socket.username} salió de la sala`,
+        timestamp: Date.now(),
+      });
+
+      utils.updateRoomUserList(socket.currentRoom);
+    }
+
+    // 🔹 Unirse a la sala de emergencia
+    socket.join(emergencyRoomId);
+    socket.currentRoom = emergencyRoomId;
+    room.users.add(helperId);
+
+    console.log(
+      `${colors.cyan}🧩 Helper unido a sala de emergencia:${colors.reset}`,
+      {
+        roomId: emergencyRoomId,
+        helperId,
+        helperName,
+        socketId: socket.id,
+      }
+    );
+
+    // 🔹 Notificar a otros en la sala
+    socket.to(emergencyRoomId).emit("user_joined_room", {
+      userId: helperId,
+      username: helperName,
+      roomId: emergencyRoomId,
+      message: `${helperName} se unió a la sala de emergencia`,
+      timestamp: Date.now(),
+    });
+
+    utils.updateRoomUserList(emergencyRoomId);
+
+    // 🔹 Enviar historial de mensajes al ayudante
+    try {
+      const messagesSnapshot = await db
+        .collection(COLLECTIONS.MESSAGES)
+        .where("roomId", "==", emergencyRoomId)
+        .orderBy("timestamp", "desc")
+        .limit(50)
+        .get();
+
+      const messages = messagesSnapshot.docs
+        .map((doc) => ({
+          id: doc.id,
+          ...doc.data(),
+        }))
+        .reverse();
+
+      socket.emit("room_messages", {
+        roomId: emergencyRoomId,
+        messages,
+      });
+    } catch (dbError) {
+      console.warn(
+        `${colors.yellow}⚠️ No se pudo cargar historial de mensajes para helper:${colors.reset}`,
+        dbError.message
+      );
+    }
+
+    // ✅ Respuesta final al cliente
+    ack?.({
+      success: true,
+      message: "Ayuda confirmada y unido a la sala de emergencia",
+      roomId: emergencyRoomId,
+    });
+  } catch (error) {
+    console.error(
+      `${colors.red}❌ Error en confirm_help:${colors.reset}`,
+      error
+    );
+    ack?.({ success: false, message: error.message });
+  }
+});
+
+// ❌ RECHAZAR AYUDA (opcional: también sacarlo de la sala de emergencia)
+socket.on("reject_help", async (data = {}, ack) => {
+  try {
+    const { emergencyUserId, helperId, helperName } = data;
+    console.log(
+      `${colors.yellow}❌ Evento → reject_help:${colors.reset}`,
+      { emergencyUserId, helperId, helperName }
+    );
+
+    if (!emergencyUserId || !helperId) {
+      return ack?.({ success: false, message: "Datos inválidos" });
+    }
+
+    // 1) Quitar de la lista de helpers en memoria
+    const helpers = state.emergencyHelpers.get(emergencyUserId);
+    if (helpers) {
+      helpers.delete(helperId);
+    }
+
+    // 2) Notificar al dueño de la emergencia
+    const emergencyAlert = state.emergencyAlerts.get(emergencyUserId);
+    if (emergencyAlert && emergencyAlert.socketId) {
+      io.to(emergencyAlert.socketId).emit("help_rejected", {
+        helperId,
+        helperName,
+      });
+    } else {
+      // Fallback por userId si quieres:
+      // utils.emitToUser(emergencyUserId, "help_rejected", { helperId, helperName });
+    }
+
+    // 3) (Opcional) sacarlo de la sala de emergencia si estaba dentro
+    const emergencyRoomId = state.emergencyUserRoom.get(emergencyUserId);
+    if (emergencyRoomId && socket.currentRoom === emergencyRoomId) {
+      const room = state.chatRooms.get(emergencyRoomId);
+      socket.leave(emergencyRoomId);
+      if (room) {
+        room.users.delete(helperId);
+      }
+
+      socket.to(emergencyRoomId).emit("user_left_room", {
+        userId: helperId,
+        username: helperName,
+        roomId: emergencyRoomId,
+        message: `${helperName} rechazó la ayuda y salió de la sala`,
+        timestamp: Date.now(),
+      });
+
+      utils.updateRoomUserList(emergencyRoomId);
+    }
+
+    console.log(
+      `${colors.yellow}❌ ${helperName} rechazó ayuda para ${emergencyUserId}${colors.reset}`
+    );
+    ack?.({ success: true, message: "Ayuda rechazada" });
+  } catch (error) {
+    console.error(
+      `${colors.red}❌ Error en reject_help:${colors.reset}`,
+      error
+    );
+    ack?.({ success: false, message: error.message });
+  }
+});
 
   socket.on("cancel_emergency", async (data = {}, ack) => {
     try {
