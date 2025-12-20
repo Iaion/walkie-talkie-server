@@ -187,6 +187,41 @@ const utils = {
     });
   }
 };
+// ============================================================
+// 🗑️ FUNCIÓN PARA ELIMINAR HISTORIAL DE CHAT
+// ============================================================
+const deleteEmergencyChatHistory = async (emergencyRoomId) => {
+  try {
+    console.log(`${colors.blue}🗑️ Eliminando historial de chat para sala: ${emergencyRoomId}${colors.reset}`);
+    
+    // Buscar todos los mensajes de esa sala
+    const messagesSnapshot = await db.collection(COLLECTIONS.MESSAGES)
+      .where("roomId", "==", emergencyRoomId)
+      .get();
+    
+    // Crear un batch para eliminar en lote
+    const batch = db.batch();
+    let deletedCount = 0;
+    
+    messagesSnapshot.docs.forEach((doc) => {
+      batch.delete(doc.ref);
+      deletedCount++;
+    });
+    
+    // Ejecutar el batch si hay documentos
+    if (deletedCount > 0) {
+      await batch.commit();
+      console.log(`${colors.green}✅ Eliminados ${deletedCount} mensajes de la sala ${emergencyRoomId}${colors.reset}`);
+    } else {
+      console.log(`${colors.gray}📭 No se encontraron mensajes para eliminar en ${emergencyRoomId}${colors.reset}`);
+    }
+    
+    return deletedCount;
+  } catch (error) {
+    console.error(`${colors.red}❌ Error eliminando historial de chat:${colors.reset}`, error);
+    throw error;
+  }
+};
 
 // ============================================================
 // 🗄️ MANEJO DE ARCHIVOS - STORAGE
@@ -1457,7 +1492,7 @@ socket.on("join_room", async (data = {}, ack) => {
 
 
   // ============================================================
-  // 🚨 SISTEMA DE EMERGENCIAS - ACTUALIZADO
+  // 🚨 SISTEMA DE  - ACTUALIZADO
   // ============================================================
   socket.on("emergency_alert", async (data = {}, ack) => {
     try {
@@ -2018,60 +2053,78 @@ socket.on("reject_help", async (data = {}, ack) => {
 });
 
   socket.on("cancel_emergency", async (data = {}, ack) => {
-    try {
-      const { userId } = data;
-      console.log(`${colors.blue}🛑 Evento → cancel_emergency:${colors.reset}`, { userId });
+  try {
+    const { userId } = data;
+    console.log(`${colors.blue}🛑 Evento → cancel_emergency:${colors.reset}`, { userId });
 
-      if (!userId) {
-        return ack?.({ success: false, message: "userId requerido" });
-      }
-
-      const emergencyRoomId = state.emergencyUserRoom.get(userId);
-
-      if (emergencyRoomId && state.chatRooms.has(emergencyRoomId)) {
-        io.to(emergencyRoomId).emit("emergency_room_closed", {
-          roomId: emergencyRoomId,
-          message: "Emergencia resuelta - Sala cerrada"
-        });
-
-        const room = state.chatRooms.get(emergencyRoomId);
-        if (room) {
-          room.users.forEach(roomUserId => {
-            const entry = state.connectedUsers.get(roomUserId);
-            if (entry) {
-              entry.sockets.forEach(socketId => {
-                io.sockets.sockets.get(socketId)?.leave(emergencyRoomId);
-              });
-            }
-            const entry2 = state.connectedUsers.get(roomUserId);
-            if (entry2 && entry2.userData?.currentRoom === emergencyRoomId) {
-              entry2.userData.currentRoom = null;
-            }
-          });
-        }
-
-        state.chatRooms.delete(emergencyRoomId);
-        state.emergencyUserRoom.delete(userId);
-        console.log(`${colors.blue}🛑 Sala de emergencia eliminada: ${emergencyRoomId}${colors.reset}`);
-      }
-
-      state.emergencyAlerts.delete(userId);
-      state.emergencyHelpers.delete(userId);
-
-      await db.collection(COLLECTIONS.EMERGENCIES).doc(userId).set({
-        status: "cancelled",
-        cancelledAt: Date.now()
-      }, { merge: true });
-
-      io.emit("emergency_cancelled", { userId });
-
-      console.log(`${colors.blue}🛑 Emergencia cancelada para usuario: ${userId}${colors.reset}`);
-      ack?.({ success: true, message: "Emergencia cancelada" });
-    } catch (error) {
-      console.error(`${colors.red}❌ Error en cancel_emergency:${colors.reset}`, error);
-      ack?.({ success: false, message: error.message });
+    if (!userId) {
+      return ack?.({ success: false, message: "userId requerido" });
     }
-  });
+
+    const emergencyRoomId = state.emergencyUserRoom.get(userId);
+
+    // 🔥 NUEVO: Eliminar historial de chat ANTES de cerrar la sala
+    if (emergencyRoomId) {
+      try {
+        const deletedCount = await deleteEmergencyChatHistory(emergencyRoomId);
+        console.log(`${colors.green}✅ Historial eliminado: ${deletedCount} mensajes borrados${colors.reset}`);
+      } catch (deleteError) {
+        console.warn(`${colors.yellow}⚠️ No se pudo eliminar el historial:${colors.reset}`, deleteError.message);
+        // No detenemos el proceso si falla la eliminación
+      }
+    }
+
+    if (emergencyRoomId && state.chatRooms.has(emergencyRoomId)) {
+      io.to(emergencyRoomId).emit("emergency_room_closed", {
+        roomId: emergencyRoomId,
+        message: "Emergencia resuelta - Sala cerrada"
+      });
+
+      const room = state.chatRooms.get(emergencyRoomId);
+      if (room) {
+        room.users.forEach(roomUserId => {
+          const entry = state.connectedUsers.get(roomUserId);
+          if (entry) {
+            entry.sockets.forEach(socketId => {
+              io.sockets.sockets.get(socketId)?.leave(emergencyRoomId);
+            });
+          }
+          const entry2 = state.connectedUsers.get(roomUserId);
+          if (entry2 && entry2.userData?.currentRoom === emergencyRoomId) {
+            entry2.userData.currentRoom = null;
+          }
+        });
+      }
+
+      state.chatRooms.delete(emergencyRoomId);
+      state.emergencyUserRoom.delete(userId);
+      console.log(`${colors.blue}🛑 Sala de emergencia eliminada: ${emergencyRoomId}${colors.reset}`);
+    }
+
+    state.emergencyAlerts.delete(userId);
+    state.emergencyHelpers.delete(userId);
+
+    await db.collection(COLLECTIONS.EMERGENCIES).doc(userId).set({
+      status: "cancelled",
+      cancelledAt: Date.now()
+    }, { merge: true });
+
+    io.emit("emergency_cancelled", { userId });
+
+    console.log(`${colors.blue}🛑 Emergencia cancelada para usuario: ${userId}${colors.reset}`);
+    
+    // 🔥 NUEVO: Incluir información en la respuesta
+    ack?.({
+      success: true,
+      message: "Emergencia cancelada y historial borrado",
+      emergencyRoomId: emergencyRoomId,
+      chatHistoryDeleted: true
+    });
+  } catch (error) {
+    console.error(`${colors.red}❌ Error en cancel_emergency:${colors.reset}`, error);
+    ack?.({ success: false, message: error.message });
+  }
+});
 
   socket.on("request_helpers", async (data = {}, ack) => {
     try {
