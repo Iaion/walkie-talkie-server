@@ -1777,27 +1777,28 @@ socket.on("join_room", async (data = {}, ack) => {
       );
 
       // ========================================================
-      // 📢 ENVIAR ALERTA A USUARIOS CERCANOS
-      // ========================================================
-      let notifiedCount = 0;
-      nearbyUsers.forEach((nearbySocketId) => {
-        if (nearbySocketId !== socket.id) {
-          io.to(nearbySocketId).emit("emergency_alert", {
-            ...emergencyData,
-            emergencyRoomId,
-          });
-          notifiedCount++;
-        }
-      });
+// 📢 ENVIAR ALERTA A USUARIOS CERCANOS (SIN DUPLICAR)
+// ========================================================
+let notifiedCount = 0;
 
-      console.log(
-        `${colors.red}📢 ALERTA DIFUNDIDA:${colors.reset} ${userName} → ${notifiedCount}/${nearbyUsers.length} usuarios`
-      );
+nearbyUsers.forEach((nearbySocketId) => {
+  // Evitar enviar al mismo emisor
+  if (nearbySocketId !== socket.id) {
+    io.to(nearbySocketId).emit("emergency_alert", {
+      ...emergencyData,
+      emergencyRoomId,
+    });
+    notifiedCount++;
+  }
+});
 
-      io.emit("emergency_alert", {
-        ...emergencyData,
-        emergencyRoomId,
-      });
+console.log(
+  `${colors.red}📢 ALERTA DIFUNDIDA:${colors.reset} ${userName} → ${notifiedCount}/${nearbyUsers.length} usuarios (cercanos)`
+);
+
+// ❌ ELIMINAR ESTO (duplica y rompe el filtro de cercanía)
+// io.emit("emergency_alert", { ...emergencyData, emergencyRoomId });
+
 
       // Respuesta al cliente que originó la emergencia
       ack?.({
