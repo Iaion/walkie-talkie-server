@@ -71,6 +71,9 @@ const COLLECTIONS = {
   EMERGENCIES: "emergencies"
 };
 
+// Firestore lock doc para controlar una emergencia a la vez
+const LOCK_DOC = db.collection("LOCKS").doc("active_emergency");
+
 // ============================================================
 // 🗃️ ESTADO EN MEMORIA
 // ============================================================
@@ -81,6 +84,18 @@ const state = {
   chatRooms: new Map(),             // roomId -> roomData
   emergencyUserRoom: new Map()      // userId -> emergencyRoomId
 };
+
+// ============================================================
+// 🔒 FUNCIÓN PARA LIBERAR LOCK DE EMERGENCIA
+// ============================================================
+async function releaseEmergencyLock() {
+  try {
+    await LOCK_DOC.set({ active: false }, { merge: true });
+    console.log(`${colors.green}✅ Lock liberado${colors.reset}`);
+  } catch (e) {
+    console.warn(`${colors.yellow}⚠️ No se pudo liberar lock:${colors.reset} ${e.message}`);
+  }
+}
 
 // ============================================================
 // 🛠️ FUNCIONES UTILITARIAS
@@ -187,6 +202,7 @@ const utils = {
     });
   }
 };
+
 // ============================================================
 // 🗑️ FUNCIÓN PARA ELIMINAR HISTORIAL DE CHAT
 // ============================================================
@@ -1041,8 +1057,6 @@ io.on("connection", (socket) => {
     }
   });
 
-  
-
   // ============================================================
   // 🚪 MANEJO DE SALAS
   // ============================================================
@@ -1490,9 +1504,8 @@ socket.on("join_room", async (data = {}, ack) => {
   });
 });
 
-
   // ============================================================
-  // 🚨 SISTEMA DE  - ACTUALIZADO
+  // 🚨 SISTEMA DE EMERGENCIA - ACTUALIZADO CON LOCK GLOBAL
   // ============================================================
   socket.on("emergency_alert", async (data = {}, ack) => {
     try {
@@ -1512,12 +1525,67 @@ socket.on("join_room", async (data = {}, ack) => {
 
       if (!userId || !userName) {
         console.warn(`${colors.yellow}⚠️ Datos de usuario faltantes${colors.reset}`);
-        return ack?.({ success: false, message: "Datos de usuario inválidos" });
+        return ack?.({ 
+          success: false, 
+          code: "INVALID_DATA", 
+          message: "Datos de usuario inválidos" 
+        });
       }
 
       if (typeof latitude !== "number" || typeof longitude !== "number") {
         console.warn(`${colors.yellow}⚠️ Coordenadas inválidas${colors.reset}`);
-        return ack?.({ success: false, message: "Ubicación inválida" });
+        return ack?.({ 
+          success: false, 
+          code: "INVALID_LOCATION", 
+          message: "Ubicación inválida" 
+        });
+      }
+
+      // ✅ RoomId de emergencia
+      const emergencyRoomId = `emergencia_${userId}`;
+
+      // ========================================================
+      // 🔒 LOCK GLOBAL (1 emergencia a la vez) - Firestore TX
+      // ========================================================
+      const lockResult = await db.runTransaction(async (tx) => {
+        const snap = await tx.get(LOCK_DOC);
+        const lock = snap.exists ? snap.data() : null;
+
+        // si está activo -> bloquear
+        if (lock?.active === true) {
+          return {
+            allowed: false,
+            activeEmergency: {
+              userId: lock.userId || null,
+              roomId: lock.roomId || null,
+              startedAt: lock.startedAt || null,
+            }
+          };
+        }
+
+        // si no está activo -> tomar lock
+        tx.set(
+          LOCK_DOC,
+          {
+            active: true,
+            userId,
+            roomId: emergencyRoomId,
+            startedAt: Date.now(),
+            emergencyType,
+          },
+          { merge: true }
+        );
+
+        return { allowed: true };
+      });
+
+      if (!lockResult.allowed) {
+        return ack?.({
+          success: false,
+          code: "EMERGENCY_ALREADY_ACTIVE",
+          message: "⚠️ Esta es una versión de prueba. Actualmente manejamos una emergencia a la vez, y ya hay una en curso. Volvé a intentarlo más tarde.",
+          activeEmergency: lockResult.activeEmergency,
+        });
       }
 
       // ========================================================
@@ -1653,7 +1721,6 @@ socket.on("join_room", async (data = {}, ack) => {
       // 💬 CREAR SALA DE EMERGENCIA
       // ========================================================
       const createdAt = Date.now();
-      const emergencyRoomId = `emergencia_${userId}`;
 
       const emergencyRoom = {
         id: emergencyRoomId,
@@ -1670,8 +1737,8 @@ socket.on("join_room", async (data = {}, ack) => {
       state.emergencyUserRoom.set(userId, emergencyRoomId);
 
       socket.emit("emergency_room_created", {
-      emergencyUserId: userId,
-      emergencyRoomId,
+        emergencyUserId: userId,
+        emergencyRoomId,
       });
 
       io.emit("new_room_created", {
@@ -1728,9 +1795,9 @@ socket.on("join_room", async (data = {}, ack) => {
       );
 
       io.emit("emergency_alert", {
-  ...emergencyData,
-  emergencyRoomId,
-});
+        ...emergencyData,
+        emergencyRoomId,
+      });
 
       // Respuesta al cliente que originó la emergencia
       ack?.({
@@ -1749,9 +1816,83 @@ socket.on("join_room", async (data = {}, ack) => {
       );
       ack?.({
         success: false,
-        message: error.message,
-        errorDetails: "Error procesando alerta de emergencia",
+        code: "SERVER_ERROR",
+        message: "Error procesando alerta de emergencia",
       });
+    }
+  });
+
+  // Evento para resolver emergencia
+  socket.on("emergency_resolve", async (data = {}, ack) => {
+    try {
+      const { userId } = data;
+      console.log(`${colors.green}✅ Evento → emergency_resolve:${colors.reset}`, { userId });
+
+      if (!userId) {
+        return ack?.({ success: false, message: "userId requerido" });
+      }
+
+      // Liberar el lock global
+      await releaseEmergencyLock();
+
+      // Resto de la lógica para resolver la emergencia...
+      const emergencyRoomId = state.emergencyUserRoom.get(userId);
+
+      if (emergencyRoomId && state.chatRooms.has(emergencyRoomId)) {
+        io.to(emergencyRoomId).emit("emergency_resolved", {
+          roomId: emergencyRoomId,
+          message: "Emergencia resuelta"
+        });
+
+        // Limpiar historial de chat
+        try {
+          await deleteEmergencyChatHistory(emergencyRoomId);
+        } catch (deleteError) {
+          console.warn(`${colors.yellow}⚠️ No se pudo eliminar el historial:${colors.reset}`, deleteError.message);
+        }
+
+        const room = state.chatRooms.get(emergencyRoomId);
+        if (room) {
+          room.users.forEach(roomUserId => {
+            const entry = state.connectedUsers.get(roomUserId);
+            if (entry) {
+              entry.sockets.forEach(socketId => {
+                io.sockets.sockets.get(socketId)?.leave(emergencyRoomId);
+              });
+            }
+            const entry2 = state.connectedUsers.get(roomUserId);
+            if (entry2 && entry2.userData?.currentRoom === emergencyRoomId) {
+              entry2.userData.currentRoom = null;
+            }
+          });
+        }
+
+        state.chatRooms.delete(emergencyRoomId);
+        state.emergencyUserRoom.delete(userId);
+        console.log(`${colors.green}✅ Sala de emergencia resuelta: ${emergencyRoomId}${colors.reset}`);
+      }
+
+      state.emergencyAlerts.delete(userId);
+      state.emergencyHelpers.delete(userId);
+
+      await db.collection(COLLECTIONS.EMERGENCIES).doc(userId).set({
+        status: "resolved",
+        resolvedAt: Date.now()
+      }, { merge: true });
+
+      io.emit("emergency_resolved", { userId });
+
+      console.log(`${colors.green}✅ Emergencia resuelta para usuario: ${userId}${colors.reset}`);
+      
+      ack?.({
+        success: true,
+        message: "Emergencia resuelta correctamente",
+        emergencyRoomId: emergencyRoomId,
+        chatHistoryDeleted: true
+      });
+    } catch (error) {
+      console.error(`${colors.red}❌ Error en emergency_resolve:${colors.reset}`, error);
+      ack?.({ success: false, message: error.message });
     }
   });
 
@@ -2061,6 +2202,9 @@ socket.on("reject_help", async (data = {}, ack) => {
       return ack?.({ success: false, message: "userId requerido" });
     }
 
+    // Liberar el lock global
+    await releaseEmergencyLock();
+
     const emergencyRoomId = state.emergencyUserRoom.get(userId);
 
     // 🔥 NUEVO: Eliminar historial de chat ANTES de cerrar la sala
@@ -2182,6 +2326,12 @@ socket.on("reject_help", async (data = {}, ack) => {
           if (state.emergencyAlerts.has(userId)) {
             state.emergencyAlerts.delete(userId);
             state.emergencyHelpers.delete(userId);
+            
+            // Liberar lock si el usuario con emergencia se desconecta
+            releaseEmergencyLock().catch(e => {
+              console.warn(`${colors.yellow}⚠️ Error liberando lock en desconexión:${colors.reset}`, e.message);
+            });
+            
             io.emit("emergency_cancelled", { userId });
             console.log(`${colors.red}🚨 Emergencia cancelada por desconexión de ${username}${colors.reset}`);
           }
@@ -2234,6 +2384,7 @@ server.listen(PORT, () => {
     console.log(`${colors.green}   - ${room.name} (${room.id})${colors.reset}`);
   });
   console.log(`${colors.red}🚨 Sistema de Emergencia activo${colors.reset}`);
+  console.log(`${colors.yellow}🔒 Sistema de LOCK global (1 emergencia a la vez)${colors.reset}`);
   console.log(`${colors.green}🚗 Gestión de Vehículos activa${colors.reset}`);
   console.log(`${colors.magenta}🎧 Soporte para audio activo${colors.reset}`);
   console.log(`${colors.magenta}📍 Filtrado por ubicación activo (50km)${colors.reset}`);
