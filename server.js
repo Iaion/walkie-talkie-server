@@ -2156,93 +2156,182 @@ io.on("connection", (socket) => {
   });
 
   // ============================================================
-  // 🔴 DESCONEXIÓN (MEJORADA - LIMPIA EMERGENCIA AUTOMÁTICAMENTE)
-  // ============================================================
-  socket.on("disconnect", async (reason) => {
-    const userId = socket.userId;
-    const username = socket.username;
-    const currentRoom = socket.currentRoom;
-    
-    console.log(`${colors.red}🔌 Socket desconectado:${colors.reset} ${username || socket.id} (${reason})`);
+// 🔴 DESCONEXIÓN (MEJORADA - LIMPIA EMERGENCIA Y MUEVE A GENERAL)
+// ============================================================
+socket.on("disconnect", async (reason) => {
+  const userId = socket.userId;
+  const username = socket.username;
+  const currentRoom = socket.currentRoom;
+  
+  console.log(`${colors.red}🔌 Socket desconectado:${colors.reset} ${username || socket.id} (${reason})`);
 
-    // 🔍 1. VERIFICAR SI EL USUARIO TIENE UNA EMERGENCIA ACTIVA
-    const hasActiveEmergency = state.emergencyAlerts.has(userId);
-    const emergencyRoomId = state.emergencyUserRoom.get(userId);
-    
-    if (userId) {
-      const entry = state.connectedUsers.get(userId);
-      if (entry) {
-        entry.sockets.delete(socket.id);
-        
-        // 🔍 2. DETERMINAR SI ES LA ÚLTIMA CONEXIÓN DEL USUARIO
-        const isLastConnection = entry.sockets.size === 0;
-        
-        // Actualizar en Firestore (remover socketId)
-        try {
-          await db.collection(COLLECTIONS.USERS).doc(userId).update({
-            socketIds: admin.firestore.FieldValue.arrayRemove(socket.id),
-            lastSeen: Date.now(),
-            // Si es la última conexión, marcar como offline
-            ...(isLastConnection && { isOnline: false })
-          });
-        } catch (error) {
-          console.warn(`${colors.yellow}⚠️ Error actualizando Firestore en desconexión:${colors.reset}`, error.message);
-        }
-        
-        if (isLastConnection) {
-          // Usuario completamente offline
-          entry.userData.isOnline = false;
-          state.connectedUsers.delete(userId);
-          
-          // 🚨 3. SI TIENE EMERGENCIA ACTIVA Y SE DESCONECTÓ COMPLETAMENTE, LIMPIARLA
-          if (hasActiveEmergency) {
-            console.log(`${colors.red}🚨 USUARIO CON EMERGENCIA ACTIVA SE DESCONECTÓ: ${username}${colors.reset}`);
-            await cleanupUserEmergency(userId, username, emergencyRoomId);
-          }
-          
-          // Notificar a otros usuarios
-          io.emit('user_status_changed', {
-            userId,
-            username,
+  // 🔍 1. VERIFICAR SI EL USUARIO TIENE UNA EMERGENCIA ACTIVA
+  const hasActiveEmergency = state.emergencyAlerts.has(userId);
+  const emergencyRoomId = state.emergencyUserRoom.get(userId);
+  
+  if (userId) {
+    const entry = state.connectedUsers.get(userId);
+    if (entry) {
+      entry.sockets.delete(socket.id);
+      
+      // 🔍 2. DETERMINAR SI ES LA ÚLTIMA CONEXIÓN DEL USUARIO
+      const isLastConnection = entry.sockets.size === 0;
+      
+      // 📝 3. ACTUALIZAR FIRESTORE (remover socketId)
+      try {
+        await db.collection(COLLECTIONS.USERS).doc(userId).update({
+          socketIds: admin.firestore.FieldValue.arrayRemove(socket.id),
+          lastSeen: Date.now(),
+          // Si es la última conexión, marcar como offline
+          ...(isLastConnection && { 
             isOnline: false,
-            emergencyCleared: hasActiveEmergency // Informar si se limpió emergencia
-          });
-          
-          console.log(`${colors.red}🔴 Usuario ${username} completamente desconectado. ${hasActiveEmergency ? '(Emergencia limpiada)' : ''}${colors.reset}`);
-        } else {
-          // El usuario tiene otras conexiones activas
-          console.log(`${colors.yellow}⚠️ Usuario ${username} tiene ${entry.sockets.size} conexiones restantes${colors.reset}`);
-        }
-      } else if (hasActiveEmergency) {
-        // Caso especial: usuario tenía emergencia pero no estaba en connectedUsers
-        console.log(`${colors.red}🚨 USUARIO NO ENCONTRADO PERO CON EMERGENCIA ACTIVA: ${userId}${colors.reset}`);
-        await cleanupUserEmergency(userId, username, emergencyRoomId);
-      }
-
-      // Notificar salida de sala
-      if (currentRoom) {
-        socket.to(currentRoom).emit("user_left_room", {
-          userId: userId,
-          username: username,
-          roomId: currentRoom,
-          message: `${username} se desconectó`,
-          timestamp: Date.now(),
-          hadEmergency: hasActiveEmergency
+            currentRoom: "general" // 🔄 Mover a sala general
+          })
         });
-
-        utils.updateRoomUserList(currentRoom);
+      } catch (error) {
+        console.warn(`${colors.yellow}⚠️ Error actualizando Firestore en desconexión:${colors.reset}`, error.message);
+      }
+      
+      if (isLastConnection) {
+        // 👤 Usuario completamente offline
+        entry.userData.isOnline = false;
+        entry.userData.currentRoom = "general"; // 🔄 Actualizar estado local
+        state.connectedUsers.delete(userId);
+        
+        // 🚨 4. SI TIENE EMERGENCIA ACTIVA, LIMPIARLA COMPLETAMENTE
+        if (hasActiveEmergency) {
+          console.log(`${colors.red}🚨 USUARIO CON EMERGENCIA ACTIVA SE DESCONECTÓ: ${username}${colors.reset}`);
+          await cleanupUserEmergency(userId, username, emergencyRoomId);
+        }
+        
+        // 📢 5. NOTIFICAR A OTROS USUARIOS
+        io.emit('user_status_changed', {
+          userId,
+          username,
+          isOnline: false,
+          currentRoom: "general", // 🔄 Informar que está en general
+          emergencyCleared: hasActiveEmergency,
+          timestamp: Date.now()
+        });
+        
+        console.log(`${colors.red}🔴 Usuario ${username} completamente desconectado. ${hasActiveEmergency ? '(Emergencia limpiada)' : ''}${colors.reset}`);
+      } else {
+        // 🔄 6. USUARIO CON MÚLTIPLES CONEXIONES - Mover a general solo esta conexión
+        console.log(`${colors.yellow}⚠️ Usuario ${username} tiene ${entry.sockets.size} conexiones restantes${colors.reset}`);
+        
+        // Solo mover esta conexión específica a general
+        socket.leave(currentRoom);
+        socket.currentRoom = "general";
+        
+        // Notificar a la sala actual que este socket salió
+        if (currentRoom && currentRoom !== "general") {
+          socket.to(currentRoom).emit("user_left_room", {
+            userId: userId,
+            username: username,
+            roomId: currentRoom,
+            message: `${username} se desconectó`,
+            timestamp: Date.now(),
+            socketId: socket.id,
+            hadEmergency: hasActiveEmergency
+          });
+        }
+      }
+    } else if (hasActiveEmergency) {
+      // 🚨 7. CASO ESPECIAL: USUARIO CON EMERGENCIA PERO NO EN CONNECTEDUSERS
+      console.log(`${colors.red}🚨 USUARIO NO ENCONTRADO PERO CON EMERGENCIA ACTIVA: ${userId}${colors.reset}`);
+      await cleanupUserEmergency(userId, username, emergencyRoomId);
+      
+      // Actualizar Firestore para mover a general
+      try {
+        await db.collection(COLLECTIONS.USERS).doc(userId).update({
+          socketIds: admin.firestore.FieldValue.arrayRemove(socket.id),
+          lastSeen: Date.now(),
+          isOnline: false,
+          currentRoom: "general",
+          hasActiveEmergency: false,
+          emergencyRoomId: null
+        });
+      } catch (error) {
+        console.warn(`${colors.yellow}⚠️ Error actualizando Firestore para usuario no encontrado:${colors.reset}`, error.message);
       }
     }
 
-    // Actualizar lista de usuarios conectados
-    io.emit(
-      "connected_users",
-      Array.from(state.connectedUsers.values()).map((u) => ({
-        ...u.userData,
-        socketCount: u.sockets.size,
-      }))
-    );
-  });
+    // 🏠 8. MANEJAR SALA ACTUAL (si está en una sala diferente a general)
+    if (currentRoom && currentRoom !== "general") {
+      // a) Notificar salida de la sala actual
+      socket.to(currentRoom).emit("user_left_room", {
+        userId: userId,
+        username: username,
+        roomId: currentRoom,
+        message: `${username} se desconectó`,
+        timestamp: Date.now(),
+        socketId: socket.id,
+        hadEmergency: hasActiveEmergency,
+        movedToGeneral: true // 🔄 Indicar que fue movido a general
+      });
+
+      // b) Actualizar lista de usuarios en la sala
+      utils.updateRoomUserList(currentRoom);
+      
+      // c) Sacar al usuario de la sala (si aún está conectado)
+      socket.leave(currentRoom);
+      
+      // d) Si el usuario tenía una sala de emergencia activa, limpiarla
+      if (hasActiveEmergency && currentRoom === emergencyRoomId) {
+        console.log(`${colors.yellow}⚠️ Usuario abandonó sala de emergencia por desconexión${colors.reset}`);
+        
+        // Notificar a los helpers en la sala de emergencia
+        io.to(emergencyRoomId).emit("emergency_user_disconnected", {
+          userId,
+          username,
+          roomId: emergencyRoomId,
+          message: `${username} se desconectó de la sala de emergencia`,
+          timestamp: Date.now(),
+          helpersInRoom: Array.from(state.emergencyHelpers.get(userId) || [])
+        });
+      }
+    }
+    
+    // 🔄 9. Mover el socket a la sala general (si no es la última conexión)
+    if (!isLastConnection && entry) {
+      socket.join("general");
+      socket.currentRoom = "general";
+      
+      // Notificar entrada a general
+      socket.to("general").emit("user_joined_room", {
+        userId: userId,
+        username: username,
+        roomId: "general",
+        message: `${username} se reconectó en general`,
+        timestamp: Date.now(),
+        isReconnection: true
+      });
+    }
+  }
+
+  // 🔄 10. SI EL USUARIO ESTABA EN UNA SALA DE EMERGENCIA, SACARLO AUTOMÁTICAMENTE
+  if (socket.rooms) {
+    const rooms = Array.from(socket.rooms);
+    const emergencyRooms = rooms.filter(room => room.startsWith('emergencia_'));
+    
+    for (const emergencyRoom of emergencyRooms) {
+      socket.leave(emergencyRoom);
+      console.log(`${colors.yellow}⚠️ Socket ${socket.id} removido de sala de emergencia: ${emergencyRoom}${colors.reset}`);
+    }
+  }
+
+  // 👥 11. ACTUALIZAR LISTA DE USUARIOS CONECTADOS
+  const connectedUsersList = Array.from(state.connectedUsers.values()).map((u) => ({
+    ...u.userData,
+    socketCount: u.sockets.size,
+    currentRoom: u.userData.currentRoom || "general" // 🔄 Asegurar sala general
+  }));
+  
+  io.emit("connected_users", connectedUsersList);
+  
+  // 🏠 12. ACTUALIZAR LISTA DE USUARIOS EN SALA GENERAL
+  utils.updateRoomUserList("general");
+});
 });
 
 // ============================================================
