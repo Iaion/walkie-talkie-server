@@ -74,6 +74,7 @@ const COLLECTIONS = {
 
 // Firestore lock doc para controlar una emergencia a la vez
 const LOCK_DOC = db.collection("LOCKS").doc("active_emergency");
+const LOCK_TTL_MS = 2 * 60 * 1000; // 2 minutos de timeout para locks stale
 
 // ============================================================
 // 🗃️ ESTADO EN MEMORIA
@@ -87,12 +88,20 @@ const state = {
 };
 
 // ============================================================
-// 🔒 FUNCIÓN PARA LIBERAR LOCK DE EMERGENCIA
+// 🔒 FUNCIÓN PARA LIBERAR LOCK DE EMERGENCIA (MEJORADA)
 // ============================================================
 async function releaseEmergencyLock() {
   try {
-    await LOCK_DOC.set({ active: false }, { merge: true });
-    console.log(`${colors.green}✅ Lock liberado${colors.reset}`);
+    await LOCK_DOC.set({
+      active: false,
+      userId: null,
+      roomId: null,
+      startedAt: null,
+      emergencyType: null,
+      releasedAt: Date.now(),
+      releaseReason: "manual_or_system"
+    }, { merge: true });
+    console.log(`${colors.green}✅ Lock liberado (clean)${colors.reset}`);
   } catch (e) {
     console.warn(`${colors.yellow}⚠️ No se pudo liberar lock:${colors.reset} ${e.message}`);
   }
@@ -159,17 +168,15 @@ async function cleanupUserEmergency(userId, username, emergencyRoomId) {
             }
           }
         }
-        
-        // c) Eliminar la sala del adapter de Socket.io
-        io.sockets.adapter.rooms.delete(roomIdToClean);
+        // NOTA: No usamos io.sockets.adapter.rooms.delete() - Socket.IO lo maneja automáticamente
       }
       
-      // d) Eliminar del estado de chatRooms si existe
+      // c) Eliminar del estado de chatRooms si existe
       if (state.chatRooms.has(roomIdToClean)) {
         state.chatRooms.delete(roomIdToClean);
       }
       
-      // e) Opcional: eliminar historial de chat
+      // d) Opcional: eliminar historial de chat
       try {
         await deleteEmergencyChatHistory(roomIdToClean);
         console.log(`${colors.green}🗑️ Historial de chat eliminado: ${roomIdToClean}${colors.reset}`);
@@ -186,7 +193,8 @@ async function cleanupUserEmergency(userId, username, emergencyRoomId) {
         emergencyRoomId: null,
         lastEmergencyEnded: Date.now(),
         isOnline: false, // Asegurar que esté offline
-        lastSeen: Date.now()
+        lastSeen: Date.now(),
+        currentRoom: "general" // Mover a sala general
       });
       
       // b) Actualizar o crear documento de EMERGENCIA
@@ -226,14 +234,12 @@ async function cleanupUserEmergency(userId, username, emergencyRoomId) {
       // No retornar false aquí, continuar con la limpieza
     }
     
-    // 6. LIBERAR EL LOCK GLOBAL (si existe esa función)
-    if (typeof releaseEmergencyLock === 'function') {
-      try {
-        await releaseEmergencyLock();
-        console.log(`${colors.green}🔓 Lock de emergencia liberado${colors.reset}`);
-      } catch (lockError) {
-        console.warn(`${colors.yellow}⚠️ Error liberando lock:${colors.reset}`, lockError.message);
-      }
+    // 6. LIBERAR EL LOCK GLOBAL
+    try {
+      await releaseEmergencyLock();
+      console.log(`${colors.green}🔓 Lock de emergencia liberado${colors.reset}`);
+    } catch (lockError) {
+      console.warn(`${colors.yellow}⚠️ Error liberando lock:${colors.reset}`, lockError.message);
     }
     
     // 7. NOTIFICAR CAMBIO DE ESTADO A TODOS LOS USUARIOS
@@ -392,9 +398,10 @@ const utils = {
 };
 
 // ============================================================
-// 🚀 FUNCIÓN PARA ENVIAR NOTIFICACIONES PUSH (CORREGIDA)
+// 🚀 FUNCIÓN PARA ENVIAR NOTIFICACIONES PUSH (CORREGIDA - scope token fijo)
 // ============================================================
 async function sendPushNotification(userId, title, body, data = {}) {
+  let token = null; // Declarado fuera del try para scope del catch
   try {
     const userDoc = await db.collection(COLLECTIONS.USERS).doc(userId).get();
     if (!userDoc.exists) {
@@ -403,7 +410,6 @@ async function sendPushNotification(userId, title, body, data = {}) {
     }
 
     const userData = userDoc.data();
-    let token = null;
     
     // Intentar obtener token del array primero
     if (userData.fcmTokens && userData.fcmTokens.length > 0) {
@@ -451,8 +457,8 @@ async function sendPushNotification(userId, title, body, data = {}) {
   } catch (error) {
     console.error(`${colors.red}❌ Error enviando notificación:${colors.reset}`, error);
     
-    // Si el token es inválido, eliminarlo del array
-    if (error.code === 'messaging/registration-token-not-registered') {
+    // Si el token es inválido, eliminarlo del array (token está en scope)
+    if (error.code === 'messaging/registration-token-not-registered' && token) {
       try {
         await db.collection(COLLECTIONS.USERS).doc(userId).update({
           fcmTokens: admin.firestore.FieldValue.arrayRemove(token),
@@ -1302,9 +1308,9 @@ io.on("connection", (socket) => {
   });
 
   // ============================================================
-  // 📍 ACTUALIZAR UBICACIÓN
+  // 📍 ACTUALIZAR UBICACIÓN (MEJORADO - PERSISTENCIA A FIRESTORE)
   // ============================================================
-  socket.on("update_location", (data = {}, ack) => {
+  socket.on("update_location", async (data = {}, ack) => {
     try {
       const { userId, lat, lng, timestamp } = data;
       if (!userId || typeof lat !== "number" || typeof lng !== "number") {
@@ -1312,11 +1318,15 @@ io.on("connection", (socket) => {
       }
       const entry = state.connectedUsers.get(userId);
       if (entry) {
-        entry.userData.lastKnownLocation = {
-          lat,
-          lng,
-          ts: typeof timestamp === "number" ? timestamp : Date.now()
-        };
+        const loc = { lat, lng, ts: typeof timestamp === "number" ? timestamp : Date.now() };
+        entry.userData.lastKnownLocation = loc;
+        
+        // ✅ PERSISTIR EN FIRESTORE PARA NOTIFICACIONES A OFFLINE
+        await db.collection(COLLECTIONS.USERS).doc(userId).set({
+          lastKnownLocation: loc,
+          lastLocationUpdatedAt: Date.now(),
+        }, { merge: true });
+        
         ack?.({ success: true });
       } else {
         ack?.({ success: false, message: "Usuario no conectado" });
@@ -1375,6 +1385,12 @@ io.on("connection", (socket) => {
       socket.join(roomId);
       socket.currentRoom = roomId;
       targetRoom.users.add(userId);
+      
+      // ✅ ACTUALIZAR ESTADO DEL USUARIO EN MEMORIA
+      const entry = state.connectedUsers.get(userId);
+      if (entry) {
+        entry.userData.currentRoom = roomId;
+      }
 
       // 3. Actualizar en Firestore (OPCIONAL, para debug)
       await db.collection(COLLECTIONS.USERS).doc(userId).set({
@@ -1451,9 +1467,9 @@ io.on("connection", (socket) => {
         socket.currentRoom = null;
       }
 
-      const userInfo = state.connectedUsers.get(userId || socket.userId);
-      if (userInfo && userInfo.userData.currentRoom === roomId) {
-        userInfo.userData.currentRoom = null;
+      const entry = state.connectedUsers.get(userId || socket.userId);
+      if (entry) {
+        entry.userData.currentRoom = null;
       }
 
       // Actualizar en Firestore (OPCIONAL)
@@ -1482,7 +1498,7 @@ io.on("connection", (socket) => {
   });
 
   // ============================================================
-  // 💬 MENSAJES DE TEXTO (CORREGIDO - SIN NOTIFICACIONES FANTASMA)
+  // 💬 MENSAJES DE TEXTO (CORREGIDO - MEJORADA PERFORMANCE)
   // ============================================================
   socket.on("send_message", async (data = {}, ack) => {
     const { userId, username, text, roomId = socket.currentRoom || "general" } = data;
@@ -1518,20 +1534,19 @@ io.on("connection", (socket) => {
       io.to(roomId).emit("new_message", message);
       socket.emit("message_sent", message);
       
-      // 3. ENVIAR NOTIFICACIONES PUSH SOLO A USUARIOS NO PRESENTES
-      // Obtener miembros de la sala (si es privada) o usuarios generales
-      const roomUsers = room ? Array.from(room.users) : [];
-      
-      // Para sala general, enviar a todos los usuarios registrados
-      // Para salas privadas, enviar solo a miembros de esa sala
+      // 3. ENVIAR NOTIFICACIONES PUSH OPTIMIZADO (NO CONSULTAR TODOS LOS USUARIOS)
       let usersToNotify = [];
       
       if (roomId === "general") {
-        // Obtener todos los usuarios registrados
-        const allUsersSnapshot = await db.collection(COLLECTIONS.USERS).get();
-        usersToNotify = allUsersSnapshot.docs.map(doc => doc.id);
+        // ✅ MEJORA DE PERFORMANCE: Solo consultar usuarios offline
+        const offlineUsersSnap = await db.collection(COLLECTIONS.USERS)
+          .where("isOnline", "==", false)
+          .get();
+        
+        usersToNotify = offlineUsersSnap.docs.map(doc => doc.id);
       } else {
-        usersToNotify = roomUsers;
+        // Para salas privadas, solo miembros de esa sala
+        usersToNotify = room ? Array.from(room.users) : [];
       }
       
       // Filtrar y enviar notificaciones
@@ -1794,9 +1809,10 @@ io.on("connection", (socket) => {
   });
 
   // ============================================================
-  // 🚨 SISTEMA DE EMERGENCIA (CORREGIDO - NOTIFICACIONES A NO PRESENTES)
+  // 🚨 SISTEMA DE EMERGENCIA (CORREGIDO - CON LOCK STALE Y SCOPE SEGURO)
   // ============================================================
   socket.on("emergency_alert", async (data = {}, ack) => {
+    let lockAcquired = false; // Para manejo seguro de rollback
     try {
       const {
         userId,
@@ -1833,12 +1849,35 @@ io.on("connection", (socket) => {
       // RoomId de emergencia
       const emergencyRoomId = `emergencia_${userId}`;
 
-      // 🔒 LOCK GLOBAL (1 emergencia a la vez)
+      // 🔒 LOCK GLOBAL CON DETECCIÓN DE STALE LOCK
       const lockResult = await db.runTransaction(async (tx) => {
         const snap = await tx.get(LOCK_DOC);
         const lock = snap.exists ? snap.data() : null;
 
         if (lock?.active === true) {
+          const startedAt = typeof lock.startedAt === "number" ? lock.startedAt : 0;
+          const age = Date.now() - startedAt;
+
+          // ✅ DETECTAR STALE LOCK (>2 minutos)
+          if (startedAt > 0 && age > LOCK_TTL_MS) {
+            tx.set(LOCK_DOC, {
+              active: true,
+              userId,
+              roomId: emergencyRoomId,
+              startedAt: Date.now(),
+              emergencyType,
+              replacedStaleLock: true,
+              previousLock: {
+                userId: lock.userId || null,
+                roomId: lock.roomId || null,
+                startedAt: lock.startedAt || null
+              }
+            }, { merge: true });
+
+            return { allowed: true, staleReplaced: true };
+          }
+
+          // ❌ LOCK ACTIVO Y NO VENCIDO
           return {
             allowed: false,
             activeEmergency: {
@@ -1849,17 +1888,14 @@ io.on("connection", (socket) => {
           };
         }
 
-        tx.set(
-          LOCK_DOC,
-          {
-            active: true,
-            userId,
-            roomId: emergencyRoomId,
-            startedAt: Date.now(),
-            emergencyType,
-          },
-          { merge: true }
-        );
+        // ✅ NO HAY LOCK ACTIVO, TOMARLO
+        tx.set(LOCK_DOC, {
+          active: true,
+          userId,
+          roomId: emergencyRoomId,
+          startedAt: Date.now(),
+          emergencyType,
+        }, { merge: true });
 
         return { allowed: true };
       });
@@ -1872,6 +1908,8 @@ io.on("connection", (socket) => {
           activeEmergency: lockResult.activeEmergency,
         });
       }
+
+      lockAcquired = true; // Marcar que adquirimos lock
 
       // Obtener avatar
       let avatarUrl = null;
@@ -2017,7 +2055,7 @@ io.on("connection", (socket) => {
       });
 
       // 2. ENVIAR NOTIFICACIONES PUSH a usuarios cercanos NO conectados
-      // Obtener todos los usuarios con ubicación de Firestore
+      // ✅ CORREGIDO: Usar lastKnownLocation en lugar de location
       const usersSnapshot = await db.collection(COLLECTIONS.USERS).get();
       let pushNotifications = 0;
       
@@ -2031,11 +2069,12 @@ io.on("connection", (socket) => {
         // Si ya fue notificado por socket, saltar
         if (notifiedUsers.has(targetUserId)) continue;
         
-        // Verificar si el usuario tiene ubicación y está dentro del radio
-        if (userData.location && userData.location.lat && userData.location.lng) {
+        // ✅ VERIFICAR USANDO lastKnownLocation
+        const loc = userData.lastKnownLocation;
+        if (loc && typeof loc.lat === "number" && typeof loc.lng === "number") {
           const distance = utils.calculateDistance(
             latitude, longitude,
-            userData.location.lat, userData.location.lng
+            loc.lat, loc.lng
           );
           
           if (distance <= 50) { // 50km radio
@@ -2076,6 +2115,13 @@ io.on("connection", (socket) => {
       });
     } catch (error) {
       console.error(`${colors.red}❌ Error en emergency_alert:${colors.reset}`, error);
+      
+      // ✅ ROLLBACK SEGURO: Si adquirimos lock pero algo falló, liberarlo
+      if (lockAcquired) {
+        console.log(`${colors.yellow}⚠️ Error después de adquirir lock, liberando...${colors.reset}`);
+        await releaseEmergencyLock();
+      }
+      
       ack?.({
         success: false,
         code: "SERVER_ERROR",
@@ -2085,7 +2131,7 @@ io.on("connection", (socket) => {
   });
 
   // ============================================================
-  // ✅ EVENTOS DE EMERGENCIA RESTANTES (sin cambios significativos)
+  // ✅ EVENTOS DE EMERGENCIA RESTANTES
   // ============================================================
   socket.on("emergency_resolve", async (data = {}, ack) => {
     try {
@@ -2156,28 +2202,30 @@ io.on("connection", (socket) => {
   });
 
   // ============================================================
-// 🔴 DESCONEXIÓN (MEJORADA - LIMPIA EMERGENCIA Y MUEVE A GENERAL)
-// ============================================================
-socket.on("disconnect", async (reason) => {
-  const userId = socket.userId;
-  const username = socket.username;
-  const currentRoom = socket.currentRoom;
-  
-  console.log(`${colors.red}🔌 Socket desconectado:${colors.reset} ${username || socket.id} (${reason})`);
+  // 🔴 DESCONEXIÓN (CORREGIDA - SCOPE SEGURO PARA isLastConnection)
+  // ============================================================
+  socket.on("disconnect", async (reason) => {
+    const userId = socket.userId;
+    const username = socket.username;
+    const currentRoom = socket.currentRoom;
+    
+    console.log(`${colors.red}🔌 Socket desconectado:${colors.reset} ${username || socket.id} (${reason})`);
 
-  // 🔍 1. VERIFICAR SI EL USUARIO TIENE UNA EMERGENCIA ACTIVA
-  const hasActiveEmergency = state.emergencyAlerts.has(userId);
-  const emergencyRoomId = state.emergencyUserRoom.get(userId);
-  
-  if (userId) {
-    const entry = state.connectedUsers.get(userId);
+    // ✅ CORRECCIÓN: Declarar variables con scope seguro
+    let entry = userId ? state.connectedUsers.get(userId) : null;
+    let isLastConnection = true; // default seguro
+    
     if (entry) {
       entry.sockets.delete(socket.id);
-      
-      // 🔍 2. DETERMINAR SI ES LA ÚLTIMA CONEXIÓN DEL USUARIO
-      const isLastConnection = entry.sockets.size === 0;
-      
-      // 📝 3. ACTUALIZAR FIRESTORE (remover socketId)
+      isLastConnection = entry.sockets.size === 0;
+    }
+
+    // 🔍 1. VERIFICAR SI EL USUARIO TIENE UNA EMERGENCIA ACTIVA
+    const hasActiveEmergency = state.emergencyAlerts.has(userId);
+    const emergencyRoomId = state.emergencyUserRoom.get(userId);
+    
+    if (userId) {
+      // 📝 2. ACTUALIZAR FIRESTORE (remover socketId)
       try {
         await db.collection(COLLECTIONS.USERS).doc(userId).update({
           socketIds: admin.firestore.FieldValue.arrayRemove(socket.id),
@@ -2192,19 +2240,19 @@ socket.on("disconnect", async (reason) => {
         console.warn(`${colors.yellow}⚠️ Error actualizando Firestore en desconexión:${colors.reset}`, error.message);
       }
       
-      if (isLastConnection) {
+      if (isLastConnection && entry) {
         // 👤 Usuario completamente offline
         entry.userData.isOnline = false;
         entry.userData.currentRoom = "general"; // 🔄 Actualizar estado local
         state.connectedUsers.delete(userId);
         
-        // 🚨 4. SI TIENE EMERGENCIA ACTIVA, LIMPIARLA COMPLETAMENTE
+        // 🚨 3. SI TIENE EMERGENCIA ACTIVA, LIMPIARLA COMPLETAMENTE
         if (hasActiveEmergency) {
           console.log(`${colors.red}🚨 USUARIO CON EMERGENCIA ACTIVA SE DESCONECTÓ: ${username}${colors.reset}`);
           await cleanupUserEmergency(userId, username, emergencyRoomId);
         }
         
-        // 📢 5. NOTIFICAR A OTROS USUARIOS
+        // 📢 4. NOTIFICAR A OTROS USUARIOS
         io.emit('user_status_changed', {
           userId,
           username,
@@ -2215,8 +2263,8 @@ socket.on("disconnect", async (reason) => {
         });
         
         console.log(`${colors.red}🔴 Usuario ${username} completamente desconectado. ${hasActiveEmergency ? '(Emergencia limpiada)' : ''}${colors.reset}`);
-      } else {
-        // 🔄 6. USUARIO CON MÚLTIPLES CONEXIONES - Mover a general solo esta conexión
+      } else if (entry) {
+        // 🔄 5. USUARIO CON MÚLTIPLES CONEXIONES - Mover a general solo esta conexión
         console.log(`${colors.yellow}⚠️ Usuario ${username} tiene ${entry.sockets.size} conexiones restantes${colors.reset}`);
         
         // Solo mover esta conexión específica a general
@@ -2235,103 +2283,102 @@ socket.on("disconnect", async (reason) => {
             hadEmergency: hasActiveEmergency
           });
         }
-      }
-    } else if (hasActiveEmergency) {
-      // 🚨 7. CASO ESPECIAL: USUARIO CON EMERGENCIA PERO NO EN CONNECTEDUSERS
-      console.log(`${colors.red}🚨 USUARIO NO ENCONTRADO PERO CON EMERGENCIA ACTIVA: ${userId}${colors.reset}`);
-      await cleanupUserEmergency(userId, username, emergencyRoomId);
-      
-      // Actualizar Firestore para mover a general
-      try {
-        await db.collection(COLLECTIONS.USERS).doc(userId).update({
-          socketIds: admin.firestore.FieldValue.arrayRemove(socket.id),
-          lastSeen: Date.now(),
-          isOnline: false,
-          currentRoom: "general",
-          hasActiveEmergency: false,
-          emergencyRoomId: null
-        });
-      } catch (error) {
-        console.warn(`${colors.yellow}⚠️ Error actualizando Firestore para usuario no encontrado:${colors.reset}`, error.message);
-      }
-    }
-
-    // 🏠 8. MANEJAR SALA ACTUAL (si está en una sala diferente a general)
-    if (currentRoom && currentRoom !== "general") {
-      // a) Notificar salida de la sala actual
-      socket.to(currentRoom).emit("user_left_room", {
-        userId: userId,
-        username: username,
-        roomId: currentRoom,
-        message: `${username} se desconectó`,
-        timestamp: Date.now(),
-        socketId: socket.id,
-        hadEmergency: hasActiveEmergency,
-        movedToGeneral: true // 🔄 Indicar que fue movido a general
-      });
-
-      // b) Actualizar lista de usuarios en la sala
-      utils.updateRoomUserList(currentRoom);
-      
-      // c) Sacar al usuario de la sala (si aún está conectado)
-      socket.leave(currentRoom);
-      
-      // d) Si el usuario tenía una sala de emergencia activa, limpiarla
-      if (hasActiveEmergency && currentRoom === emergencyRoomId) {
-        console.log(`${colors.yellow}⚠️ Usuario abandonó sala de emergencia por desconexión${colors.reset}`);
+      } else if (hasActiveEmergency) {
+        // 🚨 6. CASO ESPECIAL: USUARIO CON EMERGENCIA PERO NO EN CONNECTEDUSERS
+        console.log(`${colors.red}🚨 USUARIO NO ENCONTRADO PERO CON EMERGENCIA ACTIVA: ${userId}${colors.reset}`);
+        await cleanupUserEmergency(userId, username, emergencyRoomId);
         
-        // Notificar a los helpers en la sala de emergencia
-        io.to(emergencyRoomId).emit("emergency_user_disconnected", {
-          userId,
-          username,
-          roomId: emergencyRoomId,
-          message: `${username} se desconectó de la sala de emergencia`,
+        // Actualizar Firestore para mover a general
+        try {
+          await db.collection(COLLECTIONS.USERS).doc(userId).update({
+            socketIds: admin.firestore.FieldValue.arrayRemove(socket.id),
+            lastSeen: Date.now(),
+            isOnline: false,
+            currentRoom: "general",
+            hasActiveEmergency: false,
+            emergencyRoomId: null
+          });
+        } catch (error) {
+          console.warn(`${colors.yellow}⚠️ Error actualizando Firestore para usuario no encontrado:${colors.reset}`, error.message);
+        }
+      }
+
+      // 🏠 7. MANEJAR SALA ACTUAL (si está en una sala diferente a general)
+      if (currentRoom && currentRoom !== "general") {
+        // a) Notificar salida de la sala actual
+        socket.to(currentRoom).emit("user_left_room", {
+          userId: userId,
+          username: username,
+          roomId: currentRoom,
+          message: `${username} se desconectó`,
           timestamp: Date.now(),
-          helpersInRoom: Array.from(state.emergencyHelpers.get(userId) || [])
+          socketId: socket.id,
+          hadEmergency: hasActiveEmergency,
+          movedToGeneral: true // 🔄 Indicar que fue movido a general
+        });
+
+        // b) Actualizar lista de usuarios en la sala
+        utils.updateRoomUserList(currentRoom);
+        
+        // c) Sacar al usuario de la sala (si aún está conectado)
+        socket.leave(currentRoom);
+        
+        // d) Si el usuario tenía una sala de emergencia activa, limpiarla
+        if (hasActiveEmergency && currentRoom === emergencyRoomId) {
+          console.log(`${colors.yellow}⚠️ Usuario abandonó sala de emergencia por desconexión${colors.reset}`);
+          
+          // Notificar a los helpers en la sala de emergencia
+          io.to(emergencyRoomId).emit("emergency_user_disconnected", {
+            userId,
+            username,
+            roomId: emergencyRoomId,
+            message: `${username} se desconectó de la sala de emergencia`,
+            timestamp: Date.now(),
+            helpersInRoom: Array.from(state.emergencyHelpers.get(userId) || [])
+          });
+        }
+      }
+      
+      // 🔄 8. Mover el socket a la sala general (si no es la última conexión)
+      if (!isLastConnection && entry) {
+        socket.join("general");
+        socket.currentRoom = "general";
+        
+        // Notificar entrada a general
+        socket.to("general").emit("user_joined_room", {
+          userId: userId,
+          username: username,
+          roomId: "general",
+          message: `${username} se reconectó en general`,
+          timestamp: Date.now(),
+          isReconnection: true
         });
       }
     }
-    
-    // 🔄 9. Mover el socket a la sala general (si no es la última conexión)
-    if (!isLastConnection && entry) {
-      socket.join("general");
-      socket.currentRoom = "general";
+
+    // 🔄 9. SI EL USUARIO ESTABA EN UNA SALA DE EMERGENCIA, SACARLO AUTOMÁTICAMENTE
+    if (socket.rooms) {
+      const rooms = Array.from(socket.rooms);
+      const emergencyRooms = rooms.filter(room => room.startsWith('emergencia_'));
       
-      // Notificar entrada a general
-      socket.to("general").emit("user_joined_room", {
-        userId: userId,
-        username: username,
-        roomId: "general",
-        message: `${username} se reconectó en general`,
-        timestamp: Date.now(),
-        isReconnection: true
-      });
+      for (const emergencyRoom of emergencyRooms) {
+        socket.leave(emergencyRoom);
+        console.log(`${colors.yellow}⚠️ Socket ${socket.id} removido de sala de emergencia: ${emergencyRoom}${colors.reset}`);
+      }
     }
-  }
 
-  // 🔄 10. SI EL USUARIO ESTABA EN UNA SALA DE EMERGENCIA, SACARLO AUTOMÁTICAMENTE
-  if (socket.rooms) {
-    const rooms = Array.from(socket.rooms);
-    const emergencyRooms = rooms.filter(room => room.startsWith('emergencia_'));
+    // 👥 10. ACTUALIZAR LISTA DE USUARIOS CONECTADOS
+    const connectedUsersList = Array.from(state.connectedUsers.values()).map((u) => ({
+      ...u.userData,
+      socketCount: u.sockets.size,
+      currentRoom: u.userData.currentRoom || "general" // 🔄 Asegurar sala general
+    }));
     
-    for (const emergencyRoom of emergencyRooms) {
-      socket.leave(emergencyRoom);
-      console.log(`${colors.yellow}⚠️ Socket ${socket.id} removido de sala de emergencia: ${emergencyRoom}${colors.reset}`);
-    }
-  }
-
-  // 👥 11. ACTUALIZAR LISTA DE USUARIOS CONECTADOS
-  const connectedUsersList = Array.from(state.connectedUsers.values()).map((u) => ({
-    ...u.userData,
-    socketCount: u.sockets.size,
-    currentRoom: u.userData.currentRoom || "general" // 🔄 Asegurar sala general
-  }));
-  
-  io.emit("connected_users", connectedUsersList);
-  
-  // 🏠 12. ACTUALIZAR LISTA DE USUARIOS EN SALA GENERAL
-  utils.updateRoomUserList("general");
-});
+    io.emit("connected_users", connectedUsersList);
+    
+    // 🏠 11. ACTUALIZAR LISTA DE USUARIOS EN SALA GENERAL
+    utils.updateRoomUserList("general");
+  });
 });
 
 // ============================================================
@@ -2345,8 +2392,15 @@ server.listen(PORT, () => {
   console.log(`${colors.cyan}🌐 http://localhost:${PORT}${colors.reset}`);
   console.log(`${colors.blue}💬 Sistema de salas activo${colors.reset}`);
   console.log(`${colors.red}🚨 Sistema de Emergencia activo${colors.reset}`);
-  console.log(`${colors.yellow}🔒 Sistema de LOCK global (1 emergencia a la vez)${colors.reset}`);
+  console.log(`${colors.yellow}🔒 Sistema de LOCK global (1 emergencia a la vez) con detección de stale locks${colors.reset}`);
   console.log(`${colors.green}✅ Sistema de notificaciones push configurado${colors.reset}`);
   console.log(`${colors.magenta}📱 Notificaciones solo a usuarios NO presentes${colors.reset}`);
   console.log(`${colors.red}🧹 Sistema de limpieza automática de emergencias activo${colors.reset}`);
+  console.log(`${colors.green}✅ Correcciones aplicadas:${colors.reset}`);
+  console.log(`${colors.blue}   - Scope seguro en disconnect${colors.reset}`);
+  console.log(`${colors.blue}   - Token FCM en scope del catch${colors.reset}`);
+  console.log(`${colors.blue}   - Ubicación consistente (lastKnownLocation)${colors.reset}`);
+  console.log(`${colors.blue}   - Performance mejorada en notificaciones${colors.reset}`);
+  console.log(`${colors.blue}   - Lock cleanup mejorado${colors.reset}`);
+  console.log(`${colors.blue}   - Stale lock detection (${LOCK_TTL_MS/1000}s)${colors.reset}`);
 });
