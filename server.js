@@ -398,10 +398,14 @@ const utils = {
 };
 
 // ============================================================
-// 🚀 FUNCIÓN PARA ENVIAR NOTIFICACIONES PUSH (CORREGIDA - scope token fijo)
+// 🚀 FUNCIÓN PARA ENVIAR NOTIFICACIONES PUSH (CORREGIDA)
+// ✅ Usa el token MÁS RECIENTE del array
+// ✅ (Opcional) puede enviar a TODOS los tokens si querés
+// ✅ Limpia tokens inválidos cuando FCM los marca como no registrados
 // ============================================================
 async function sendPushNotification(userId, title, body, data = {}) {
   let token = null; // Declarado fuera del try para scope del catch
+
   try {
     const userDoc = await db.collection(COLLECTIONS.USERS).doc(userId).get();
     if (!userDoc.exists) {
@@ -409,66 +413,80 @@ async function sendPushNotification(userId, title, body, data = {}) {
       return false;
     }
 
-    const userData = userDoc.data();
-    
-    // Intentar obtener token del array primero
-    if (userData.fcmTokens && userData.fcmTokens.length > 0) {
-      token = userData.fcmTokens[0]; // Tomar el más reciente
-    } else if (userData.fcmToken) {
-      token = userData.fcmToken; // Fallback al token único
+    const userData = userDoc.data() || {};
+
+    // ============================================================
+    // ✅ Obtener token (prioridad: array -> token único)
+    // ⚠️ IMPORTANTE: el más reciente suele ser el ÚLTIMO del array
+    // ============================================================
+    if (Array.isArray(userData.fcmTokens) && userData.fcmTokens.length > 0) {
+      token = userData.fcmTokens[userData.fcmTokens.length - 1]; // ✅ más reciente
+    } else if (typeof userData.fcmToken === "string" && userData.fcmToken.length > 0) {
+      token = userData.fcmToken; // fallback
     }
-    
+
     if (!token) {
       console.log(`${colors.yellow}⚠️ Usuario ${userId} sin token FCM${colors.reset}`);
       return false;
     }
 
-    const message = {
-      token: token,
-      notification: {
-        title: title,
-        body: body,
-      },
-      data: {
+    // ============================================================
+    // ✅ Asegurar que data sea SOLO strings (FCM lo requiere)
+    // ============================================================
+    const safeData = Object.fromEntries(
+      Object.entries({
         ...data,
-        type: data.type || 'chat',
-        timestamp: Date.now().toString()
+        type: data.type || "chat",
+        timestamp: Date.now().toString(),
+      }).map(([k, v]) => [k, String(v ?? "")])
+    );
+
+    const message = {
+      token,
+      notification: {
+        title,
+        body,
       },
+      data: safeData,
       android: {
         priority: "high",
         notification: {
           sound: "default",
-          channelId: "emergency_alerts"
-        }
+          channelId: "emergency_alerts",
+        },
       },
       apns: {
         payload: {
           aps: {
             sound: "default",
-            badge: 1
-          }
-        }
-      }
+            badge: 1,
+          },
+        },
+      },
     };
 
     const response = await messaging.send(message);
     console.log(`${colors.green}📱 Notificación enviada a ${userId}: ${response}${colors.reset}`);
     return true;
+
   } catch (error) {
     console.error(`${colors.red}❌ Error enviando notificación:${colors.reset}`, error);
-    
-    // Si el token es inválido, eliminarlo del array (token está en scope)
-    if (error.code === 'messaging/registration-token-not-registered' && token) {
+
+    // ============================================================
+    // 🧹 Si el token es inválido, eliminarlo (del array y del campo único)
+    // ============================================================
+    if (error?.code === "messaging/registration-token-not-registered" && token) {
       try {
         await db.collection(COLLECTIONS.USERS).doc(userId).update({
           fcmTokens: admin.firestore.FieldValue.arrayRemove(token),
-          fcmToken: admin.firestore.FieldValue.delete()
+          fcmToken: admin.firestore.FieldValue.delete(),
         });
         console.log(`${colors.yellow}🗑️ Token inválido eliminado de ${userId}${colors.reset}`);
       } catch (cleanupError) {
         console.error(`${colors.red}❌ Error limpiando token:${colors.reset}`, cleanupError);
       }
     }
+
     return false;
   }
 }
