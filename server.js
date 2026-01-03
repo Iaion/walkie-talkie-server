@@ -398,13 +398,13 @@ const utils = {
 };
 
 // ============================================================
-// 🚀 FUNCIÓN PARA ENVIAR NOTIFICACIONES PUSH (CORREGIDA)
-// ✅ Usa el token MÁS RECIENTE del array
-// ✅ (Opcional) puede enviar a TODOS los tokens si querés
-// ✅ Limpia tokens inválidos cuando FCM los marca como no registrados
+// 🚀 FUNCIÓN PARA ENVIAR NOTIFICACIONES PUSH (MEJORADA)
+// - Prioriza fcmTokens[0]
+// - Fallback: devices[*].token
+// - Fuerza data como strings (FCM)
 // ============================================================
 async function sendPushNotification(userId, title, body, data = {}) {
-  let token = null; // Declarado fuera del try para scope del catch
+  let token = null;
 
   try {
     const userDoc = await db.collection(COLLECTIONS.USERS).doc(userId).get();
@@ -415,30 +415,35 @@ async function sendPushNotification(userId, title, body, data = {}) {
 
     const userData = userDoc.data() || {};
 
-    // ============================================================
-    // ✅ Obtener token (prioridad: array -> token único)
-    // ⚠️ IMPORTANTE: el más reciente suele ser el ÚLTIMO del array
-    // ============================================================
+    // 1) Token principal: array fcmTokens
     if (Array.isArray(userData.fcmTokens) && userData.fcmTokens.length > 0) {
-      token = userData.fcmTokens[userData.fcmTokens.length - 1]; // ✅ más reciente
-    } else if (typeof userData.fcmToken === "string" && userData.fcmToken.length > 0) {
-      token = userData.fcmToken; // fallback
+      token = userData.fcmTokens[0];
+    }
+
+    // 2) Fallback: token único viejo
+    if (!token && userData.fcmToken) {
+      token = userData.fcmToken;
+    }
+
+    // 3) Fallback: devices map (si existe)
+    if (!token && userData.devices && typeof userData.devices === "object") {
+      const deviceEntries = Object.values(userData.devices);
+      const firstDeviceWithToken = deviceEntries.find(d => d && typeof d.token === "string" && d.token.length > 0);
+      token = firstDeviceWithToken?.token || null;
     }
 
     if (!token) {
-      console.log(`${colors.yellow}⚠️ Usuario ${userId} sin token FCM${colors.reset}`);
+      console.log(`${colors.yellow}⚠️ Usuario ${userId} sin token FCM (fcmTokens/fcmToken/devices)${colors.reset}`);
       return false;
     }
 
-    // ============================================================
-    // ✅ Asegurar que data sea SOLO strings (FCM lo requiere)
-    // ============================================================
+    // ✅ FCM requiere data: string->string
     const safeData = Object.fromEntries(
       Object.entries({
         ...data,
         type: data.type || "chat",
         timestamp: Date.now().toString(),
-      }).map(([k, v]) => [k, String(v ?? "")])
+      }).map(([k, v]) => [k, v == null ? "" : String(v)])
     );
 
     const message = {
@@ -452,7 +457,9 @@ async function sendPushNotification(userId, title, body, data = {}) {
         priority: "high",
         notification: {
           sound: "default",
-          channelId: "emergency_alerts",
+          // ✅ IMPORTANTE: que coincida con tu canal Android
+          // Si tu app usa "emergency_alerts_channel", poné ese acá.
+          channelId: safeData.type === "emergency" ? "emergency_alerts_channel" : "chat_notifications",
         },
       },
       apns: {
@@ -466,16 +473,14 @@ async function sendPushNotification(userId, title, body, data = {}) {
     };
 
     const response = await messaging.send(message);
-    console.log(`${colors.green}📱 Notificación enviada a ${userId}: ${response}${colors.reset}`);
+    console.log(`${colors.green}📱 Push enviada a ${userId} (${token.slice(0, 10)}...): ${response}${colors.reset}`);
     return true;
 
   } catch (error) {
     console.error(`${colors.red}❌ Error enviando notificación:${colors.reset}`, error);
 
-    // ============================================================
-    // 🧹 Si el token es inválido, eliminarlo (del array y del campo único)
-    // ============================================================
-    if (error?.code === "messaging/registration-token-not-registered" && token) {
+    // Si el token es inválido, limpiar
+    if (error.code === "messaging/registration-token-not-registered" && token) {
       try {
         await db.collection(COLLECTIONS.USERS).doc(userId).update({
           fcmTokens: admin.firestore.FieldValue.arrayRemove(token),
@@ -490,6 +495,7 @@ async function sendPushNotification(userId, title, body, data = {}) {
     return false;
   }
 }
+
 
 // ============================================================
 // 🗑️ FUNCIÓN PARA ELIMINAR HISTORIAL DE CHAT
@@ -1578,16 +1584,37 @@ io.on("connection", (socket) => {
         if (!isPresent) {
           // Solo enviar push si NO está presente
           await sendPushNotification(
-            targetUserId,
-            `${username} dice:`,
-            text.substring(0, 100),
-            {
-              type: "chat_message",
-              roomId: roomId,
-              messageId: message.id,
-              senderId: userId
-            }
-          );
+  targetUserId,
+  "🚨 EMERGENCIA",
+  `${userName} necesita ayuda`,
+  {
+    type: "emergency",
+
+    // 🔑 Identidad
+    emergencyUserId: userId,
+    emergencyUserName: userName,
+    emergencyType,
+
+    // 📍 Ubicación
+    latitude: latitude.toString(),
+    longitude: longitude.toString(),
+
+    // 🖼️ Usuario
+    avatarUrl: avatarUrl || "",
+
+    // 🚗 Vehículo (aplanado)
+    vehicleMarca: vehicleData?.brand || "",
+    vehicleModelo: vehicleData?.model || "",
+    vehiclePatente: vehicleData?.licensePlate || "",
+    vehicleColor: vehicleData?.color || "",
+    vehicleFoto: vehicleData?.photoUri || "",
+
+    // 🕒
+    timestamp: Date.now().toString(),
+    emergencyRoomId,
+  }
+);
+
         }
       }
       
@@ -1684,17 +1711,37 @@ io.on("connection", (socket) => {
         
         if (!isPresent) {
           await sendPushNotification(
-            targetUserId,
-            `${username} envió un audio`,
-            "Toca para escuchar",
-            {
-              type: "audio_message",
-              roomId: roomId,
-              messageId: message.id,
-              senderId: userId,
-              audioUrl: finalAudioUrl
-            }
-          );
+  targetUserId,
+  "🚨 EMERGENCIA",
+  `${userName} necesita ayuda`,
+  {
+    type: "emergency",
+
+    // 🔑 Identidad
+    emergencyUserId: userId,
+    emergencyUserName: userName,
+    emergencyType,
+
+    // 📍 Ubicación
+    latitude: latitude.toString(),
+    longitude: longitude.toString(),
+
+    // 🖼️ Usuario
+    avatarUrl: avatarUrl || "",
+
+    // 🚗 Vehículo (aplanado)
+    vehicleMarca: vehicleData?.brand || "",
+    vehicleModelo: vehicleData?.model || "",
+    vehiclePatente: vehicleData?.licensePlate || "",
+    vehicleColor: vehicleData?.color || "",
+    vehicleFoto: vehicleData?.photoUri || "",
+
+    // 🕒
+    timestamp: Date.now().toString(),
+    emergencyRoomId,
+  }
+);
+
         }
       }
 
@@ -2090,20 +2137,37 @@ socket.on("emergency_alert", async (data = {}, ack) => {
       if (notifiedUsers.has(targetUserId)) continue;
 
       const ok = await sendPushNotification(
-        targetUserId,
-        "🚨 ¡EMERGENCIA!",
-        `${userName} necesita ayuda`,
-        {
-          type: "emergency",
-          emergencyUserId: userId,
-          userName: userName,
-          latitude: latitude.toString(),
-          longitude: longitude.toString(),
-          emergencyRoomId: emergencyRoomId,
-          avatarUrl: avatarUrl || "",
-          emergencyType: emergencyType,
-        }
-      );
+  targetUserId,
+  "🚨 EMERGENCIA",
+  `${userName} necesita ayuda`,
+  {
+    type: "emergency",
+
+    // 🔑 Identidad
+    emergencyUserId: userId,
+    emergencyUserName: userName,
+    emergencyType,
+
+    // 📍 Ubicación
+    latitude: latitude.toString(),
+    longitude: longitude.toString(),
+
+    // 🖼️ Usuario
+    avatarUrl: avatarUrl || "",
+
+    // 🚗 Vehículo (aplanado)
+    vehicleMarca: vehicleData?.brand || "",
+    vehicleModelo: vehicleData?.model || "",
+    vehiclePatente: vehicleData?.licensePlate || "",
+    vehicleColor: vehicleData?.color || "",
+    vehicleFoto: vehicleData?.photoUri || "",
+
+    // 🕒
+    timestamp: Date.now().toString(),
+    emergencyRoomId,
+  }
+);
+
 
       if (ok) pushNotifications++;
     }
