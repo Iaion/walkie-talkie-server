@@ -441,12 +441,29 @@ async function sendPushNotification(userId, title, body, data = {}) {
     }
 
     // ✅ FCM data debe ser string->string
-    // ✅ Metemos title/body en data para DATA-ONLY
+    // ✅ Forzamos que SIEMPRE viajen los campos críticos de la emergencia
     const merged = {
       ...data,
+
+      // Notif data-only
       title,
       body,
       timestamp: Date.now(),
+
+      // 🔥 Campos críticos (no pueden faltar en el helper)
+      emergency_user_id: data.emergency_user_id ?? data.userId ?? "",
+      emergency_user_name: data.emergency_user_name ?? data.userName ?? "",
+      emergency_latitude: data.emergency_latitude ?? data.latitude ?? "",
+      emergency_longitude: data.emergency_longitude ?? data.longitude ?? "",
+      emergency_avatar_url: data.emergency_avatar_url ?? data.avatarUrl ?? "",
+      emergency_room_id: data.emergency_room_id ?? data.roomId ?? "",
+
+      // 🔥 Vehículo (para que no llegue "solo la foto")
+      vehicle_foto: data.vehicle_foto ?? data.fotoVehiculoUri ?? "",
+      vehicle_marca: data.vehicle_marca ?? data.marca ?? "",
+      vehicle_modelo: data.vehicle_modelo ?? data.modelo ?? "",
+      vehicle_patente: data.vehicle_patente ?? data.patente ?? "",
+      vehicle_color: data.vehicle_color ?? data.color ?? "",
     };
 
     const safeData = Object.fromEntries(
@@ -514,7 +531,7 @@ async function sendPushNotification(userId, title, body, data = {}) {
   } catch (error) {
     console.error(`${colors.red}❌ Error enviando notificación:${colors.reset}`, error);
 
-    // Si el error viene “global” (no por token), no borres nada a ciegas.
+    // Si el error viene "global" (no por token), no borres nada a ciegas.
     // (La limpieza fina ya la hacemos arriba con sendEachForMulticast)
 
     // Aun así, si por alguna razón usaste un solo token (caso raro) y se marcó como no registrado:
@@ -533,7 +550,6 @@ async function sendPushNotification(userId, title, body, data = {}) {
     return false;
   }
 }
-
 
 
 // ============================================================
