@@ -1827,326 +1827,317 @@ io.on("connection", (socket) => {
   });
 
   // ============================================================
-  // 🚨 SISTEMA DE EMERGENCIA (CORREGIDO - CON LOCK STALE Y SCOPE SEGURO)
-  // ============================================================
-  socket.on("emergency_alert", async (data = {}, ack) => {
-    let lockAcquired = false; // Para manejo seguro de rollback
-    try {
-      const {
-        userId,
-        userName,
-        latitude,
-        longitude,
-        timestamp,
-        emergencyType = "general",
-      } = data;
+// 🚨 SISTEMA DE EMERGENCIA (CORREGIDO - CON LOCK STALE Y SCOPE SEGURO)
+// ============================================================
+socket.on("emergency_alert", async (data = {}, ack) => {
+  let lockAcquired = false; // Para manejo seguro de rollback
+  try {
+    const {
+      userId,
+      userName,
+      latitude,
+      longitude,
+      timestamp,
+      emergencyType = "general",
+    } = data;
 
-      console.log(
-        `${colors.red}🚨 Evento → emergency_alert:${colors.reset}`,
-        { userId, userName, latitude, longitude, emergencyType }
-      );
+    console.log(
+      `${colors.red}🚨 Evento → emergency_alert:${colors.reset}`,
+      { userId, userName, latitude, longitude, emergencyType }
+    );
 
-      if (!userId || !userName) {
-        console.warn(`${colors.yellow}⚠️ Datos de usuario faltantes${colors.reset}`);
-        return ack?.({ 
-          success: false, 
-          code: "INVALID_DATA", 
-          message: "Datos de usuario inválidos" 
-        });
-      }
-
-      if (typeof latitude !== "number" || typeof longitude !== "number") {
-        console.warn(`${colors.yellow}⚠️ Coordenadas inválidas${colors.reset}`);
-        return ack?.({ 
-          success: false, 
-          code: "INVALID_LOCATION", 
-          message: "Ubicación inválida" 
-        });
-      }
-
-      // RoomId de emergencia
-      const emergencyRoomId = `emergencia_${userId}`;
-
-      // 🔒 LOCK GLOBAL CON DETECCIÓN DE STALE LOCK
-      const lockResult = await db.runTransaction(async (tx) => {
-        const snap = await tx.get(LOCK_DOC);
-        const lock = snap.exists ? snap.data() : null;
-
-        if (lock?.active === true) {
-          const startedAt = typeof lock.startedAt === "number" ? lock.startedAt : 0;
-          const age = Date.now() - startedAt;
-
-          // ✅ DETECTAR STALE LOCK (>2 minutos)
-          if (startedAt > 0 && age > LOCK_TTL_MS) {
-            tx.set(LOCK_DOC, {
-              active: true,
-              userId,
-              roomId: emergencyRoomId,
-              startedAt: Date.now(),
-              emergencyType,
-              replacedStaleLock: true,
-              previousLock: {
-                userId: lock.userId || null,
-                roomId: lock.roomId || null,
-                startedAt: lock.startedAt || null
-              }
-            }, { merge: true });
-
-            return { allowed: true, staleReplaced: true };
-          }
-
-          // ❌ LOCK ACTIVO Y NO VENCIDO
-          return {
-            allowed: false,
-            activeEmergency: {
-              userId: lock.userId || null,
-              roomId: lock.roomId || null,
-              startedAt: lock.startedAt || null,
-            }
-          };
-        }
-
-        // ✅ NO HAY LOCK ACTIVO, TOMARLO
-        tx.set(LOCK_DOC, {
-          active: true,
-          userId,
-          roomId: emergencyRoomId,
-          startedAt: Date.now(),
-          emergencyType,
-        }, { merge: true });
-
-        return { allowed: true };
-      });
-
-      if (!lockResult.allowed) {
-        return ack?.({
-          success: false,
-          code: "EMERGENCY_ALREADY_ACTIVE",
-          message: "⚠️ Esta es una versión de prueba. Actualmente manejamos una emergencia a la vez, y ya hay una en curso. Volvé a intentarlo más tarde.",
-          activeEmergency: lockResult.activeEmergency,
-        });
-      }
-
-      lockAcquired = true; // Marcar que adquirimos lock
-
-      // Obtener avatar
-      let avatarUrl = null;
-      try {
-        const userDoc = await db.collection(COLLECTIONS.USERS).doc(userId).get();
-        if (userDoc.exists) {
-          const userData = userDoc.data();
-          avatarUrl = userData?.avatarUrl || userData?.avatarUri || null;
-        }
-      } catch (e) {
-        console.warn(`${colors.yellow}⚠️ Error obteniendo avatar:${colors.reset} ${e.message}`);
-      }
-
-      // Obtener vehículo primario
-      let vehicleData = null;
-      try {
-        const vehiculoSnap = await db
-          .collection(COLLECTIONS.VEHICLES)
-          .where("userId", "==", userId)
-          .where("isPrimary", "==", true)
-          .where("isActive", "==", true)
-          .limit(1)
-          .get();
-
-        if (!vehiculoSnap.empty) {
-          const vehiculoDoc = vehiculoSnap.docs[0];
-          const vehiculo = vehiculoDoc.data() || {};
-          const typeRaw = vehiculo.type || vehiculo.tipo || null;
-
-          vehicleData = {
-            id: vehiculoDoc.id,
-            type: typeRaw,
-            name: vehiculo.name || vehiculo.nombre || null,
-            brand: vehiculo.brand || vehiculo.marca || null,
-            model: vehiculo.model || vehiculo.modelo || null,
-            year: vehiculo.year || null,
-            color: vehiculo.color || null,
-            licensePlate: vehiculo.licensePlate || vehiculo.patente || null,
-            photoUri: vehiculo.photoUri || vehiculo.fotoVehiculoUri || null,
-            ...(typeRaw === "CAR" && { doors: vehiculo.doors }),
-            ...(typeRaw === "MOTORCYCLE" && {
-              cylinderCapacity: vehiculo.cylinderCapacity,
-              mileage: vehiculo.mileage,
-            }),
-            ...(typeRaw === "BICYCLE" && {
-              frameSerialNumber: vehiculo.frameSerialNumber,
-              hasElectricMotor: vehiculo.hasElectricMotor,
-              frameSize: vehiculo.frameSize,
-            }),
-          };
-        }
-      } catch (vehErr) {
-        console.warn(`${colors.yellow}⚠️ Error obteniendo vehículo:${colors.reset} ${vehErr.message}`);
-      }
-
-      const emergencyData = {
-        userId,
-        userName,
-        avatarUrl: avatarUrl,
-        latitude,
-        longitude,
-        timestamp: timestamp || Date.now(),
-        socketId: socket.id,
-        emergencyType,
-        status: "active",
-        vehicleInfo: vehicleData,
-      };
-
-      state.emergencyAlerts.set(userId, emergencyData);
-      if (!state.emergencyHelpers.has(userId)) {
-        state.emergencyHelpers.set(userId, new Set());
-      }
-
-      // Guardar en Firestore
-      try {
-        await db
-          .collection(COLLECTIONS.EMERGENCIES)
-          .doc(userId)
-          .set(
-            {
-              ...emergencyData,
-              createdAt: Date.now(),
-            },
-            { merge: true }
-          );
-      } catch (fireErr) {
-        console.error(`${colors.red}❌ Error guardando emergencia:${colors.reset}`, fireErr.message);
-      }
-
-      // Crear sala de emergencia
-      const createdAt = Date.now();
-      const emergencyRoom = {
-        id: emergencyRoomId,
-        name: `Emergencia ${userName}`,
-        type: "emergency",
-        description: `Sala de emergencia para ${userName}`,
-        users: new Set([userId]),
-        createdAt,
-        messageCount: 0,
-        emergencyData: emergencyData,
-      };
-
-      state.chatRooms.set(emergencyRoomId, emergencyRoom);
-      state.emergencyUserRoom.set(userId, emergencyRoomId);
-
-      socket.emit("emergency_room_created", {
-        emergencyUserId: userId,
-        emergencyRoomId,
-      });
-
-      io.emit("new_room_created", {
-        id: emergencyRoom.id,
-        name: emergencyRoom.name,
-        type: emergencyRoom.type,
-        description: emergencyRoom.description,
-        userCount: emergencyRoom.users.size,
-        messageCount: emergencyRoom.messageCount,
-        createdAt: emergencyRoom.createdAt,
-      });
-
-      console.log(`${colors.red}🚨 Sala de emergencia creada: ${emergencyRoomId}${colors.reset}`);
-
-      // Obtener usuarios cercanos (solo sockets)
-      const nearbySockets = utils.getNearbyUsers(latitude, longitude, 50);
-      
-      // 1. ENVIAR POR SOCKET a usuarios cercanos y conectados
-      let socketNotifications = 0;
-      const notifiedUsers = new Set();
-      
-      nearbySockets.forEach((nearbySocketId) => {
-        // Evitar enviar al mismo emisor
-        if (nearbySocketId !== socket.id) {
-          const targetSocket = io.sockets.sockets.get(nearbySocketId);
-          if (targetSocket && targetSocket.userId) {
-            notifiedUsers.add(targetSocket.userId);
-            io.to(nearbySocketId).emit("emergency_alert", {
-              ...emergencyData,
-              emergencyRoomId,
-            });
-            socketNotifications++;
-          }
-        }
-      });
-
-      // 2. ENVIAR NOTIFICACIONES PUSH a usuarios cercanos NO conectados
-      // ✅ CORREGIDO: Usar lastKnownLocation en lugar de location
-      const usersSnapshot = await db.collection(COLLECTIONS.USERS).get();
-      let pushNotifications = 0;
-      
-      for (const doc of usersSnapshot.docs) {
-        const targetUserId = doc.id;
-        const userData = doc.data();
-        
-        // Saltar al usuario que generó la emergencia
-        if (targetUserId === userId) continue;
-        
-        // Si ya fue notificado por socket, saltar
-        if (notifiedUsers.has(targetUserId)) continue;
-        
-        // ✅ VERIFICAR USANDO lastKnownLocation
-        const loc = userData.lastKnownLocation;
-        if (loc && typeof loc.lat === "number" && typeof loc.lng === "number") {
-          const distance = utils.calculateDistance(
-            latitude, longitude,
-            loc.lat, loc.lng
-          );
-          
-          if (distance <= 50) { // 50km radio
-            // Enviar notificación push
-            await sendPushNotification(
-              targetUserId,
-              "🚨 ¡EMERGENCIA CERCANA!",
-              `${userName} necesita ayuda a ${Math.round(distance)}km de ti`,
-              {
-                type: "emergency",
-                emergencyUserId: userId,
-                latitude: latitude.toString(),
-                longitude: longitude.toString(),
-                distance: distance.toString(),
-                emergencyRoomId: emergencyRoomId,
-                avatarUrl: avatarUrl || "",
-                emergencyType: emergencyType
-              }
-            );
-            pushNotifications++;
-          }
-        }
-      }
-
-      console.log(`${colors.red}📢 ALERTA DIFUNDIDA:${colors.reset} ${userName}`);
-      console.log(`${colors.blue}   → Sockets: ${socketNotifications} usuarios conectados${colors.reset}`);
-      console.log(`${colors.magenta}   → Push: ${pushNotifications} usuarios no conectados${colors.reset}`);
-
-      // Respuesta al cliente que originó la emergencia
-      ack?.({
-        success: true,
-        message: "Alerta de emergencia enviada correctamente",
-        vehicle: vehicleData,
-        avatarUrl: avatarUrl,
-        socketNotifications: socketNotifications,
-        pushNotifications: pushNotifications,
-        emergencyRoomId,
-      });
-    } catch (error) {
-      console.error(`${colors.red}❌ Error en emergency_alert:${colors.reset}`, error);
-      
-      // ✅ ROLLBACK SEGURO: Si adquirimos lock pero algo falló, liberarlo
-      if (lockAcquired) {
-        console.log(`${colors.yellow}⚠️ Error después de adquirir lock, liberando...${colors.reset}`);
-        await releaseEmergencyLock();
-      }
-      
-      ack?.({
+    if (!userId || !userName) {
+      console.warn(`${colors.yellow}⚠️ Datos de usuario faltantes${colors.reset}`);
+      return ack?.({
         success: false,
-        code: "SERVER_ERROR",
-        message: "Error procesando alerta de emergencia",
+        code: "INVALID_DATA",
+        message: "Datos de usuario inválidos"
       });
     }
-  });
+
+    if (typeof latitude !== "number" || typeof longitude !== "number") {
+      console.warn(`${colors.yellow}⚠️ Coordenadas inválidas${colors.reset}`);
+      return ack?.({
+        success: false,
+        code: "INVALID_LOCATION",
+        message: "Ubicación inválida"
+      });
+    }
+
+    // RoomId de emergencia
+    const emergencyRoomId = `emergencia_${userId}`;
+
+    // 🔒 LOCK GLOBAL CON DETECCIÓN DE STALE LOCK
+    const lockResult = await db.runTransaction(async (tx) => {
+      const snap = await tx.get(LOCK_DOC);
+      const lock = snap.exists ? snap.data() : null;
+
+      if (lock?.active === true) {
+        const startedAt = typeof lock.startedAt === "number" ? lock.startedAt : 0;
+        const age = Date.now() - startedAt;
+
+        // ✅ DETECTAR STALE LOCK (>2 minutos)
+        if (startedAt > 0 && age > LOCK_TTL_MS) {
+          tx.set(LOCK_DOC, {
+            active: true,
+            userId,
+            roomId: emergencyRoomId,
+            startedAt: Date.now(),
+            emergencyType,
+            replacedStaleLock: true,
+            previousLock: {
+              userId: lock.userId || null,
+              roomId: lock.roomId || null,
+              startedAt: lock.startedAt || null
+            }
+          }, { merge: true });
+
+          return { allowed: true, staleReplaced: true };
+        }
+
+        // ❌ LOCK ACTIVO Y NO VENCIDO
+        return {
+          allowed: false,
+          activeEmergency: {
+            userId: lock.userId || null,
+            roomId: lock.roomId || null,
+            startedAt: lock.startedAt || null,
+          }
+        };
+      }
+
+      // ✅ NO HAY LOCK ACTIVO, TOMARLO
+      tx.set(LOCK_DOC, {
+        active: true,
+        userId,
+        roomId: emergencyRoomId,
+        startedAt: Date.now(),
+        emergencyType,
+      }, { merge: true });
+
+      return { allowed: true };
+    });
+
+    if (!lockResult.allowed) {
+      return ack?.({
+        success: false,
+        code: "EMERGENCY_ALREADY_ACTIVE",
+        message: "⚠️ Esta es una versión de prueba. Actualmente manejamos una emergencia a la vez, y ya hay una en curso. Volvé a intentarlo más tarde.",
+        activeEmergency: lockResult.activeEmergency,
+      });
+    }
+
+    lockAcquired = true; // Marcar que adquirimos lock
+
+    // Obtener avatar
+    let avatarUrl = null;
+    try {
+      const userDoc = await db.collection(COLLECTIONS.USERS).doc(userId).get();
+      if (userDoc.exists) {
+        const userData = userDoc.data();
+        avatarUrl = userData?.avatarUrl || userData?.avatarUri || null;
+      }
+    } catch (e) {
+      console.warn(`${colors.yellow}⚠️ Error obteniendo avatar:${colors.reset} ${e.message}`);
+    }
+
+    // Obtener vehículo primario
+    let vehicleData = null;
+    try {
+      const vehiculoSnap = await db
+        .collection(COLLECTIONS.VEHICLES)
+        .where("userId", "==", userId)
+        .where("isPrimary", "==", true)
+        .where("isActive", "==", true)
+        .limit(1)
+        .get();
+
+      if (!vehiculoSnap.empty) {
+        const vehiculoDoc = vehiculoSnap.docs[0];
+        const vehiculo = vehiculoDoc.data() || {};
+        const typeRaw = vehiculo.type || vehiculo.tipo || null;
+
+        vehicleData = {
+          id: vehiculoDoc.id,
+          type: typeRaw,
+          name: vehiculo.name || vehiculo.nombre || null,
+          brand: vehiculo.brand || vehiculo.marca || null,
+          model: vehiculo.model || vehiculo.modelo || null,
+          year: vehiculo.year || null,
+          color: vehiculo.color || null,
+          licensePlate: vehiculo.licensePlate || vehiculo.patente || null,
+          photoUri: vehiculo.photoUri || vehiculo.fotoVehiculoUri || null,
+          ...(typeRaw === "CAR" && { doors: vehiculo.doors }),
+          ...(typeRaw === "MOTORCYCLE" && {
+            cylinderCapacity: vehiculo.cylinderCapacity,
+            mileage: vehiculo.mileage,
+          }),
+          ...(typeRaw === "BICYCLE" && {
+            frameSerialNumber: vehiculo.frameSerialNumber,
+            hasElectricMotor: vehiculo.hasElectricMotor,
+            frameSize: vehiculo.frameSize,
+          }),
+        };
+      }
+    } catch (vehErr) {
+      console.warn(`${colors.yellow}⚠️ Error obteniendo vehículo:${colors.reset} ${vehErr.message}`);
+    }
+
+    const emergencyData = {
+      userId,
+      userName,
+      avatarUrl: avatarUrl,
+      latitude,
+      longitude,
+      timestamp: timestamp || Date.now(),
+      socketId: socket.id,
+      emergencyType,
+      status: "active",
+      vehicleInfo: vehicleData,
+    };
+
+    state.emergencyAlerts.set(userId, emergencyData);
+    if (!state.emergencyHelpers.has(userId)) {
+      state.emergencyHelpers.set(userId, new Set());
+    }
+
+    // Guardar en Firestore
+    try {
+      await db
+        .collection(COLLECTIONS.EMERGENCIES)
+        .doc(userId)
+        .set(
+          {
+            ...emergencyData,
+            createdAt: Date.now(),
+          },
+          { merge: true }
+        );
+    } catch (fireErr) {
+      console.error(`${colors.red}❌ Error guardando emergencia:${colors.reset}`, fireErr.message);
+    }
+
+    // Crear sala de emergencia
+    const createdAt = Date.now();
+    const emergencyRoom = {
+      id: emergencyRoomId,
+      name: `Emergencia ${userName}`,
+      type: "emergency",
+      description: `Sala de emergencia para ${userName}`,
+      users: new Set([userId]),
+      createdAt,
+      messageCount: 0,
+      emergencyData: emergencyData,
+    };
+
+    state.chatRooms.set(emergencyRoomId, emergencyRoom);
+    state.emergencyUserRoom.set(userId, emergencyRoomId);
+
+    socket.emit("emergency_room_created", {
+      emergencyUserId: userId,
+      emergencyRoomId,
+    });
+
+    io.emit("new_room_created", {
+      id: emergencyRoom.id,
+      name: emergencyRoom.name,
+      type: emergencyRoom.type,
+      description: emergencyRoom.description,
+      userCount: emergencyRoom.users.size,
+      messageCount: emergencyRoom.messageCount,
+      createdAt: emergencyRoom.createdAt,
+    });
+
+    console.log(`${colors.red}🚨 Sala de emergencia creada: ${emergencyRoomId}${colors.reset}`);
+
+    // ============================================================
+    // ✅ NUEVO: NOTIFICAR A TODOS (SIN DISTANCIA)
+    // ============================================================
+
+    // 1) SOCKET: a TODOS los conectados (menos el emisor)
+    let socketNotifications = 0;
+    const notifiedUsers = new Set(); // userIds ya notificados por socket
+
+    for (const [sid, s] of io.sockets.sockets) {
+      // saltar el socket del que originó la emergencia
+      if (sid === socket.id) continue;
+
+      // si el socket pertenece al mismo userId (por si tiene 2 dispositivos)
+      if (s?.userId && s.userId === userId) continue;
+
+      // notificar
+      io.to(sid).emit("emergency_alert", {
+        ...emergencyData,
+        emergencyRoomId,
+      });
+      socketNotifications++;
+
+      // marcar para evitar push duplicado
+      if (s?.userId) notifiedUsers.add(s.userId);
+    }
+
+    // 2) PUSH: a TODOS los usuarios de Firestore (menos el solicitante)
+    const usersSnapshot = await db.collection(COLLECTIONS.USERS).get();
+    let pushNotifications = 0;
+
+    for (const doc of usersSnapshot.docs) {
+      const targetUserId = doc.id;
+
+      // Saltar al usuario que generó la emergencia
+      if (targetUserId === userId) continue;
+
+      // Si ya fue notificado por socket, saltar (evita duplicado)
+      if (notifiedUsers.has(targetUserId)) continue;
+
+      const ok = await sendPushNotification(
+        targetUserId,
+        "🚨 ¡EMERGENCIA!",
+        `${userName} necesita ayuda`,
+        {
+          type: "emergency",
+          emergencyUserId: userId,
+          userName: userName,
+          latitude: latitude.toString(),
+          longitude: longitude.toString(),
+          emergencyRoomId: emergencyRoomId,
+          avatarUrl: avatarUrl || "",
+          emergencyType: emergencyType,
+        }
+      );
+
+      if (ok) pushNotifications++;
+    }
+
+    console.log(`${colors.red}📢 ALERTA DIFUNDIDA:${colors.reset} ${userName}`);
+    console.log(`${colors.blue}   → Sockets: ${socketNotifications} usuarios conectados${colors.reset}`);
+    console.log(`${colors.magenta}   → Push: ${pushNotifications} usuarios no conectados${colors.reset}`);
+
+    // Respuesta al cliente que originó la emergencia
+    ack?.({
+      success: true,
+      message: "Alerta de emergencia enviada correctamente",
+      vehicle: vehicleData,
+      avatarUrl: avatarUrl,
+      socketNotifications: socketNotifications,
+      pushNotifications: pushNotifications,
+      emergencyRoomId,
+    });
+  } catch (error) {
+    console.error(`${colors.red}❌ Error en emergency_alert:${colors.reset}`, error);
+
+    // ✅ ROLLBACK SEGURO: Si adquirimos lock pero algo falló, liberarlo
+    if (lockAcquired) {
+      console.log(`${colors.yellow}⚠️ Error después de adquirir lock, liberando...${colors.reset}`);
+      await releaseEmergencyLock();
+    }
+
+    ack?.({
+      success: false,
+      code: "SERVER_ERROR",
+      message: "Error procesando alerta de emergencia",
+    });
+  }
+});
 
   // ============================================================
   // ✅ EVENTOS DE EMERGENCIA RESTANTES
