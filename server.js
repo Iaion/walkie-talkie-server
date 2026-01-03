@@ -392,13 +392,16 @@ const utils = {
 };
 
 // ============================================================
-// 🚀 FUNCIÓN PARA ENVIAR NOTIFICACIONES PUSH (MEJORADA)
-// - Prioriza fcmTokens[0]
-// - Fallback: devices[*].token
-// - Fuerza data como strings (FCM)
+// 🚀 FUNCIÓN PARA ENVIAR NOTIFICACIONES PUSH (CORREGIDA)
+// ✅ DATA-ONLY (sin "notification") para que Android use TU UI (EmergencyNotificationManager)
+// - Usa TODOS los tokens (multicast): fcmTokens + fallback devices[*].token + fcmToken viejo
+// - Deduplica tokens
+// - Fuerza data como strings (requisito FCM)
+// - Limpia tokens inválidos correctamente
 // ============================================================
 async function sendPushNotification(userId, title, body, data = {}) {
-  let token = null;
+  let tokens = [];
+  let usedTokens = [];
 
   try {
     const userDoc = await db.collection(COLLECTIONS.USERS).doc(userId).get();
@@ -409,88 +412,128 @@ async function sendPushNotification(userId, title, body, data = {}) {
 
     const userData = userDoc.data() || {};
 
-    // 1) Token principal: array fcmTokens
+    // 1) Tokens principales: array fcmTokens (multi-dispositivo)
     if (Array.isArray(userData.fcmTokens) && userData.fcmTokens.length > 0) {
-      token = userData.fcmTokens[0];
+      tokens.push(...userData.fcmTokens.filter(t => typeof t === "string" && t.length > 0));
     }
 
     // 2) Fallback: token único viejo
-    if (!token && userData.fcmToken) {
-      token = userData.fcmToken;
+    if (userData.fcmToken && typeof userData.fcmToken === "string" && userData.fcmToken.length > 0) {
+      tokens.push(userData.fcmToken);
     }
 
     // 3) Fallback: devices map (si existe)
-    if (!token && userData.devices && typeof userData.devices === "object") {
+    if (userData.devices && typeof userData.devices === "object") {
       const deviceEntries = Object.values(userData.devices);
-      const firstDeviceWithToken = deviceEntries.find(d => d && typeof d.token === "string" && d.token.length > 0);
-      token = firstDeviceWithToken?.token || null;
+      for (const d of deviceEntries) {
+        if (d && typeof d.token === "string" && d.token.length > 0) {
+          tokens.push(d.token);
+        }
+      }
     }
 
-    if (!token) {
+    // Deduplicar
+    tokens = Array.from(new Set(tokens));
+
+    if (tokens.length === 0) {
       console.log(`${colors.yellow}⚠️ Usuario ${userId} sin token FCM (fcmTokens/fcmToken/devices)${colors.reset}`);
       return false;
     }
 
-    // ✅ FCM requiere data: string->string
+    // ✅ FCM data debe ser string->string
+    // ✅ Metemos title/body en data para DATA-ONLY
+    const merged = {
+      ...data,
+      title,
+      body,
+      timestamp: Date.now(),
+    };
+
     const safeData = Object.fromEntries(
-      Object.entries({
-        ...data,
-        type: data.type || "chat",
-        timestamp: Date.now().toString(),
-      }).map(([k, v]) => [k, v == null ? "" : String(v)])
+      Object.entries(merged).map(([k, v]) => [k, v == null ? "" : String(v)])
     );
 
+    // ✅ DATA-ONLY: NO incluir message.notification
+    // Para Android: prioridad high
     const message = {
-      token,
-      notification: {
-        title,
-        body,
-      },
-      data: safeData,
+      tokens,
       android: {
         priority: "high",
-        notification: {
-          sound: "default",
-          // ✅ IMPORTANTE: que coincida con tu canal Android
-          // Si tu app usa "emergency_alerts_channel", poné ese acá.
-          channelId: safeData.type === "emergency" ? "emergency_alerts_channel" : "chat_notifications",
-        },
       },
+      data: safeData,
       apns: {
+        headers: {
+          "apns-priority": "10",
+        },
         payload: {
           aps: {
-            sound: "default",
-            badge: 1,
+            "content-available": 1,
           },
         },
       },
     };
 
-    const response = await messaging.send(message);
-    console.log(`${colors.green}📱 Push enviada a ${userId} (${token.slice(0, 10)}...): ${response}${colors.reset}`);
-    return true;
+    const res = await messaging.sendEachForMulticast(message);
 
-  } catch (error) {
-    console.error(`${colors.red}❌ Error enviando notificación:${colors.reset}`, error);
-    
+    usedTokens = tokens;
 
-    // Si el token es inválido, limpiar
-    if (error.code === "messaging/registration-token-not-registered" && token) {
+    const ok = res.successCount > 0;
+    console.log(
+      `${ok ? colors.green : colors.yellow}📱 Push multicast a ${userId}: ${res.successCount}/${tokens.length} ok${colors.reset}`
+    );
+
+    // Limpieza de tokens inválidos (solo los que fallaron con NOT_REGISTERED)
+    const invalidTokens = [];
+    res.responses.forEach((r, idx) => {
+      if (!r.success) {
+        const code = r.error?.code || "";
+        if (code === "messaging/registration-token-not-registered") {
+          invalidTokens.push(tokens[idx]);
+        }
+      }
+    });
+
+    if (invalidTokens.length > 0) {
       try {
         await db.collection(COLLECTIONS.USERS).doc(userId).update({
-          fcmTokens: admin.firestore.FieldValue.arrayRemove(token),
-          fcmToken: admin.firestore.FieldValue.delete(),
-          
+          fcmTokens: admin.firestore.FieldValue.arrayRemove(...invalidTokens),
+          // No borres fcmToken viejo a menos que coincida con alguno inválido
+          ...(invalidTokens.includes(userData.fcmToken)
+            ? { fcmToken: admin.firestore.FieldValue.delete() }
+            : {}),
         });
-        console.log(`${colors.yellow}🗑️ Token inválido eliminado de ${userId}${colors.reset}`);
+        console.log(
+          `${colors.yellow}🗑️ Tokens inválidos eliminados de ${userId}: ${invalidTokens.length}${colors.reset}`
+        );
       } catch (cleanupError) {
-        console.error(`${colors.red}❌ Error limpiando token:${colors.reset}`, cleanupError);
+        console.error(`${colors.red}❌ Error limpiando tokens inválidos:${colors.reset}`, cleanupError);
+      }
+    }
+
+    return ok;
+  } catch (error) {
+    console.error(`${colors.red}❌ Error enviando notificación:${colors.reset}`, error);
+
+    // Si el error viene “global” (no por token), no borres nada a ciegas.
+    // (La limpieza fina ya la hacemos arriba con sendEachForMulticast)
+
+    // Aun así, si por alguna razón usaste un solo token (caso raro) y se marcó como no registrado:
+    const code = error?.code || "";
+    if (code === "messaging/registration-token-not-registered" && usedTokens.length > 0) {
+      try {
+        await db.collection(COLLECTIONS.USERS).doc(userId).update({
+          fcmTokens: admin.firestore.FieldValue.arrayRemove(...usedTokens),
+        });
+        console.log(`${colors.yellow}🗑️ Tokens inválidos eliminados (fallback) de ${userId}${colors.reset}`);
+      } catch (cleanupError) {
+        console.error(`${colors.red}❌ Error limpiando tokens (fallback):${colors.reset}`, cleanupError);
       }
     }
 
     return false;
   }
 }
+
 
 
 // ============================================================
