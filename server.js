@@ -1179,37 +1179,45 @@ io.on("connection", (socket) => {
   console.log(`${colors.cyan}🔗 NUEVA CONEXIÓN SOCKET:${colors.reset} ${socket.id}`);
 
   // ============================================================
-  // 🔑 EVENTO: REGISTRAR TOKEN FCM (CORREGIDO)
-  // ============================================================
-  socket.on('register_fcm_token', async (data = {}, callback) => {
-    try {
-      const { userId, fcmToken } = data;
-      
-      if (!userId || !fcmToken) {
-        return callback?.({ success: false, message: "userId y fcmToken requeridos" });
-      }
+// 🔑 EVENTO: REGISTRAR TOKEN FCM (CORREGIDO - MERGE REAL EN devices)
+// ============================================================
+socket.on("register_fcm_token", async (data = {}, callback) => {
+  try {
+    const { userId, fcmToken } = data;
 
-      // Usar array de tokens (multi-dispositivo) en una sola operación
-      await db.collection(COLLECTIONS.USERS).doc(userId).set({
+    if (!userId || !fcmToken) {
+      return callback?.({ success: false, message: "userId y fcmToken requeridos" });
+    }
+
+    const userRef = db.collection(COLLECTIONS.USERS).doc(userId);
+
+    const deviceId = data.deviceId || socket.id;
+    const devicePath = `devices.${deviceId}`;
+
+    await userRef.set(
+      {
         fcmTokens: admin.firestore.FieldValue.arrayUnion(fcmToken),
         fcmTokensUpdatedAt: Date.now(),
-        devices: {
-          [socket.id]: {
-            token: fcmToken,
-            platform: data.platform || 'android',
-            lastActive: Date.now()
-          }
-        }
-      }, { merge: true });
+        [devicePath]: {
+          token: fcmToken,
+          platform: data.platform || "android",
+          deviceModel: data.deviceModel || null,
+          lastActive: Date.now(),
+        },
+        // (opcional pero recomendado para debug)
+        socketIds: admin.firestore.FieldValue.arrayUnion(socket.id),
+      },
+      { merge: true }
+    );
 
-      console.log(`${colors.green}✅ Token FCM registrado para ${userId}${colors.reset}`);
-      callback?.({ success: true, message: "Token registrado" });
-      
-    } catch (error) {
-      console.error(`${colors.red}❌ Error registrando token:${colors.reset}`, error);
-      callback?.({ success: false, message: error.message });
-    }
-  });
+    console.log(`${colors.green}✅ Token FCM registrado para ${userId}${colors.reset}`);
+    callback?.({ success: true, message: "Token registrado" });
+  } catch (error) {
+    console.error(`${colors.red}❌ Error registrando token:${colors.reset}`, error);
+    callback?.({ success: false, message: error.message });
+  }
+});
+
 
   // ============================================================
   // 👤 USUARIO CONECTADO AL CHAT
