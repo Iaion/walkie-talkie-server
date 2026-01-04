@@ -72,9 +72,12 @@ const COLLECTIONS = {
   EMERGENCIES: "emergencies"
 };
 
-// Firestore lock doc para controlar una emergencia a la vez
-const LOCK_DOC = db.collection("LOCKS").doc("active_emergency");
-const LOCK_TTL_MS = 2 * 60 * 1000; // 2 minutos de timeout para locks stale
+const LOCKS_COLLECTION = "LOCKS";
+const LOCK_DOC_ID = "active";
+const LOCK_REF = db.collection(LOCKS_COLLECTION).doc(LOCK_DOC_ID);
+
+// TTL por si queda stale (opcional)
+const LOCK_TTL_MS = 2 * 60 * 1000;
 
 // ============================================================
 // 🗃️ ESTADO EN MEMORIA
