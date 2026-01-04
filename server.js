@@ -87,9 +87,81 @@ const state = {
   emergencyUserRoom: new Map()      // userId -> emergencyRoomId
 };
 
+
 // ============================================================
 // 🔒 FUNCIÓN PARA LIBERAR LOCK DE EMERGENCIA (MEJORADA)
 // ============================================================
+async function acquireEmergencyLock(userId, roomId, emergencyType = "general") {
+  const now = Date.now();
+
+  return await db.runTransaction(async (tx) => {
+    const snap = await tx.get(LOCK_DOC);
+    const lock = snap.exists ? snap.data() : null;
+
+    // Si hay lock activo, verificar si está stale
+    if (lock?.active === true) {
+      const startedAt = Number(lock.startedAt || 0);
+      const isStale = startedAt > 0 && (now - startedAt) > LOCK_TTL_MS;
+
+      if (!isStale) {
+        return { ok: false, reason: "LOCK_ACTIVE", lock };
+      }
+
+      // Reemplazar lock stale
+      tx.set(
+        LOCK_DOC,
+        {
+          active: true,
+          userId,
+          roomId,
+          emergencyType,
+          startedAt: now,
+          replacedStaleLock: true,
+          previousLock: lock || null,
+        },
+        { merge: true }
+      );
+
+      return { ok: true, replacedStale: true };
+    }
+
+    // Lock libre
+    tx.set(
+      LOCK_DOC,
+      {
+        active: true,
+        userId,
+        roomId,
+        emergencyType,
+        startedAt: now,
+        replacedStaleLock: false,
+        previousLock: null,
+      },
+      { merge: true }
+    );
+
+    return { ok: true, replacedStale: false };
+  });
+}
+
+async function releaseEmergencyLock(reason = "manual_or_system", extra = {}) {
+  try {
+    await LOCK_DOC.set(
+      {
+        active: false,
+        releaseReason: reason,
+        releasedAt: Date.now(),
+        ...extra,
+      },
+      { merge: true }
+    );
+    return true;
+  } catch (e) {
+    console.error("❌ releaseEmergencyLock error:", e);
+    return false;
+  }
+}
+
 // ============================================================
 // 🔓 LIBERAR LOCK DE EMERGENCIA (CORREGIDO)
 // - setea active=false (NO "activate")
