@@ -144,31 +144,8 @@ async function acquireEmergencyLock(userId, roomId, emergencyType = "general") {
   });
 }
 
-async function releaseEmergencyLock(reason = "manual_or_system", extra = {}) {
-  try {
-    await LOCK_DOC.set(
-      {
-        active: false,
-        releaseReason: reason,
-        releasedAt: Date.now(),
-        ...extra,
-      },
-      { merge: true }
-    );
-    return true;
-  } catch (e) {
-    console.error("❌ releaseEmergencyLock error:", e);
-    return false;
-  }
-}
 
-// ============================================================
-// 🔓 LIBERAR LOCK DE EMERGENCIA (CORREGIDO)
-// - setea active=false (NO "activate")
-// - guarda previousLock
-// - limpia userId/roomId actuales
-// - usa transaction para evitar carreras
-// ============================================================
+
 // ============================================================
 // 🔓 LIBERAR LOCK (CORREGIDO)
 // ✅ Colección correcta: "LOCKS"
