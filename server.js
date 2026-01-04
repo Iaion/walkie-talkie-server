@@ -169,51 +169,85 @@ async function releaseEmergencyLock(reason = "manual_or_system", extra = {}) {
 // - limpia userId/roomId actuales
 // - usa transaction para evitar carreras
 // ============================================================
+// ============================================================
+// 🔓 LIBERAR LOCK (CORREGIDO)
+// ✅ Colección correcta: "LOCKS"
+// ✅ Doc correcto: "active_emergency"
+// ✅ Campo correcto: "active"
+// ✅ No falla si el doc no existe (set + merge)
+// ✅ Transacción: no pisa lock activo de OTRO user (protección)
+// ============================================================
 async function releaseEmergencyLock({ userId, roomId, reason = "manual_or_system" } = {}) {
-  const lockRef = db.collection("locks").doc("emergency_lock"); // 👈 asegurate que ESTE sea el doc que mirás
+  const lockRef = db.collection("LOCKS").doc("active_emergency"); // ✅ CORRECTO
 
-  await db.runTransaction(async (tx) => {
-    const snap = await tx.get(lockRef);
+  try {
+    await db.runTransaction(async (tx) => {
+      const snap = await tx.get(lockRef);
 
-    if (!snap.exists) {
-      // si no existe, lo creamos liberado para evitar estados raros
-      tx.set(lockRef, {
-        active: false,
-        releasedAt: Date.now(),
-        releaseReason: reason,
-        userId: null,
-        roomId: null,
-        emergencyType: "general",
-      });
-      return;
-    }
+      if (!snap.exists) {
+        // Si no existe, lo dejamos creado y LIBERADO
+        tx.set(
+          lockRef,
+          {
+            active: false,
+            releasedAt: Date.now(),
+            releaseReason: reason,
+            userId: null,
+            roomId: null,
+            emergencyType: "general",
+            previousLock: null,
+          },
+          { merge: true }
+        );
+        return;
+      }
 
-    const lock = snap.data() || {};
+      const lock = snap.data() || {};
 
-    // ✅ Si el lock está activo pero corresponde a otro userId, NO lo pises (para no cortar otra emergencia)
-    if (lock.active === true && userId && lock.userId && lock.userId !== userId) {
-      console.log(`${colors.yellow}⚠️ Lock activo de otro usuario, no se libera. lockUser=${lock.userId} userId=${userId}${colors.reset}`);
-      return;
-    }
+      // ✅ Si el lock está activo pero corresponde a otro usuario, NO lo pises
+      if (lock.active === true && userId && lock.userId && lock.userId !== userId) {
+        console.log(
+          `${colors.yellow}⚠️ Lock activo de otro usuario, no se libera. lockUser=${lock.userId} userId=${userId}${colors.reset}`
+        );
+        return;
+      }
 
-    tx.update(lockRef, {
-      active: false, // ✅ CLAVE
-      releasedAt: Date.now(),
-      releaseReason: reason,
-      previousLock: {
-        ...lock,
-        releasedAt: lock.releasedAt || null,
-      },
-      userId: null,
-      roomId: null,
+      // ✅ Liberar SIEMPRE el doc correcto y el campo correcto
+      tx.set(
+        lockRef,
+        {
+          active: false, // ✅ CLAVE
+          releasedAt: Date.now(),
+          releaseReason: reason,
+          userId: null,
+          roomId: null,
+          previousLock: {
+            ...lock,
+            releasedAt: lock.releasedAt || null,
+          },
+        },
+        { merge: true } // ✅ no depende de que existan campos
+      );
     });
-  });
 
-  return true;
+    // (Opcional) log de verificación
+    const verify = await lockRef.get();
+    console.log(
+      `${colors.green}✅ Lock liberado (LOCKS/active_emergency). active=${verify.data()?.active}${colors.reset}`
+    );
+
+    return true;
+  } catch (e) {
+    console.error(`${colors.red}❌ Error liberando lock:${colors.reset}`, e);
+    return false;
+  }
 }
 
 // ============================================================
-// 🧹 FUNCIÓN PARA LIMPIAR EMERGENCIA (MIN CAMBIOS - NO TOCA TOKENS)
+// 🧹 FUNCIÓN PARA LIMPIAR EMERGENCIA (CORREGIDA)
+// ✅ No toca tokens
+// ✅ Libera lock correcto (LOCKS/active_emergency, active=false)
+// ✅ Mantiene tu flujo y logs
 // ============================================================
 async function cleanupUserEmergency(userId, username, emergencyRoomId, reason = "user_disconnected") {
   try {
@@ -230,7 +264,6 @@ async function cleanupUserEmergency(userId, username, emergencyRoomId, reason = 
       return false;
     }
 
-    // Usar el roomId correcto (el del estado interno tiene prioridad)
     const roomIdToClean = actualRoomId;
 
     // 2. LIMPIAR ESTADO INTERNO PRIMERO
@@ -243,7 +276,7 @@ async function cleanupUserEmergency(userId, username, emergencyRoomId, reason = 
       userId,
       username: username || "Usuario desconocido",
       roomId: roomIdToClean,
-      reason, // ✅ ahora es variable
+      reason,
       timestamp: Date.now(),
       isActive: false,
     });
@@ -286,14 +319,15 @@ async function cleanupUserEmergency(userId, username, emergencyRoomId, reason = 
         await deleteEmergencyChatHistory(roomIdToClean);
         console.log(`${colors.green}🗑️ Historial de chat eliminado: ${roomIdToClean}${colors.reset}`);
       } catch (chatError) {
-        console.warn(`${colors.yellow}⚠️ No se pudo eliminar historial de chat:${colors.reset}`, chatError.message);
+        console.warn(
+          `${colors.yellow}⚠️ No se pudo eliminar historial de chat:${colors.reset}`,
+          chatError.message
+        );
       }
     }
 
     // 5. ACTUALIZAR FIRESTORE (SIN TOCAR TOKENS / DEVICES / ONLINE)
     try {
-      // a) Actualizar documento del USUARIO
-      // ✅ CAMBIO CLAVE: NO tocar isOnline / currentRoom (evita limpiezas colaterales)
       await db.collection(COLLECTIONS.USERS).doc(userId).update({
         hasActiveEmergency: false,
         emergencyRoomId: null,
@@ -301,7 +335,6 @@ async function cleanupUserEmergency(userId, username, emergencyRoomId, reason = 
         lastSeen: Date.now(),
       });
 
-      // b) Actualizar o crear documento de EMERGENCIA
       const emergencyRef = db.collection(COLLECTIONS.EMERGENCIES).doc(userId);
       const emergencyDoc = await emergencyRef.get();
 
@@ -330,17 +363,19 @@ async function cleanupUserEmergency(userId, username, emergencyRoomId, reason = 
 
       console.log(`${colors.green}✅ Firestore actualizado para usuario: ${userId}${colors.reset}`);
     } catch (firestoreError) {
-      console.error(`${colors.red}❌ Error actualizando Firestore:${colors.reset}`, firestoreError.message);
-      // No retornar false aquí, continuar con la limpieza
+      console.error(
+        `${colors.red}❌ Error actualizando Firestore:${colors.reset}`,
+        firestoreError.message
+      );
     }
 
-    // 6. LIBERAR EL LOCK GLOBAL
+    // 6. ✅ LIBERAR EL LOCK GLOBAL (DOC/CAMPO CORRECTOS)
     try {
       await releaseEmergencyLock({
-  userId,
-  roomId: roomIdToClean,
-  reason,
-});
+        userId,
+        roomId: roomIdToClean,
+        reason,
+      });
 
       console.log(`${colors.green}🔓 Lock de emergencia liberado${colors.reset}`);
     } catch (lockError) {
@@ -348,8 +383,6 @@ async function cleanupUserEmergency(userId, username, emergencyRoomId, reason = 
     }
 
     // 7. NOTIFICAR CAMBIO DE ESTADO A TODOS LOS USUARIOS
-    // ✅ No digas "isOnline:false" si esto se usa también al cancelar emergencia
-    // (si querés mantenerlo, dejalo, pero NO recomiendo tocar online acá)
     io.emit("user_status_changed", {
       userId,
       username: username || "Usuario",
@@ -365,18 +398,22 @@ async function cleanupUserEmergency(userId, username, emergencyRoomId, reason = 
     }));
     io.emit("connected_users", connectedUsersList);
 
-    console.log(`${colors.green}✅ Emergencia COMPLETAMENTE limpiada para: ${username || userId}${colors.reset}`);
+    console.log(
+      `${colors.green}✅ Emergencia COMPLETAMENTE limpiada para: ${username || userId}${colors.reset}`
+    );
     return true;
   } catch (error) {
     console.error(`${colors.red}❌ ERROR CRÍTICO en cleanupUserEmergency:${colors.reset}`, error);
 
-    // Intentar limpieza mínima en caso de error
     try {
       state.emergencyAlerts.delete(userId);
       state.emergencyHelpers.delete(userId);
       state.emergencyUserRoom.delete(userId);
     } catch (cleanupError) {
-      console.error(`${colors.red}❌ Error incluso en limpieza mínima:${colors.reset}`, cleanupError);
+      console.error(
+        `${colors.red}❌ Error incluso en limpieza mínima:${colors.reset}`,
+        cleanupError
+      );
     }
 
     return false;
