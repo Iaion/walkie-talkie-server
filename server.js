@@ -72,12 +72,15 @@ const COLLECTIONS = {
   EMERGENCIES: "emergencies"
 };
 
+// ============================================================
+// 🔒 CONFIGURACIÓN DE LOCKS
+// ============================================================
 const LOCKS_COLLECTION = "LOCKS";
 const LOCK_DOC_ID = "active";
 const LOCK_REF = db.collection(LOCKS_COLLECTION).doc(LOCK_DOC_ID);
+const LOCK_TTL_MS = 2 * 60 * 1000; // 2 minutos
 
-// TTL por si queda stale (opcional)
-const LOCK_TTL_MS = 2 * 60 * 1000;
+
 
 // ============================================================
 // 🗃️ ESTADO EN MEMORIA
@@ -92,13 +95,13 @@ const state = {
 
 
 // ============================================================
-// 🔒 FUNCIÓN PARA LIBERAR LOCK DE EMERGENCIA (MEJORADA)
+// 🔒 FUNCIÓN PARA ADQUIRIR LOCK DE EMERGENCIA (CORREGIDA)
 // ============================================================
 async function acquireEmergencyLock(userId, roomId, emergencyType = "general") {
   const now = Date.now();
 
   return await db.runTransaction(async (tx) => {
-    const snap = await tx.get(LOCK_DOC);
+    const snap = await tx.get(LOCK_REF); // ✅ Usa LOCK_REF
     const lock = snap.exists ? snap.data() : null;
 
     // Si hay lock activo, verificar si está stale
@@ -112,7 +115,7 @@ async function acquireEmergencyLock(userId, roomId, emergencyType = "general") {
 
       // Reemplazar lock stale
       tx.set(
-        LOCK_DOC,
+        LOCK_REF, // ✅ Usa LOCK_REF
         {
           active: true,
           userId,
@@ -130,7 +133,7 @@ async function acquireEmergencyLock(userId, roomId, emergencyType = "general") {
 
     // Lock libre
     tx.set(
-      LOCK_DOC,
+      LOCK_REF, // ✅ Usa LOCK_REF
       {
         active: true,
         userId,
@@ -147,8 +150,6 @@ async function acquireEmergencyLock(userId, roomId, emergencyType = "general") {
   });
 }
 
-
-
 // ============================================================
 // 🔓 LIBERAR LOCK (CORREGIDO)
 // ✅ Colección correcta: "LOCKS"
@@ -157,34 +158,31 @@ async function acquireEmergencyLock(userId, roomId, emergencyType = "general") {
 // ✅ No falla si el doc no existe (set + merge)
 // ✅ Transacción: no pisa lock activo de OTRO user (protección)
 // ============================================================
+// ============================================================
+// 🔓 LIBERAR LOCK DE EMERGENCIA (CORRECTO)
+// ============================================================
 async function releaseEmergencyLock({ userId, roomId, reason = "manual_or_system" } = {}) {
-  const lockRef = db.collection("LOCKS").doc("active_emergency"); // ✅ CORRECTO
-
   try {
     await db.runTransaction(async (tx) => {
-      const snap = await tx.get(lockRef);
+      const snap = await tx.get(LOCK_REF); // ✅ Usa LOCK_REF
 
+      // Si no existe, lo dejamos creado en "libre"
       if (!snap.exists) {
-        // Si no existe, lo dejamos creado y LIBERADO
-        tx.set(
-          lockRef,
-          {
-            active: false,
-            releasedAt: Date.now(),
-            releaseReason: reason,
-            userId: null,
-            roomId: null,
-            emergencyType: "general",
-            previousLock: null,
-          },
-          { merge: true }
-        );
+        tx.set(LOCK_REF, {
+          active: false,
+          releasedAt: Date.now(),
+          releaseReason: reason,
+          userId: null,
+          roomId: null,
+          emergencyType: "general",
+          createdAt: Date.now(),
+        });
         return;
       }
 
       const lock = snap.data() || {};
 
-      // ✅ Si el lock está activo pero corresponde a otro usuario, NO lo pises
+      // ✅ Si hay un lock activo de otro usuario, NO lo pises.
       if (lock.active === true && userId && lock.userId && lock.userId !== userId) {
         console.log(
           `${colors.yellow}⚠️ Lock activo de otro usuario, no se libera. lockUser=${lock.userId} userId=${userId}${colors.reset}`
@@ -192,30 +190,25 @@ async function releaseEmergencyLock({ userId, roomId, reason = "manual_or_system
         return;
       }
 
-      // ✅ Liberar SIEMPRE el doc correcto y el campo correcto
-      tx.set(
-        lockRef,
-        {
-          active: false, // ✅ CLAVE
-          releasedAt: Date.now(),
-          releaseReason: reason,
-          userId: null,
-          roomId: null,
-          previousLock: {
-            ...lock,
-            releasedAt: lock.releasedAt || null,
-          },
+      tx.update(LOCK_REF, {
+        active: false, // ✅ CLAVE
+        releasedAt: Date.now(),
+        releaseReason: reason,
+        roomId: null,
+        userId: null,
+
+        // opcional: guardo snapshot anterior
+        previousLock: {
+          ...lock,
+          releasedAtPrev: lock.releasedAt || null,
+          releaseReasonPrev: lock.releaseReason || null,
         },
-        { merge: true } // ✅ no depende de que existan campos
-      );
+      });
     });
 
-    // (Opcional) log de verificación
-    const verify = await lockRef.get();
     console.log(
-      `${colors.green}✅ Lock liberado (LOCKS/active_emergency). active=${verify.data()?.active}${colors.reset}`
+      `${colors.green}🔓 releaseEmergencyLock OK → LOCKS/active active=false userId=${userId || "null"}${colors.reset}`
     );
-
     return true;
   } catch (e) {
     console.error(`${colors.red}❌ Error liberando lock:${colors.reset}`, e);
@@ -2380,15 +2373,13 @@ socket.on("emergency_alert", async (data = {}, ack) => {
     console.error(`${colors.red}❌ Error en emergency_alert:${colors.reset}`, error);
 
     // ✅ ROLLBACK SEGURO: Si adquirimos lock pero algo falló, liberarlo
-    if (lockAcquired) {
-      console.log(`${colors.yellow}⚠️ Error después de adquirir lock, liberando...${colors.reset}`);
-      await releaseEmergencyLock({
-  userId,
-  roomId: roomIdToClean,
-  reason,
-});
-
-    }
+   if (lockAcquired) {
+  console.log(`${colors.yellow}⚠️ Error después de adquirir lock, liberando...${colors.reset}`);
+  await releaseEmergencyLock({ // ✅ Llama correctamente
+    userId: userId,
+    reason: "error_during_emergency"
+  });
+}
 
     ack?.({
       success: false,
@@ -2660,6 +2651,29 @@ socket.on("emergency_alert", async (data = {}, ack) => {
 initializeDefaultRooms();
 
 const PORT = process.env.PORT || 8080;
+// ============================================================
+// 🛡️ MANEJO DE ERRORES GLOBAL
+// ============================================================
+process.on('uncaughtException', (error) => {
+  console.error(`${colors.red}🔥 ERROR NO CAPTURADO:${colors.reset}`, error);
+  // No salir del proceso, solo loguear
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error(`${colors.red}🔥 PROMESA RECHAZADA NO MANEJADA:${colors.reset}`, reason);
+});
+
+// ============================================================
+// 🧹 LIMPIEZA DE MEMORIA PERIÓDICA
+// ============================================================
+setInterval(() => {
+  const memoryUsage = process.memoryUsage();
+  console.log(`${colors.gray}🧠 Uso de memoria:${colors.reset}`, {
+    rss: Math.round(memoryUsage.rss / 1024 / 1024) + 'MB',
+    heapTotal: Math.round(memoryUsage.heapTotal / 1024 / 1024) + 'MB',
+    heapUsed: Math.round(memoryUsage.heapUsed / 1024 / 1024) + 'MB',
+  });
+}, 300000); // Cada 5 minutos
 server.listen(PORT, () => {
   console.log(`${colors.green}🚀 Servidor de chat corriendo en puerto ${PORT}${colors.reset}`);
   console.log(`${colors.cyan}🌐 http://localhost:${PORT}${colors.reset}`);
