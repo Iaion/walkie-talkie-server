@@ -172,62 +172,109 @@ async function acquireEmergencyLock({ userId, roomId, emergencyType = "general",
 // ✅ Transacción: no pisa lock activo de OTRO user (protección)
 // ============================================================
 // ============================================================
-// 🔓 LIBERAR LOCK DE EMERGENCIA (CORRECTO)
+// 🔓 LIBERAR LOCK DE EMERGENCIA (LOCKS/active_emergency)
 // ============================================================
-async function releaseEmergencyLock({ userId, roomId, reason = "manual_or_system", force = false } = {}) {
+const LOCK_DOC_REF = db.collection("LOCKS").doc("active_emergency"); // ✅ TU COLECCIÓN REAL
+
+async function releaseEmergencyLock(
+  { userId = null, roomId = null, reason = "manual_or_system", force = false } = {}
+) {
   const now = Date.now();
 
-  return await db.runTransaction(async (tx) => {
-    const snap = await tx.get(LOCK_REF);
+  try {
+    const result = await db.runTransaction(async (tx) => {
+      const snap = await tx.get(LOCK_DOC_REF);
 
-    // Si no existe, lo dejamos creado como liberado
-    if (!snap.exists) {
-      tx.set(LOCK_REF, {
-        active: false,
+      // ✅ Si no existe, lo creamos liberado (auto-heal)
+      if (!snap.exists) {
+        tx.set(LOCK_DOC_REF, {
+          active: false,
+          releasedAt: now,
+          releaseReason: reason,
+          userId: null,
+          roomId: null,
+          emergencyType: "general",
+          previousLock: null,
+          createdAt: now,
+        });
+        return { ok: true, created: true };
+      }
+
+      const lock = snap.data() || {};
+      const lockActive = lock.active === true;
+
+      // ✅ Idempotente: si ya está liberado, no hacemos nada
+      if (!lockActive) {
+        return { ok: true, alreadyReleased: true, current: lock };
+      }
+
+      // ✅ Seguridad: si pertenece a otro userId, no liberar (salvo force)
+      const lockUserId = lock.userId || null;
+      if (!force && userId && lockUserId && lockUserId !== userId) {
+        console.log(
+          `${colors.yellow}⚠️ releaseEmergencyLock: lock de otro usuario, NO se libera (force=false). lockUser=${lockUserId} userId=${userId}${colors.reset}`
+        );
+        return { ok: false, code: "LOCK_OTHER_USER", lockUserId, current: lock };
+      }
+
+      // ✅ Guardar snapshot anterior (útil para debug)
+      const prev = {
+        active: lock.active === true,
+        userId: lock.userId || null,
+        roomId: lock.roomId || null,
+        emergencyType: lock.emergencyType || "general",
+        startedAt: lock.startedAt || null,
+        replacedStaleLock: lock.replacedStaleLock || false,
+        releasedAt: lock.releasedAt || null,
+      };
+
+      tx.update(LOCK_DOC_REF, {
+        active: false, // ✅ CLAVE
         releasedAt: now,
         releaseReason: reason,
+        releasedBy: userId || null,
+        releasedRoomId: roomId || null,
+
+        // 🔁 reset de campos activos
         userId: null,
         roomId: null,
         emergencyType: "general",
-        previousLock: null,
+
+        // 🧾 auditoría
+        previousLock: {
+          ...prev,
+          releasedAt: now,
+          releaseReason: reason,
+          releasedBy: userId || null,
+          releasedRoomId: roomId || null,
+        },
       });
-      return { ok: true, created: true };
-    }
 
-    const lock = snap.data() || {};
-
-    // ✅ Si ya está liberado, no hacemos nada (idempotente)
-    if (lock.active !== true) {
-      return { ok: true, alreadyReleased: true };
-    }
-
-    // ✅ Seguridad: si hay lock activo de otro usuario, NO lo pises (salvo force)
-    if (!force && userId && lock.userId && lock.userId !== userId) {
-      console.log(
-        `${colors.yellow}⚠️ releaseEmergencyLock: lock pertenece a otro usuario, NO se libera. lockUser=${lock.userId} userId=${userId}${colors.reset}`
-      );
-      return { ok: false, code: "LOCK_OTHER_USER", lockUserId: lock.userId };
-    }
-
-    tx.update(LOCK_REF, {
-      active: false, // ✅ CLAVE
-      releasedAt: now,
-      releaseReason: reason,
-      previousLock: {
-        ...lock,
-        releasedAt: now,
-        releasedBy: userId || null,
-        releasedRoomId: roomId || null,
-      },
-      userId: null,
-      roomId: null,
+      return { ok: true, updated: true, previous: prev };
     });
 
-    return { ok: true };
-  });
+    // 🔎 Log útil
+    if (result?.ok && result?.updated) {
+      console.log(`${colors.green}🔓 Lock liberado (active=false)${colors.reset}`, {
+        userId,
+        roomId,
+        reason,
+        force,
+      });
+    } else if (result?.ok && result?.alreadyReleased) {
+      console.log(`${colors.gray}ℹ️ Lock ya estaba liberado${colors.reset}`, {
+        userId,
+        roomId,
+        reason,
+      });
+    }
+
+    return result;
+  } catch (e) {
+    console.error(`${colors.red}❌ releaseEmergencyLock falló:${colors.reset}`, e?.message || e);
+    return { ok: false, error: e?.message || String(e) };
+  }
 }
-
-
 // ============================================================
 // 🧹 FUNCIÓN PARA LIMPIAR EMERGENCIA (CORREGIDA)
 // ✅ No toca tokens
@@ -257,14 +304,19 @@ async function cleanupUserEmergency(userId, username, emergencyRoomId, reason = 
     state.emergencyUserRoom.delete(userId);
 
     // 3. NOTIFICAR A TODOS ANTES DE LIMPIAR LA SALA
-    io.emit("emergency_cancelled", {
-      userId,
-      username: username || "Usuario desconocido",
-      roomId: roomIdToClean,
-      reason,
-      timestamp: Date.now(),
-      isActive: false,
-    });
+const safeRoomId = roomIdToClean || state.emergencyUserRoom.get(userId) || `emergencia_${userId}`;
+const safeUserName = username || state.emergencyAlerts.get(userId)?.userName || "Usuario desconocido";
+
+io.emit("emergency_cancelled", {
+  userId,
+  userName: safeUserName,     // ✅ unificado
+  username: safeUserName,     // ✅ compat (por si tu Android lee "username")
+  roomId: safeRoomId,
+  reason,
+  timestamp: Date.now(),
+  isActive: false,
+});
+
 
     // 4. MANEJAR LA SALA DE EMERGENCIA SI EXISTE
     if (roomIdToClean) {
@@ -357,10 +409,11 @@ async function cleanupUserEmergency(userId, username, emergencyRoomId, reason = 
     // 6. ✅ LIBERAR EL LOCK GLOBAL (DOC/CAMPO CORRECTOS)
     try {
       await releaseEmergencyLock({
-        userId,
-        roomId: roomIdToClean,
-        reason,
-      });
+  userId,
+  roomId: roomIdToClean,
+  reason,
+  // force: true, // solo si querés liberar aunque el lock no sea de ese userId
+});
 
       console.log(`${colors.green}🔓 Lock de emergencia liberado${colors.reset}`);
     } catch (lockError) {
@@ -2073,6 +2126,12 @@ socket.on("register_fcm_token", async (data = {}, callback) => {
 // ============================================================
 socket.on("emergency_alert", async (data = {}, ack) => {
   let lockAcquired = false; // Para manejo seguro de rollback
+
+  // ✅ Guardar para poder liberar lock incluso si falla antes del destructuring
+  let reqUserId = null;
+  let reqUserName = null;
+  let emergencyRoomId = null;
+
   try {
     const {
       userId,
@@ -2082,6 +2141,10 @@ socket.on("emergency_alert", async (data = {}, ack) => {
       timestamp,
       emergencyType = "general",
     } = data;
+
+    // ✅ Guardar para catch/rollback
+    reqUserId = userId || null;
+    reqUserName = userName || null;
 
     console.log(
       `${colors.red}🚨 Evento → emergency_alert:${colors.reset}`,
@@ -2106,19 +2169,23 @@ socket.on("emergency_alert", async (data = {}, ack) => {
       });
     }
 
-    // RoomId de emergencia
-    const emergencyRoomId = `emergencia_${userId}`;
+    // RoomId de emergencia (NORMALIZADO)
+    emergencyRoomId = `emergencia_${userId}`;
+
+    // ✅ LOCK DOC REAL: colección LOCKS, doc active_emergency, campo active
+    // (esto reemplaza tu LOCK_DOC que te daba "not defined" o apuntaba a otra colección)
+    const LOCK_DOC = db.collection("LOCKS").doc("active_emergency");
 
     // 🔒 LOCK GLOBAL CON DETECCIÓN DE STALE LOCK
     const lockResult = await db.runTransaction(async (tx) => {
       const snap = await tx.get(LOCK_DOC);
-      const lock = snap.exists ? snap.data() : null;
+      const lock = snap.exists ? (snap.data() || {}) : null;
 
       if (lock?.active === true) {
         const startedAt = typeof lock.startedAt === "number" ? lock.startedAt : 0;
         const age = Date.now() - startedAt;
 
-        // ✅ DETECTAR STALE LOCK (>2 minutos)
+        // ✅ DETECTAR STALE LOCK (> TTL)
         if (startedAt > 0 && age > LOCK_TTL_MS) {
           tx.set(LOCK_DOC, {
             active: true,
@@ -2169,15 +2236,23 @@ socket.on("emergency_alert", async (data = {}, ack) => {
       });
     }
 
-    lockAcquired = true; // Marcar que adquirimos lock
+    lockAcquired = true; // ✅ ya tomamos lock
+
+    // ✅ Unir al socket dueño a SU sala de emergencia (evita que quede en general)
+    try {
+      socket.join(emergencyRoomId);
+      socket.currentRoom = emergencyRoomId;
+    } catch (joinErr) {
+      console.warn(`${colors.yellow}⚠️ No se pudo unir socket a ${emergencyRoomId}:${colors.reset}`, joinErr.message);
+    }
 
     // Obtener avatar
     let avatarUrl = null;
     try {
       const userDoc = await db.collection(COLLECTIONS.USERS).doc(userId).get();
       if (userDoc.exists) {
-        const userData = userDoc.data();
-        avatarUrl = userData?.avatarUrl || userData?.avatarUri || null;
+        const userData = userDoc.data() || {};
+        avatarUrl = userData.avatarUrl || userData.avatarUri || null;
       }
     } catch (e) {
       console.warn(`${colors.yellow}⚠️ Error obteniendo avatar:${colors.reset} ${e.message}`);
@@ -2231,10 +2306,12 @@ socket.on("emergency_alert", async (data = {}, ack) => {
       avatarUrl: avatarUrl,
       latitude,
       longitude,
-      timestamp: timestamp || Date.now(),
+      timestamp: (typeof timestamp === "number" ? timestamp : Date.now()),
       socketId: socket.id,
       emergencyType,
       status: "active",
+      emergencyRoomId,          // ✅ CLAVE
+      roomId: emergencyRoomId,  // ✅ compat
       vehicleInfo: vehicleData,
     };
 
@@ -2251,10 +2328,19 @@ socket.on("emergency_alert", async (data = {}, ack) => {
         .set(
           {
             ...emergencyData,
+            isActive: true,
             createdAt: Date.now(),
           },
           { merge: true }
         );
+
+      // ✅ útil para tu app si lee esto
+      await db.collection(COLLECTIONS.USERS).doc(userId).set({
+        hasActiveEmergency: true,
+        emergencyRoomId,
+        lastEmergencyStarted: Date.now(),
+      }, { merge: true });
+
     } catch (fireErr) {
       console.error(`${colors.red}❌ Error guardando emergencia:${colors.reset}`, fireErr.message);
     }
@@ -2293,7 +2379,7 @@ socket.on("emergency_alert", async (data = {}, ack) => {
     console.log(`${colors.red}🚨 Sala de emergencia creada: ${emergencyRoomId}${colors.reset}`);
 
     // ============================================================
-    // ✅ NUEVO: NOTIFICAR A TODOS (SIN DISTANCIA)
+    // ✅ NOTIFICAR A TODOS (SIN DISTANCIA)
     // ============================================================
 
     // 1) SOCKET: a TODOS los conectados (menos el emisor)
@@ -2307,14 +2393,12 @@ socket.on("emergency_alert", async (data = {}, ack) => {
       // si el socket pertenece al mismo userId (por si tiene 2 dispositivos)
       if (s?.userId && s.userId === userId) continue;
 
-      // notificar
       io.to(sid).emit("emergency_alert", {
         ...emergencyData,
         emergencyRoomId,
       });
       socketNotifications++;
 
-      // marcar para evitar push duplicado
       if (s?.userId) notifiedUsers.add(s.userId);
     }
 
@@ -2325,44 +2409,58 @@ socket.on("emergency_alert", async (data = {}, ack) => {
     for (const doc of usersSnapshot.docs) {
       const targetUserId = doc.id;
 
-      // Saltar al usuario que generó la emergencia
       if (targetUserId === userId) continue;
-
-      // Si ya fue notificado por socket, saltar (evita duplicado)
       if (notifiedUsers.has(targetUserId)) continue;
 
       const ok = await sendPushNotification(
-  targetUserId,
-  "🚨 EMERGENCIA",
-  `${userName} necesita ayuda`,
-  {
-    type: "emergency",
+        targetUserId,
+        "🚨 EMERGENCIA",
+        `${userName} necesita ayuda`,
+        {
+          type: "emergency",
 
-    // 🔑 Identidad
-    emergencyUserId: userId,
-    emergencyUserName: userName,
-    emergencyType,
+          // 🔑 Identidad (claves que vos ya usabas)
+          emergencyUserId: userId,
+          emergencyUserName: userName,
+          emergencyType,
 
-    // 📍 Ubicación
-    latitude: latitude.toString(),
-    longitude: longitude.toString(),
+          // ✅ Compat con tu Android (por si lee estas keys)
+          open_emergency_screen: "true",
+          is_helper: "true",
+          emergency_user_id: userId,
+          emergency_user_name: userName,
+          emergency_type: emergencyType,
+          emergency_room_id: emergencyRoomId,
 
-    // 🖼️ Usuario
-    avatarUrl: avatarUrl || "",
+          // 📍 Ubicación
+          latitude: latitude.toString(),
+          longitude: longitude.toString(),
+          emergency_latitude: latitude.toString(),
+          emergency_longitude: longitude.toString(),
 
-    // 🚗 Vehículo (aplanado)
-    vehicleMarca: vehicleData?.brand || "",
-    vehicleModelo: vehicleData?.model || "",
-    vehiclePatente: vehicleData?.licensePlate || "",
-    vehicleColor: vehicleData?.color || "",
-    vehicleFoto: vehicleData?.photoUri || "",
+          // 🖼️ Usuario
+          avatarUrl: avatarUrl || "",
+          emergency_avatar_url: avatarUrl || "",
 
-    // 🕒
-    timestamp: Date.now().toString(),
-    emergencyRoomId,
-  }
-);
+          // 🚗 Vehículo (aplanado)
+          vehicleMarca: vehicleData?.brand || "",
+          vehicleModelo: vehicleData?.model || "",
+          vehiclePatente: vehicleData?.licensePlate || "",
+          vehicleColor: vehicleData?.color || "",
+          vehicleFoto: vehicleData?.photoUri || "",
 
+          // ✅ Compat con tu receiver anterior (si usa estas)
+          vehicle_marca: vehicleData?.brand || "",
+          vehicle_modelo: vehicleData?.model || "",
+          vehicle_patente: vehicleData?.licensePlate || "",
+          vehicle_color: vehicleData?.color || "",
+          vehicle_foto: vehicleData?.photoUri || "",
+
+          // 🕒
+          timestamp: Date.now().toString(),
+          emergencyRoomId,
+        }
+      );
 
       if (ok) pushNotifications++;
     }
@@ -2372,7 +2470,7 @@ socket.on("emergency_alert", async (data = {}, ack) => {
     console.log(`${colors.magenta}   → Push: ${pushNotifications} usuarios no conectados${colors.reset}`);
 
     // Respuesta al cliente que originó la emergencia
-    ack?.({
+    return ack?.({
       success: true,
       message: "Alerta de emergencia enviada correctamente",
       vehicle: vehicleData,
@@ -2380,20 +2478,27 @@ socket.on("emergency_alert", async (data = {}, ack) => {
       socketNotifications: socketNotifications,
       pushNotifications: pushNotifications,
       emergencyRoomId,
+      staleReplaced: !!lockResult.staleReplaced,
     });
+
   } catch (error) {
     console.error(`${colors.red}❌ Error en emergency_alert:${colors.reset}`, error);
 
     // ✅ ROLLBACK SEGURO: Si adquirimos lock pero algo falló, liberarlo
-   if (lockAcquired) {
-  console.log(`${colors.yellow}⚠️ Error después de adquirir lock, liberando...${colors.reset}`);
-  await releaseEmergencyLock({ // ✅ Llama correctamente
-    userId: userId,
-    reason: "error_during_emergency"
-  });
-}
+    if (lockAcquired) {
+      console.log(`${colors.yellow}⚠️ Error después de adquirir lock, liberando...${colors.reset}`);
+      try {
+        await releaseEmergencyLock({
+          userId: reqUserId,
+          roomId: emergencyRoomId || (reqUserId ? `emergencia_${reqUserId}` : null),
+          reason: "error_during_emergency",
+        });
+      } catch (e) {
+        console.warn(`${colors.yellow}⚠️ Falló releaseEmergencyLock en rollback:${colors.reset}`, e.message);
+      }
+    }
 
-    ack?.({
+    return ack?.({
       success: false,
       code: "SERVER_ERROR",
       message: "Error procesando alerta de emergencia",
@@ -2401,81 +2506,133 @@ socket.on("emergency_alert", async (data = {}, ack) => {
   }
 });
 
-  // ============================================================
-  // ✅ EVENTOS DE EMERGENCIA RESTANTES
-  // ============================================================
-  socket.on("emergency_resolve", async (data = {}, ack) => {
-    try {
-      const { userId } = data;
-      console.log(`${colors.green}✅ Evento → emergency_resolve:${colors.reset}`, { userId });
 
-      if (!userId) {
-        return ack?.({ success: false, message: "userId requerido" });
-      }
+  // ============================================================
+// ✅ EVENTOS DE EMERGENCIA RESTANTES
+// ============================================================
+socket.on("emergency_resolve", async (data = {}, ack) => {
+  try {
+    const { userId, reason = "resolved_by_user" } = data;
 
-      await releaseEmergencyLock({
+    console.log(`${colors.green}✅ Evento → emergency_resolve:${colors.reset}`, { userId, reason });
+
+    if (!userId) {
+      return ack?.({ success: false, message: "userId requerido" });
+    }
+
+    // ✅ Determinar roomId REAL a limpiar (SIEMPRE definido)
+    const emergencyRoomId =
+      state.emergencyUserRoom.get(userId) || `emergencia_${userId}`;
+
+    // ✅ 1) LIBERAR LOCK GLOBAL (ACTIVO = FALSE)
+    // (roomId acá es válido; antes estabas usando roomIdToClean/reason sin definir)
+    await releaseEmergencyLock({
+      userId,
+      roomId: emergencyRoomId,
+      reason,
+    });
+
+    // ✅ 2) NOTIFICAR RESOLUCIÓN / CANCELACIÓN a todos
+    // Si tu app usa "emergency_cancelled" para cerrar pantallas, lo emitimos también
+   // 3. NOTIFICAR A TODOS ANTES DE LIMPIAR LA SALA
+const safeRoomId = roomIdToClean || state.emergencyUserRoom.get(userId) || `emergencia_${userId}`;
+const safeUserName = username || state.emergencyAlerts.get(userId)?.userName || "Usuario desconocido";
+
+io.emit("emergency_cancelled", {
   userId,
-  roomId: roomIdToClean,
+  userName: safeUserName,     // ✅ unificado
+  username: safeUserName,     // ✅ compat (por si tu Android lee "username")
+  roomId: safeRoomId,
   reason,
+  timestamp: Date.now(),
+  isActive: false,
 });
 
-      const emergencyRoomId = state.emergencyUserRoom.get(userId);
+    // A los que están en la sala
+    io.to(emergencyRoomId).emit("emergency_resolved", {
+      roomId: emergencyRoomId,
+      userId,
+      message: "Emergencia resuelta",
+      reason,
+      timestamp: Date.now(),
+    });
 
-      if (emergencyRoomId && state.chatRooms.has(emergencyRoomId)) {
-        io.to(emergencyRoomId).emit("emergency_resolved", {
-          roomId: emergencyRoomId,
-          message: "Emergencia resuelta"
-        });
-
-        try {
-          await deleteEmergencyChatHistory(emergencyRoomId);
-        } catch (deleteError) {
-          console.warn(`${colors.yellow}⚠️ No se pudo eliminar el historial:${colors.reset}`, deleteError.message);
-        }
-
-        const room = state.chatRooms.get(emergencyRoomId);
-        if (room) {
-          room.users.forEach(roomUserId => {
-            const entry = state.connectedUsers.get(roomUserId);
-            if (entry) {
-              entry.sockets.forEach(socketId => {
-                io.sockets.sockets.get(socketId)?.leave(emergencyRoomId);
-              });
-            }
-            const entry2 = state.connectedUsers.get(roomUserId);
-            if (entry2 && entry2.userData?.currentRoom === emergencyRoomId) {
-              entry2.userData.currentRoom = null;
-            }
-          });
-        }
-
-        state.chatRooms.delete(emergencyRoomId);
-        state.emergencyUserRoom.delete(userId);
-      }
-
-      state.emergencyAlerts.delete(userId);
-      state.emergencyHelpers.delete(userId);
-
-      await db.collection(COLLECTIONS.EMERGENCIES).doc(userId).set({
-        status: "resolved",
-        resolvedAt: Date.now()
-      }, { merge: true });
-
-      io.emit("emergency_resolved", { userId });
-
-      console.log(`${colors.green}✅ Emergencia resuelta para usuario: ${userId}${colors.reset}`);
-      
-      ack?.({
-        success: true,
-        message: "Emergencia resuelta correctamente",
-        emergencyRoomId: emergencyRoomId,
-        chatHistoryDeleted: true
-      });
-    } catch (error) {
-      console.error(`${colors.red}❌ Error en emergency_resolve:${colors.reset}`, error);
-      ack?.({ success: false, message: error.message });
+    // ✅ 3) ELIMINAR HISTORIAL (opcional)
+    try {
+      await deleteEmergencyChatHistory(emergencyRoomId);
+      console.log(`${colors.green}🗑️ Historial eliminado: ${emergencyRoomId}${colors.reset}`);
+    } catch (deleteError) {
+      console.warn(
+        `${colors.yellow}⚠️ No se pudo eliminar el historial:${colors.reset}`,
+        deleteError.message
+      );
     }
-  });
+
+    // ✅ 4) SACAR A TODOS DE LA SALA Y LIMPIAR currentRoom en memoria
+    const room = state.chatRooms.get(emergencyRoomId);
+    if (room) {
+      room.users.forEach((roomUserId) => {
+        const entry = state.connectedUsers.get(roomUserId);
+        if (entry) {
+          entry.sockets.forEach((socketId) => {
+            const s = io.sockets.sockets.get(socketId);
+            s?.leave(emergencyRoomId);
+
+            // si este socket estaba "parado" en esa room
+            if (s && s.currentRoom === emergencyRoomId) s.currentRoom = null;
+          });
+
+          // userData currentRoom (si lo estás usando en tu UI)
+          if (entry.userData?.currentRoom === emergencyRoomId) {
+            entry.userData.currentRoom = null;
+          }
+        }
+      });
+    }
+
+    // ✅ 5) LIMPIAR ESTADO EN MEMORIA
+    state.chatRooms.delete(emergencyRoomId);
+    state.emergencyUserRoom.delete(userId);
+    state.emergencyAlerts.delete(userId);
+    state.emergencyHelpers.delete(userId);
+
+    // ✅ 6) ACTUALIZAR FIRESTORE (esto es clave para que al volver atrás no reaparezca)
+    await db.collection(COLLECTIONS.EMERGENCIES).doc(userId).set(
+      {
+        status: "resolved",
+        isActive: false,
+        resolvedAt: Date.now(),
+        endedAt: Date.now(),
+        roomId: emergencyRoomId,
+        endReason: reason,
+      },
+      { merge: true }
+    );
+
+    // También el usuario
+    await db.collection(COLLECTIONS.USERS).doc(userId).set(
+      {
+        hasActiveEmergency: false,
+        emergencyRoomId: null,
+        lastEmergencyEnded: Date.now(),
+      },
+      { merge: true }
+    );
+
+    console.log(`${colors.green}✅ Emergencia resuelta para usuario: ${userId}${colors.reset}`);
+
+    return ack?.({
+      success: true,
+      message: "Emergencia resuelta correctamente",
+      emergencyRoomId,
+      chatHistoryDeleted: true,
+    });
+  } catch (error) {
+    console.error(`${colors.red}❌ Error en emergency_resolve:${colors.reset}`, error);
+    return ack?.({ success: false, message: error.message });
+  }
+});
+
 
   // ============================================================
   // 🔴 DESCONEXIÓN (CORREGIDA - SCOPE SEGURO PARA isLastConnection)
