@@ -75,10 +75,12 @@ const COLLECTIONS = {
 // ============================================================
 // 🔒 CONFIGURACIÓN DE LOCKS
 // ============================================================
-const LOCKS_COLLECTION = "LOCKS";
-const LOCK_DOC_ID = "active";
-const LOCK_REF = db.collection(LOCKS_COLLECTION).doc(LOCK_DOC_ID);
-const LOCK_TTL_MS = 2 * 60 * 1000; // 2 minutos
+// ============================================================
+// 🔒 FIRESTORE LOCK (1 emergencia activa global)
+// Colección: LOCKS | Doc: active_emergency | Campo: active
+// ============================================================
+const LOCK_REF = db.collection("LOCKS").doc("active_emergency");
+const LOCK_TTL_MS = 5 * 60 * 1000; // 5 minutos (ajustable)
 
 
 
@@ -97,58 +99,69 @@ const state = {
 // ============================================================
 // 🔒 FUNCIÓN PARA ADQUIRIR LOCK DE EMERGENCIA (CORREGIDA)
 // ============================================================
-async function acquireEmergencyLock(userId, roomId, emergencyType = "general") {
+async function acquireEmergencyLock({ userId, roomId, emergencyType = "general", reason = "create_emergency" } = {}) {
+  if (!userId) throw new Error("acquireEmergencyLock: userId requerido");
+
   const now = Date.now();
 
   return await db.runTransaction(async (tx) => {
-    const snap = await tx.get(LOCK_REF); // ✅ Usa LOCK_REF
-    const lock = snap.exists ? snap.data() : null;
+    const snap = await tx.get(LOCK_REF);
 
-    // Si hay lock activo, verificar si está stale
-    if (lock?.active === true) {
-      const startedAt = Number(lock.startedAt || 0);
-      const isStale = startedAt > 0 && (now - startedAt) > LOCK_TTL_MS;
-
-      if (!isStale) {
-        return { ok: false, reason: "LOCK_ACTIVE", lock };
-      }
-
-      // Reemplazar lock stale
-      tx.set(
-        LOCK_REF, // ✅ Usa LOCK_REF
-        {
-          active: true,
-          userId,
-          roomId,
-          emergencyType,
-          startedAt: now,
-          replacedStaleLock: true,
-          previousLock: lock || null,
-        },
-        { merge: true }
-      );
-
-      return { ok: true, replacedStale: true };
-    }
-
-    // Lock libre
-    tx.set(
-      LOCK_REF, // ✅ Usa LOCK_REF
-      {
+    // Si no existe, lo creamos como ACTIVO para este user
+    if (!snap.exists) {
+      tx.set(LOCK_REF, {
         active: true,
         userId,
-        roomId,
+        roomId: roomId || null,
         emergencyType,
         startedAt: now,
+        acquiredAt: now,
+        acquireReason: reason,
+        releasedAt: null,
+        releaseReason: null,
         replacedStaleLock: false,
         previousLock: null,
-      },
-      { merge: true }
-    );
+      });
+      return { ok: true, staleReplaced: false };
+    }
 
-    return { ok: true, replacedStale: false };
+    const lock = snap.data() || {};
+    const isActive = lock.active === true;
+    const startedAt = typeof lock.startedAt === "number" ? lock.startedAt : 0;
+    const stale = isActive && startedAt > 0 && (now - startedAt) > LOCK_TTL_MS;
+
+    // ✅ Si está activo y NO está stale => bloquear
+    if (isActive && !stale) {
+      return {
+        ok: false,
+        code: "LOCK_ACTIVE",
+        message: `Ya hay una emergencia activa (userId=${lock.userId || "?"})`,
+        lock,
+      };
+    }
+
+    // ✅ Si está stale, lo reemplazamos
+    tx.update(LOCK_REF, {
+      active: true,
+      userId,
+      roomId: roomId || null,
+      emergencyType,
+      startedAt: now,
+      acquiredAt: now,
+      acquireReason: reason,
+      releasedAt: null,
+      releaseReason: null,
+      replacedStaleLock: stale === true,
+      previousLock: {
+        ...lock,
+        replacedAt: now,
+      },
+    });
+
+    return { ok: true, staleReplaced: stale === true };
   });
 }
+
 
 // ============================================================
 // 🔓 LIBERAR LOCK (CORREGIDO)
@@ -161,60 +174,59 @@ async function acquireEmergencyLock(userId, roomId, emergencyType = "general") {
 // ============================================================
 // 🔓 LIBERAR LOCK DE EMERGENCIA (CORRECTO)
 // ============================================================
-async function releaseEmergencyLock({ userId, roomId, reason = "manual_or_system" } = {}) {
-  try {
-    await db.runTransaction(async (tx) => {
-      const snap = await tx.get(LOCK_REF); // ✅ Usa LOCK_REF
+async function releaseEmergencyLock({ userId, roomId, reason = "manual_or_system", force = false } = {}) {
+  const now = Date.now();
 
-      // Si no existe, lo dejamos creado en "libre"
-      if (!snap.exists) {
-        tx.set(LOCK_REF, {
-          active: false,
-          releasedAt: Date.now(),
-          releaseReason: reason,
-          userId: null,
-          roomId: null,
-          emergencyType: "general",
-          createdAt: Date.now(),
-        });
-        return;
-      }
+  return await db.runTransaction(async (tx) => {
+    const snap = await tx.get(LOCK_REF);
 
-      const lock = snap.data() || {};
-
-      // ✅ Si hay un lock activo de otro usuario, NO lo pises.
-      if (lock.active === true && userId && lock.userId && lock.userId !== userId) {
-        console.log(
-          `${colors.yellow}⚠️ Lock activo de otro usuario, no se libera. lockUser=${lock.userId} userId=${userId}${colors.reset}`
-        );
-        return;
-      }
-
-      tx.update(LOCK_REF, {
-        active: false, // ✅ CLAVE
-        releasedAt: Date.now(),
+    // Si no existe, lo dejamos creado como liberado
+    if (!snap.exists) {
+      tx.set(LOCK_REF, {
+        active: false,
+        releasedAt: now,
         releaseReason: reason,
-        roomId: null,
         userId: null,
-
-        // opcional: guardo snapshot anterior
-        previousLock: {
-          ...lock,
-          releasedAtPrev: lock.releasedAt || null,
-          releaseReasonPrev: lock.releaseReason || null,
-        },
+        roomId: null,
+        emergencyType: "general",
+        previousLock: null,
       });
+      return { ok: true, created: true };
+    }
+
+    const lock = snap.data() || {};
+
+    // ✅ Si ya está liberado, no hacemos nada (idempotente)
+    if (lock.active !== true) {
+      return { ok: true, alreadyReleased: true };
+    }
+
+    // ✅ Seguridad: si hay lock activo de otro usuario, NO lo pises (salvo force)
+    if (!force && userId && lock.userId && lock.userId !== userId) {
+      console.log(
+        `${colors.yellow}⚠️ releaseEmergencyLock: lock pertenece a otro usuario, NO se libera. lockUser=${lock.userId} userId=${userId}${colors.reset}`
+      );
+      return { ok: false, code: "LOCK_OTHER_USER", lockUserId: lock.userId };
+    }
+
+    tx.update(LOCK_REF, {
+      active: false, // ✅ CLAVE
+      releasedAt: now,
+      releaseReason: reason,
+      previousLock: {
+        ...lock,
+        releasedAt: now,
+        releasedBy: userId || null,
+        releasedRoomId: roomId || null,
+      },
+      userId: null,
+      roomId: null,
     });
 
-    console.log(
-      `${colors.green}🔓 releaseEmergencyLock OK → LOCKS/active active=false userId=${userId || "null"}${colors.reset}`
-    );
-    return true;
-  } catch (e) {
-    console.error(`${colors.red}❌ Error liberando lock:${colors.reset}`, e);
-    return false;
-  }
+    return { ok: true };
+  });
 }
+
 
 // ============================================================
 // 🧹 FUNCIÓN PARA LIMPIAR EMERGENCIA (CORREGIDA)
