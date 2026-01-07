@@ -301,7 +301,7 @@ async function releaseEmergencyLock(
 }
 
 // ============================================================
-// 🧹 FUNCIÓN PARA LIMPIAR EMERGENCIA (CORREGIDA)
+// 🧹 FUNCIÓN PARA LIMPIAR EMERGENCIA (CORREGIDA - PRESERVA TOKENS FCM)
 // ============================================================
 async function cleanupUserEmergency(userId, username, emergencyRoomId, reason = "user_disconnected") {
   try {
@@ -326,7 +326,7 @@ async function cleanupUserEmergency(userId, username, emergencyRoomId, reason = 
     state.emergencyHelpers.delete(userId);
     state.emergencyUserRoom.delete(userId);
 
-    // 3. NOTIFICAR A TODOS ANTES DE LIMPIAR LA SALA - ✅ CORREGIDO
+    // 3. NOTIFICAR A TODOS ANTES DE LIMPIAR LA SALA
     io.emit("emergency_cancelled", {
       userId,
       userName: safeUserName,
@@ -382,15 +382,79 @@ async function cleanupUserEmergency(userId, username, emergencyRoomId, reason = 
       }
     }
 
-    // 5. ACTUALIZAR FIRESTORE
+    // 5. ACTUALIZAR FIRESTORE - CON TRANSACCIÓN PARA PRESERVAR TOKENS
     try {
-      await db.collection(COLLECTIONS.USERS).doc(userId).update({
-        hasActiveEmergency: false,
-        emergencyRoomId: null,
-        lastEmergencyEnded: Date.now(),
-        lastSeen: Date.now(),
+      const userRef = db.collection(COLLECTIONS.USERS).doc(userId);
+      
+      // Verificar tokens antes de la limpieza
+      const docParaRevisar = await userRef.get();
+      console.log("🔍 ANTES DE LIMPIAR, TOKENS SON:", {
+        fcmTokens: docParaRevisar.data()?.fcmTokens,
+        fcmToken: docParaRevisar.data()?.fcmToken,
+        devices: docParaRevisar.data()?.devices,
+        userId: userId
+      });
+      
+      await db.runTransaction(async (transaction) => {
+        const userSnap = await transaction.get(userRef);
+        if (!userSnap.exists) {
+          console.log(`${colors.yellow}⚠️ Usuario no encontrado en Firestore: ${userId}${colors.reset}`);
+          return;
+        }
+
+        const userData = userSnap.data() || {};
+        
+        // Solo actualizamos los campos de emergencia específicos,
+        // manteniendo INTACTOS fcmTokens, fcmToken y devices.
+        transaction.update(userRef, {
+          hasActiveEmergency: false,
+          emergencyRoomId: null,
+          lastEmergencyEnded: Date.now(),
+          lastSeen: Date.now(),
+          // No tocamos: fcmTokens, fcmToken, devices, socketIds
+        });
+        
+        console.log(`${colors.green}✅ Transaction preparada: campos de emergencia actualizados${colors.reset}`);
       });
 
+      // Verificar tokens después de la transacción
+      const docDespues = await userRef.get();
+      console.log("🔍 DESPUÉS DE LIMPIAR, TOKENS SON:", {
+        fcmTokens: docDespues.data()?.fcmTokens,
+        fcmToken: docDespues.data()?.fcmToken,
+        devices: docDespues.data()?.devices,
+        userId: userId
+      });
+
+      console.log(`${colors.green}✅ Firestore actualizado (Tokens preservados) para usuario: ${userId}${colors.reset}`);
+      
+    } catch (firestoreError) {
+      console.error(
+        `${colors.red}❌ Error actualizando Firestore:${colors.reset}`,
+        firestoreError.message
+      );
+      
+      // Fallback seguro: actualizar solo los campos necesarios sin transaction
+      try {
+        const userRef = db.collection(COLLECTIONS.USERS).doc(userId);
+        await userRef.set({
+          hasActiveEmergency: false,
+          emergencyRoomId: null,
+          lastEmergencyEnded: Date.now(),
+          lastSeen: Date.now(),
+        }, { merge: true });
+        
+        console.log(`${colors.yellow}🔄 Fallback ejecutado: campos de emergencia actualizados sin transaction${colors.reset}`);
+      } catch (fallbackError) {
+        console.error(
+          `${colors.red}❌ Error incluso en fallback:${colors.reset}`,
+          fallbackError.message
+        );
+      }
+    }
+
+    // 6. ACTUALIZAR DOCUMENTO DE EMERGENCIA
+    try {
       const emergencyRef = db.collection(COLLECTIONS.EMERGENCIES).doc(userId);
       const emergencyDoc = await emergencyRef.get();
 
@@ -417,15 +481,15 @@ async function cleanupUserEmergency(userId, username, emergencyRoomId, reason = 
         });
       }
 
-      console.log(`${colors.green}✅ Firestore actualizado para usuario: ${userId}${colors.reset}`);
-    } catch (firestoreError) {
-      console.error(
-        `${colors.red}❌ Error actualizando Firestore:${colors.reset}`,
-        firestoreError.message
+      console.log(`${colors.green}✅ Documento de emergencia actualizado${colors.reset}`);
+    } catch (emergencyError) {
+      console.warn(
+        `${colors.yellow}⚠️ Error actualizando documento de emergencia:${colors.reset}`,
+        emergencyError.message
       );
     }
 
-    // 6. ✅ LIBERAR EL LOCK GLOBAL
+    // 7. ✅ LIBERAR EL LOCK GLOBAL
     try {
       await releaseEmergencyLock({
         userId,
@@ -439,7 +503,7 @@ async function cleanupUserEmergency(userId, username, emergencyRoomId, reason = 
       console.warn(`${colors.yellow}⚠️ Error liberando lock:${colors.reset}`, lockError.message);
     }
 
-    // 7. NOTIFICAR CAMBIO DE ESTADO A TODOS LOS USUARIOS
+    // 8. NOTIFICAR CAMBIO DE ESTADO A TODOS LOS USUARIOS
     io.emit("user_status_changed", {
       userId,
       username: safeUserName,
@@ -448,7 +512,7 @@ async function cleanupUserEmergency(userId, username, emergencyRoomId, reason = 
       timestamp: Date.now(),
     });
 
-    // 8. ACTUALIZAR LISTA DE USUARIOS CONECTADOS
+    // 9. ACTUALIZAR LISTA DE USUARIOS CONECTADOS
     const connectedUsersList = Array.from(state.connectedUsers.values()).map((u) => ({
       ...u.userData,
       socketCount: u.sockets.size,
@@ -476,7 +540,6 @@ async function cleanupUserEmergency(userId, username, emergencyRoomId, reason = 
     return false;
   }
 }
-
 // ============================================================
 // 🛠️ FUNCIONES UTILITARIAS
 // ============================================================
