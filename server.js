@@ -303,179 +303,227 @@ async function releaseEmergencyLock(
 // ============================================================
 // 🧹 FUNCIÓN PARA LIMPIAR EMERGENCIA (CORREGIDA)
 // ============================================================
-async function cleanupUserEmergency(userId, username, emergencyRoomId, reason = "user_disconnected") {
-  try {
-    console.log(
-      `${colors.red}🧹 LIMPIANDO EMERGENCIA DE USUARIO: ${username || userId}${colors.reset}`
-    );
+socket.on("disconnect", async (reason) => {
+  const userId = socket.userId;
+  const username = socket.username;
+  const currentRoom = socket.currentRoom;
+  
+  console.log(`${colors.red}🔌 Socket desconectado:${colors.reset} ${username || socket.id} (${reason})`);
 
-    // 🔍 1. VERIFICAR SI REALMENTE EXISTE UNA EMERGENCIA ACTIVA
-    const hasActiveEmergency = state.emergencyAlerts.has(userId);
-    const actualRoomId = state.emergencyUserRoom.get(userId) || emergencyRoomId;
+  let entry = userId ? state.connectedUsers.get(userId) : null;
+  let isLastConnection = true;
+  
+  if (entry) {
+    entry.sockets.delete(socket.id);
+    isLastConnection = entry.sockets.size === 0;
+  }
 
-    if (!hasActiveEmergency && !actualRoomId) {
-      console.log(`${colors.yellow}⚠️ No hay emergencia activa para limpiar: ${userId}${colors.reset}`);
-      return false;
-    }
-
-    const roomIdToClean = actualRoomId;
-    const safeUserName = username || state.emergencyAlerts.get(userId)?.userName || "Usuario desconocido";
-
-    // 2. LIMPIAR ESTADO INTERNO PRIMERO
-    state.emergencyAlerts.delete(userId);
-    state.emergencyHelpers.delete(userId);
-    state.emergencyUserRoom.delete(userId);
-
-    // 3. NOTIFICAR A TODOS ANTES DE LIMPIAR LA SALA - ✅ CORREGIDO
-    io.emit("emergency_cancelled", {
-      userId,
-      userName: safeUserName,
-      username: safeUserName,
-      roomId: roomIdToClean,
-      reason,
-      timestamp: Date.now(),
-      isActive: false,
-    });
-
-    // 4. MANEJAR LA SALA DE EMERGENCIA SI EXISTE
-    if (roomIdToClean) {
-      console.log(`${colors.cyan}📝 Limpiando sala de emergencia: ${roomIdToClean}${colors.reset}`);
-
-      // a) Notificar a todos en la sala
-      io.to(roomIdToClean).emit("emergency_ended", {
-        roomId: roomIdToClean,
-        userId,
-        username: safeUserName,
-        reason,
-        message: `${safeUserName} finalizó la emergencia.`,
-        timestamp: Date.now(),
-      });
-
-      // b) Sacar a todos de la sala
-      const socketsInRoom = io.sockets.adapter.rooms.get(roomIdToClean);
-      if (socketsInRoom) {
-        for (const socketId of socketsInRoom) {
-          const socket = io.sockets.sockets.get(socketId);
-          if (socket) {
-            socket.leave(roomIdToClean);
-            if (socket.userId === userId) {
-              socket.currentRoom = null;
-            }
-          }
-        }
-      }
-
-      // c) Eliminar del estado de chatRooms si existe
-      if (state.chatRooms.has(roomIdToClean)) {
-        state.chatRooms.delete(roomIdToClean);
-      }
-
-      // d) Opcional: eliminar historial de chat
-      try {
-        await deleteEmergencyChatHistory(roomIdToClean);
-        console.log(`${colors.green}🗑️ Historial de chat eliminado: ${roomIdToClean}${colors.reset}`);
-      } catch (chatError) {
-        console.warn(
-          `${colors.yellow}⚠️ No se pudo eliminar historial de chat:${colors.reset}`,
-          chatError.message
-        );
-      }
-    }
-
-    // 5. ACTUALIZAR FIRESTORE
+  const hasActiveEmergency = state.emergencyAlerts.has(userId);
+  const emergencyRoomId = state.emergencyUserRoom.get(userId);
+  
+  if (userId) {
     try {
-      await db.collection(COLLECTIONS.USERS).doc(userId).update({
-        hasActiveEmergency: false,
-        emergencyRoomId: null,
-        lastEmergencyEnded: Date.now(),
-        lastSeen: Date.now(),
-      });
-
-      const emergencyRef = db.collection(COLLECTIONS.EMERGENCIES).doc(userId);
-      const emergencyDoc = await emergencyRef.get();
-
-      const endedPayload = {
-        status: "cancelled",
-        endReason: reason,
-        endedAt: Date.now(),
-        isActive: false,
-        cleanedBySystem: true,
-        cleanedAt: Date.now(),
-        roomId: roomIdToClean || null,
+      // ✅ ACTUALIZACIÓN SEGURA - NO BORRAR TOKENS FCM
+      const updateData = {
+        socketIds: admin.firestore.FieldValue.arrayRemove(socket.id),
+        lastSeen: Date.now()
       };
-
-      if (emergencyDoc.exists) {
-        await emergencyRef.update(endedPayload);
-      } else {
-        await emergencyRef.set({
-          userId,
-          username: safeUserName,
-          startReason: "unknown",
-          startedAt: Date.now() - 60000,
-          createdAt: Date.now(),
-          ...endedPayload,
+      
+      if (isLastConnection) {
+        updateData.isOnline = false;
+        updateData.currentRoom = "general";
+      }
+      
+      await db.collection(COLLECTIONS.USERS).doc(userId).update(updateData);
+      
+      console.log(`${colors.green}✅ Firestore actualizado para desconexión: ${userId}${colors.reset}`);
+    } catch (error) {
+      console.warn(`${colors.yellow}⚠️ Error actualizando Firestore en desconexión:${colors.reset}`, error.message);
+    }
+    
+    if (isLastConnection && entry) {
+      // ✅ USUARIO COMPLETAMENTE DESCONECTADO (ÚLTIMO SOCKET)
+      entry.userData.isOnline = false;
+      entry.userData.currentRoom = "general";
+      
+      // ✅ SOLO LIMPIAR EMERGENCIA SI REALMENTE ES LA ÚLTIMA CONEXIÓN
+      // Y EL USUARIO TIENE UNA EMERGENCIA ACTIVA
+      if (hasActiveEmergency) {
+        console.log(`${colors.red}🚨 USUARIO CON EMERGENCIA ACTIVA SE DESCONECTÓ (última conexión): ${username}${colors.reset}`);
+        await cleanupUserEmergency(userId, username, emergencyRoomId, "user_disconnected_last_connection");
+      }
+      
+      // Eliminar del estado después de limpiar emergencia
+      state.connectedUsers.delete(userId);
+      
+      io.emit('user_status_changed', {
+        userId,
+        username,
+        isOnline: false,
+        currentRoom: "general",
+        emergencyCleared: hasActiveEmergency,
+        timestamp: Date.now(),
+        wasLastConnection: true
+      });
+      
+      console.log(`${colors.red}🔴 Usuario ${username} completamente desconectado. ${hasActiveEmergency ? '(Emergencia limpiada)' : ''}${colors.reset}`);
+      
+    } else if (entry) {
+      // ✅ EL USUARIO TIENE OTRAS CONEXIONES - NO LIMPIAR EMERGENCIA
+      console.log(`${colors.yellow}⚠️ Usuario ${username} tiene ${entry.sockets.size} conexiones restantes${colors.reset}`);
+      
+      socket.leave(currentRoom);
+      socket.currentRoom = "general";
+      
+      if (currentRoom && currentRoom !== "general") {
+        socket.to(currentRoom).emit("user_left_room", {
+          userId: userId,
+          username: username,
+          roomId: currentRoom,
+          message: `${username} se desconectó (tiene otras conexiones)`,
+          timestamp: Date.now(),
+          socketId: socket.id,
+          hadEmergency: hasActiveEmergency,
+          emergencyStillActive: hasActiveEmergency, // ✅ Informar que la emergencia sigue activa
+          remainingConnections: entry.sockets.size
         });
       }
-
-      console.log(`${colors.green}✅ Firestore actualizado para usuario: ${userId}${colors.reset}`);
-    } catch (firestoreError) {
-      console.error(
-        `${colors.red}❌ Error actualizando Firestore:${colors.reset}`,
-        firestoreError.message
-      );
+      
+      // ✅ Si tiene emergencia activa pero otras conexiones, solo notificar
+      if (hasActiveEmergency && currentRoom === emergencyRoomId) {
+        console.log(`${colors.yellow}⚠️ Usuario con emergencia activa se desconectó (pero tiene otras conexiones)${colors.reset}`);
+        
+        io.to(emergencyRoomId).emit("emergency_user_partial_disconnect", {
+          userId,
+          username,
+          roomId: emergencyRoomId,
+          message: `${username} perdió una conexión`,
+          timestamp: Date.now(),
+          remainingConnections: entry.sockets.size,
+          emergencyStillActive: true
+        });
+      }
+      
+    } else if (hasActiveEmergency && !entry) {
+      // ✅ CASO EXTRAÑO: EMERGENCIA ACTIVA PERO USUARIO NO ENCONTRADO
+      console.log(`${colors.red}🚨 USUARIO NO ENCONTRADO PERO CON EMERGENCIA ACTIVA: ${userId}${colors.reset}`);
+      
+      // ✅ CORREGIDO: Usar cleanupUserEmergency con cuidado
+      const cleanupResult = await cleanupUserEmergency(userId, username, emergencyRoomId, "user_not_found_with_active_emergency");
+      
+      if (cleanupResult) {
+        console.log(`${colors.green}✅ Emergencia limpiada exitosamente para usuario no encontrado${colors.reset}`);
+      } else {
+        console.error(`${colors.red}❌ Falló la limpieza de emergencia para usuario no encontrado${colors.reset}`);
+      }
     }
 
-    // 6. ✅ LIBERAR EL LOCK GLOBAL
-    try {
-      await releaseEmergencyLock({
-        userId,
-        roomId: roomIdToClean,
-        reason,
-        force: false,
-      });
+    // ✅ MANEJO DE SALAS
+    if (currentRoom && currentRoom !== "general") {
+      // Solo emitir evento si realmente estaba en la sala
+      if (socket.rooms?.has(currentRoom)) {
+        socket.to(currentRoom).emit("user_left_room", {
+          userId: userId,
+          username: username,
+          roomId: currentRoom,
+          message: `${username} se desconectó`,
+          timestamp: Date.now(),
+          socketId: socket.id,
+          hadEmergency: hasActiveEmergency,
+          movedToGeneral: true,
+          isLastConnection: isLastConnection
+        });
 
-      console.log(`${colors.green}🔓 Lock de emergencia liberado${colors.reset}`);
-    } catch (lockError) {
-      console.warn(`${colors.yellow}⚠️ Error liberando lock:${colors.reset}`, lockError.message);
+        utils.updateRoomUserList(currentRoom);
+      }
+      
+      socket.leave(currentRoom);
+      
+      // ✅ MANEJO ESPECÍFICO PARA SALAS DE EMERGENCIA
+      if (hasActiveEmergency && currentRoom === emergencyRoomId) {
+        console.log(`${colors.yellow}⚠️ Usuario abandonó sala de emergencia por desconexión${colors.reset}`);
+        
+        io.to(emergencyRoomId).emit("emergency_user_disconnected", {
+          userId,
+          username,
+          roomId: emergencyRoomId,
+          message: `${username} perdió una conexión a la sala de emergencia`,
+          timestamp: Date.now(),
+          helpersInRoom: Array.from(state.emergencyHelpers.get(userId) || []),
+          remainingConnections: entry?.sockets?.size || 0,
+          isLastConnection: isLastConnection
+        });
+      }
     }
-
-    // 7. NOTIFICAR CAMBIO DE ESTADO A TODOS LOS USUARIOS
-    io.emit("user_status_changed", {
-      userId,
-      username: safeUserName,
-      hasActiveEmergency: false,
-      emergencyCleared: true,
-      timestamp: Date.now(),
-    });
-
-    // 8. ACTUALIZAR LISTA DE USUARIOS CONECTADOS
-    const connectedUsersList = Array.from(state.connectedUsers.values()).map((u) => ({
-      ...u.userData,
-      socketCount: u.sockets.size,
-    }));
-    io.emit("connected_users", connectedUsersList);
-
-    console.log(
-      `${colors.green}✅ Emergencia COMPLETAMENTE limpiada para: ${safeUserName}${colors.reset}`
-    );
-    return true;
-  } catch (error) {
-    console.error(`${colors.red}❌ ERROR CRÍTICO en cleanupUserEmergency:${colors.reset}`, error);
-
-    try {
-      state.emergencyAlerts.delete(userId);
-      state.emergencyHelpers.delete(userId);
-      state.emergencyUserRoom.delete(userId);
-    } catch (cleanupError) {
-      console.error(
-        `${colors.red}❌ Error incluso en limpieza mínima:${colors.reset}`,
-        cleanupError
-      );
+    
+    // ✅ SI NO ES LA ÚLTIMA CONEXIÓN, MANTENER EN GENERAL
+    if (!isLastConnection && entry) {
+      const generalSocket = entry.sockets.values().next().value;
+      if (generalSocket) {
+        const generalSocketObj = io.sockets.sockets.get(generalSocket);
+        if (generalSocketObj) {
+          generalSocketObj.join("general");
+          generalSocketObj.currentRoom = "general";
+          
+          generalSocketObj.to("general").emit("user_joined_room", {
+            userId: userId,
+            username: username,
+            roomId: "general",
+            message: `${username} está conectado en general`,
+            timestamp: Date.now(),
+            isReconnection: false,
+            remainingConnections: entry.sockets.size
+          });
+        }
+      }
     }
-
-    return false;
   }
-}
+
+  // ✅ LIMPIAR SALAS DE EMERGENCIA QUE EL SOCKET PUEDA HABER DEJADO
+  if (socket.rooms) {
+    const rooms = Array.from(socket.rooms);
+    const emergencyRooms = rooms.filter(room => room.startsWith('emergencia_'));
+    
+    for (const emergencyRoom of emergencyRooms) {
+      socket.leave(emergencyRoom);
+      console.log(`${colors.yellow}⚠️ Socket ${socket.id} removido de sala de emergencia: ${emergencyRoom}${colors.reset}`);
+      
+      // ✅ Notificar si era ayudante en esa sala
+      const roomHelpers = state.emergencyHelpers.get(emergencyRoom.replace('emergencia_', ''));
+      if (roomHelpers?.has(userId)) {
+        io.to(emergencyRoom).emit("helper_disconnected", {
+          helperId: userId,
+          helperName: username,
+          roomId: emergencyRoom,
+          timestamp: Date.now(),
+          message: `${username} se desconectó de la sala de ayuda`
+        });
+      }
+    }
+  }
+
+  // ✅ ACTUALIZAR LISTA DE USUARIOS CONECTADOS
+  const connectedUsersList = Array.from(state.connectedUsers.values()).map((u) => ({
+    ...u.userData,
+    socketCount: u.sockets.size,
+    currentRoom: u.userData.currentRoom || "general",
+    hasActiveEmergency: state.emergencyAlerts.has(u.userData.id)
+  }));
+  
+  io.emit("connected_users", connectedUsersList);
+  utils.updateRoomUserList("general");
+  
+  // ✅ LOG FINAL
+  console.log(`${colors.cyan}📊 Estado después de desconexión:${colors.reset}`, {
+    totalUsers: state.connectedUsers.size,
+    activeEmergencies: state.emergencyAlerts.size,
+    userId,
+    username,
+    isLastConnection,
+    hasActiveEmergency,
+    emergencyRoomId
+  });
+});
 
 // ============================================================
 // 🛠️ FUNCIONES UTILITARIAS
