@@ -82,8 +82,6 @@ const COLLECTIONS = {
 const LOCK_REF = db.collection("LOCKS").doc("active_emergency");
 const LOCK_TTL_MS = 5 * 60 * 1000; // 5 minutos (ajustable)
 
-
-
 // ============================================================
 // 🗃️ ESTADO EN MEMORIA
 // ============================================================
@@ -95,24 +93,26 @@ const state = {
   emergencyUserRoom: new Map()      // userId -> emergencyRoomId
 };
 
-
 // ============================================================
-// 🔒 FUNCIÓN PARA ADQUIRIR LOCK DE EMERGENCIA (CORREGIDA)
+// 🔒 ADQUIRIR LOCK DE EMERGENCIA (LOCKS/active_emergency) - ROBUSTO
 // ============================================================
-async function acquireEmergencyLock({ userId, roomId, emergencyType = "general", reason = "create_emergency" } = {}) {
+async function acquireEmergencyLock(
+  { userId, roomId, emergencyType = "general", reason = "create_emergency" } = {}
+) {
   if (!userId) throw new Error("acquireEmergencyLock: userId requerido");
 
   const now = Date.now();
+  const normalizedRoomId = roomId || `emergencia_${userId}`;
 
   return await db.runTransaction(async (tx) => {
     const snap = await tx.get(LOCK_REF);
 
-    // Si no existe, lo creamos como ACTIVO para este user
+    // ✅ Si no existe, lo creamos como ACTIVO
     if (!snap.exists) {
       tx.set(LOCK_REF, {
         active: true,
         userId,
-        roomId: roomId || null,
+        roomId: normalizedRoomId,
         emergencyType,
         startedAt: now,
         acquiredAt: now,
@@ -122,15 +122,45 @@ async function acquireEmergencyLock({ userId, roomId, emergencyType = "general",
         replacedStaleLock: false,
         previousLock: null,
       });
-      return { ok: true, staleReplaced: false };
+      return { ok: true, staleReplaced: false, created: true };
     }
 
     const lock = snap.data() || {};
     const isActive = lock.active === true;
-    const startedAt = typeof lock.startedAt === "number" ? lock.startedAt : 0;
-    const stale = isActive && startedAt > 0 && (now - startedAt) > LOCK_TTL_MS;
 
-    // ✅ Si está activo y NO está stale => bloquear
+    const startedAt =
+      typeof lock.startedAt === "number" && lock.startedAt > 0 ? lock.startedAt : 0;
+
+    // ✅ Si está activo pero NO tiene startedAt válido → tratar como stale
+    const staleByMissingStartedAt = isActive && startedAt === 0;
+
+    const staleByTTL =
+      isActive && startedAt > 0 && (now - startedAt) > LOCK_TTL_MS;
+
+    const stale = staleByMissingStartedAt || staleByTTL;
+
+    // ✅ Idempotente: si el lock activo ya es del MISMO userId, lo "renovamos"
+    if (isActive && !stale && lock.userId === userId) {
+      tx.update(LOCK_REF, {
+        active: true,
+        userId,
+        roomId: normalizedRoomId,
+        emergencyType,
+        startedAt: startedAt || now,
+        acquiredAt: lock.acquiredAt || now,
+        lastTouchAt: now,
+        acquireReason: reason,
+      });
+
+      return {
+        ok: true,
+        staleReplaced: false,
+        alreadyOwned: true,
+        lock: { ...lock, roomId: normalizedRoomId },
+      };
+    }
+
+    // ❌ Lock activo y NO stale => bloquear
     if (isActive && !stale) {
       return {
         ok: false,
@@ -140,42 +170,42 @@ async function acquireEmergencyLock({ userId, roomId, emergencyType = "general",
       };
     }
 
-    // ✅ Si está stale, lo reemplazamos
+    // ✅ Stale: reemplazarlo
     tx.update(LOCK_REF, {
       active: true,
       userId,
-      roomId: roomId || null,
+      roomId: normalizedRoomId,
       emergencyType,
       startedAt: now,
       acquiredAt: now,
+      lastTouchAt: now,
       acquireReason: reason,
       releasedAt: null,
       releaseReason: null,
-      replacedStaleLock: stale === true,
+      replacedStaleLock: true,
       previousLock: {
         ...lock,
         replacedAt: now,
+        replacedBy: userId,
+        replacedRoomId: normalizedRoomId,
+        staleByMissingStartedAt,
+        staleByTTL,
       },
     });
 
-    return { ok: true, staleReplaced: stale === true };
+    return {
+      ok: true,
+      staleReplaced: true,
+      staleByMissingStartedAt,
+      staleByTTL,
+      previousLockUserId: lock.userId || null,
+    };
   });
 }
 
-
-// ============================================================
-// 🔓 LIBERAR LOCK (CORREGIDO)
-// ✅ Colección correcta: "LOCKS"
-// ✅ Doc correcto: "active_emergency"
-// ✅ Campo correcto: "active"
-// ✅ No falla si el doc no existe (set + merge)
-// ✅ Transacción: no pisa lock activo de OTRO user (protección)
-// ============================================================
 // ============================================================
 // 🔓 LIBERAR LOCK DE EMERGENCIA (LOCKS/active_emergency)
 // ============================================================
-const LOCK_DOC_REF = db.collection("LOCKS").doc("active_emergency"); // ✅ TU COLECCIÓN REAL
-
 async function releaseEmergencyLock(
   { userId = null, roomId = null, reason = "manual_or_system", force = false } = {}
 ) {
@@ -183,11 +213,11 @@ async function releaseEmergencyLock(
 
   try {
     const result = await db.runTransaction(async (tx) => {
-      const snap = await tx.get(LOCK_DOC_REF);
+      const snap = await tx.get(LOCK_REF);
 
       // ✅ Si no existe, lo creamos liberado (auto-heal)
       if (!snap.exists) {
-        tx.set(LOCK_DOC_REF, {
+        tx.set(LOCK_REF, {
           active: false,
           releasedAt: now,
           releaseReason: reason,
@@ -201,48 +231,43 @@ async function releaseEmergencyLock(
       }
 
       const lock = snap.data() || {};
-      const lockActive = lock.active === true;
+      const isActive = lock.active === true;
 
-      // ✅ Idempotente: si ya está liberado, no hacemos nada
-      if (!lockActive) {
+      // ✅ Idempotente: si ya está liberado
+      if (!isActive) {
         return { ok: true, alreadyReleased: true, current: lock };
       }
 
-      // ✅ Seguridad: si pertenece a otro userId, no liberar (salvo force)
-      const lockUserId = lock.userId || null;
-      if (!force && userId && lockUserId && lockUserId !== userId) {
+      // ✅ Seguridad: si lock pertenece a otro userId, no liberar salvo force
+      if (!force && userId && lock.userId && lock.userId !== userId) {
         console.log(
-          `${colors.yellow}⚠️ releaseEmergencyLock: lock de otro usuario, NO se libera (force=false). lockUser=${lockUserId} userId=${userId}${colors.reset}`
+          `${colors.yellow}⚠️ releaseEmergencyLock: NO libero (lock de otro usuario). lockUser=${lock.userId} userId=${userId}${colors.reset}`
         );
-        return { ok: false, code: "LOCK_OTHER_USER", lockUserId, current: lock };
+        return { ok: false, code: "LOCK_OTHER_USER", lockUserId: lock.userId, current: lock };
       }
 
-      // ✅ Guardar snapshot anterior (útil para debug)
-      const prev = {
-        active: lock.active === true,
+      const previous = {
+        active: true,
         userId: lock.userId || null,
         roomId: lock.roomId || null,
         emergencyType: lock.emergencyType || "general",
         startedAt: lock.startedAt || null,
         replacedStaleLock: lock.replacedStaleLock || false,
         releasedAt: lock.releasedAt || null,
+        releaseReason: lock.releaseReason || null,
       };
 
-      tx.update(LOCK_DOC_REF, {
+      tx.update(LOCK_REF, {
         active: false, // ✅ CLAVE
         releasedAt: now,
         releaseReason: reason,
         releasedBy: userId || null,
         releasedRoomId: roomId || null,
-
-        // 🔁 reset de campos activos
         userId: null,
         roomId: null,
         emergencyType: "general",
-
-        // 🧾 auditoría
         previousLock: {
-          ...prev,
+          ...previous,
           releasedAt: now,
           releaseReason: reason,
           releasedBy: userId || null,
@@ -250,22 +275,21 @@ async function releaseEmergencyLock(
         },
       });
 
-      return { ok: true, updated: true, previous: prev };
+      return { ok: true, updated: true, previous };
     });
 
-    // 🔎 Log útil
     if (result?.ok && result?.updated) {
       console.log(`${colors.green}🔓 Lock liberado (active=false)${colors.reset}`, {
-        userId,
-        roomId,
         reason,
         force,
+        userId,
+        roomId,
       });
     } else if (result?.ok && result?.alreadyReleased) {
       console.log(`${colors.gray}ℹ️ Lock ya estaba liberado${colors.reset}`, {
+        reason,
         userId,
         roomId,
-        reason,
       });
     }
 
@@ -275,11 +299,9 @@ async function releaseEmergencyLock(
     return { ok: false, error: e?.message || String(e) };
   }
 }
+
 // ============================================================
 // 🧹 FUNCIÓN PARA LIMPIAR EMERGENCIA (CORREGIDA)
-// ✅ No toca tokens
-// ✅ Libera lock correcto (LOCKS/active_emergency, active=false)
-// ✅ Mantiene tu flujo y logs
 // ============================================================
 async function cleanupUserEmergency(userId, username, emergencyRoomId, reason = "user_disconnected") {
   try {
@@ -297,26 +319,23 @@ async function cleanupUserEmergency(userId, username, emergencyRoomId, reason = 
     }
 
     const roomIdToClean = actualRoomId;
+    const safeUserName = username || state.emergencyAlerts.get(userId)?.userName || "Usuario desconocido";
 
     // 2. LIMPIAR ESTADO INTERNO PRIMERO
     state.emergencyAlerts.delete(userId);
     state.emergencyHelpers.delete(userId);
     state.emergencyUserRoom.delete(userId);
 
-    // 3. NOTIFICAR A TODOS ANTES DE LIMPIAR LA SALA
-const safeRoomId = roomIdToClean || state.emergencyUserRoom.get(userId) || `emergencia_${userId}`;
-const safeUserName = username || state.emergencyAlerts.get(userId)?.userName || "Usuario desconocido";
-
-io.emit("emergency_cancelled", {
-  userId,
-  userName: safeUserName,     // ✅ unificado
-  username: safeUserName,     // ✅ compat (por si tu Android lee "username")
-  roomId: safeRoomId,
-  reason,
-  timestamp: Date.now(),
-  isActive: false,
-});
-
+    // 3. NOTIFICAR A TODOS ANTES DE LIMPIAR LA SALA - ✅ CORREGIDO
+    io.emit("emergency_cancelled", {
+      userId,
+      userName: safeUserName,
+      username: safeUserName,
+      roomId: roomIdToClean,
+      reason,
+      timestamp: Date.now(),
+      isActive: false,
+    });
 
     // 4. MANEJAR LA SALA DE EMERGENCIA SI EXISTE
     if (roomIdToClean) {
@@ -326,9 +345,9 @@ io.emit("emergency_cancelled", {
       io.to(roomIdToClean).emit("emergency_ended", {
         roomId: roomIdToClean,
         userId,
-        username: username || "Usuario",
+        username: safeUserName,
         reason,
-        message: `${username || "El usuario"} finalizó la emergencia.`,
+        message: `${safeUserName} finalizó la emergencia.`,
         timestamp: Date.now(),
       });
 
@@ -363,7 +382,7 @@ io.emit("emergency_cancelled", {
       }
     }
 
-    // 5. ACTUALIZAR FIRESTORE (SIN TOCAR TOKENS / DEVICES / ONLINE)
+    // 5. ACTUALIZAR FIRESTORE
     try {
       await db.collection(COLLECTIONS.USERS).doc(userId).update({
         hasActiveEmergency: false,
@@ -390,7 +409,7 @@ io.emit("emergency_cancelled", {
       } else {
         await emergencyRef.set({
           userId,
-          username: username || "Desconocido",
+          username: safeUserName,
           startReason: "unknown",
           startedAt: Date.now() - 60000,
           createdAt: Date.now(),
@@ -406,14 +425,14 @@ io.emit("emergency_cancelled", {
       );
     }
 
-    // 6. ✅ LIBERAR EL LOCK GLOBAL (DOC/CAMPO CORRECTOS)
+    // 6. ✅ LIBERAR EL LOCK GLOBAL
     try {
       await releaseEmergencyLock({
-  userId,
-  roomId: roomIdToClean,
-  reason,
-  // force: true, // solo si querés liberar aunque el lock no sea de ese userId
-});
+        userId,
+        roomId: roomIdToClean,
+        reason,
+        force: false,
+      });
 
       console.log(`${colors.green}🔓 Lock de emergencia liberado${colors.reset}`);
     } catch (lockError) {
@@ -423,7 +442,7 @@ io.emit("emergency_cancelled", {
     // 7. NOTIFICAR CAMBIO DE ESTADO A TODOS LOS USUARIOS
     io.emit("user_status_changed", {
       userId,
-      username: username || "Usuario",
+      username: safeUserName,
       hasActiveEmergency: false,
       emergencyCleared: true,
       timestamp: Date.now(),
@@ -437,7 +456,7 @@ io.emit("emergency_cancelled", {
     io.emit("connected_users", connectedUsersList);
 
     console.log(
-      `${colors.green}✅ Emergencia COMPLETAMENTE limpiada para: ${username || userId}${colors.reset}`
+      `${colors.green}✅ Emergencia COMPLETAMENTE limpiada para: ${safeUserName}${colors.reset}`
     );
     return true;
   } catch (error) {
@@ -462,11 +481,9 @@ io.emit("emergency_cancelled", {
 // 🛠️ FUNCIONES UTILITARIAS
 // ============================================================
 const utils = {
-  // Validación de URLs
   isHttpUrl: (str) => typeof str === "string" && /^https?:\/\//i.test(str),
   isDataUrl: (str) => typeof str === "string" && /^data:image\/[a-zA-Z0-9.+-]+;base64,/i.test(str),
   
-  // Procesamiento de DataURL
   getMimeFromDataUrl: (dataUrl) => {
     const match = /^data:(image\/[a-zA-Z0-9.+-]+);base64,/.exec(dataUrl || "");
     return match ? match[1] : "image/jpeg";
@@ -477,9 +494,8 @@ const utils = {
     return idx !== -1 ? dataUrl.substring(idx + 7) : null;
   },
 
-  // Cálculo de distancias
   calculateDistance: (lat1, lon1, lat2, lon2) => {
-    const R = 6371; // Radio de la Tierra en km
+    const R = 6371;
     const dLat = (lat2 - lat1) * Math.PI / 180;
     const dLon = (lon2 - lon1) * Math.PI / 180;
     const a = 
@@ -490,7 +506,6 @@ const utils = {
     return R * c;
   },
 
-  // Usuarios cercanos
   getNearbyUsers: (alertLat, alertLng, radiusKm = 50) => {
     const socketsWithin = [];
     
@@ -499,42 +514,27 @@ const utils = {
     
     state.connectedUsers.forEach(({ userData, sockets }, userId) => {
       const loc = userData?.lastKnownLocation;
-      console.log(`${colors.gray}👤 Usuario ${userId}:${colors.reset}`, {
-        tieneUbicacion: !!loc,
-        ubicacion: loc,
-        sockets: Array.from(sockets || [])
-      });
       
       if (loc && typeof loc.lat === "number" && typeof loc.lng === "number") {
         const d = utils.calculateDistance(alertLat, alertLng, loc.lat, loc.lng);
-        console.log(`${colors.gray}   📏 Distancia: ${d.toFixed(2)}km${colors.reset}`);
         if (d <= radiusKm) {
           sockets.forEach((sid) => socketsWithin.push(sid));
-          console.log(`${colors.green}   ✅ DENTRO del radio${colors.reset}`);
-        } else {
-          console.log(`${colors.yellow}   ❌ FUERA del radio${colors.reset}`);
         }
-      } else {
-        console.log(`${colors.yellow}   ⚠️ SIN ubicación válida${colors.reset}`);
       }
     });
 
-    // Fallback: si no hay nadie con ubicación, notificar a todos
     if (socketsWithin.length === 0) {
-      console.log(`${colors.yellow}⚠️ No hay usuarios con ubicación, notificando a TODOS${colors.reset}`);
       state.connectedUsers.forEach(({ sockets }) => {
         sockets.forEach((sid) => socketsWithin.push(sid));
       });
     }
     
-    console.log(`${colors.blue}👥 Sockets a notificar:${colors.reset} ${socketsWithin.length}`);
     return socketsWithin;
   },
 
-  // Verificar si usuario está presente en sala (CORREGIDO)
   isUserPresentInRoom: (userId, roomId) => {
     const entry = state.connectedUsers.get(userId);
-    if (!entry) return false; // offline
+    if (!entry) return false;
     const room = io.sockets.adapter.rooms.get(roomId);
     if (!room) return false;
     for (const sid of entry.sockets) {
@@ -543,7 +543,6 @@ const utils = {
     return false;
   },
 
-  // Emisión a usuarios
   emitToUser: (userId, event, payload) => {
     const entry = state.connectedUsers.get(userId);
     if (!entry) return 0;
@@ -558,7 +557,6 @@ const utils = {
     return count;
   },
 
-  // Actualizar lista de usuarios en sala
   updateRoomUserList: (roomId) => {
     const room = state.chatRooms.get(roomId);
     if (!room) return;
@@ -577,12 +575,7 @@ const utils = {
 };
 
 // ============================================================
-// 🚀 FUNCIÓN PARA ENVIAR NOTIFICACIONES PUSH (CORREGIDA)
-// ✅ DATA-ONLY (sin "notification") para que Android use TU UI (EmergencyNotificationManager)
-// - Usa TODOS los tokens (multicast): fcmTokens + fallback devices[*].token + fcmToken viejo
-// - Deduplica tokens
-// - Fuerza data como strings (requisito FCM)
-// - Limpia tokens inválidos correctamente
+// 🚀 FUNCIÓN PARA ENVIAR NOTIFICACIONES PUSH
 // ============================================================
 async function sendPushNotification(userId, title, body, data = {}) {
   let tokens = [];
@@ -597,17 +590,14 @@ async function sendPushNotification(userId, title, body, data = {}) {
 
     const userData = userDoc.data() || {};
 
-    // 1) Tokens principales: array fcmTokens (multi-dispositivo)
     if (Array.isArray(userData.fcmTokens) && userData.fcmTokens.length > 0) {
       tokens.push(...userData.fcmTokens.filter(t => typeof t === "string" && t.length > 0));
     }
 
-    // 2) Fallback: token único viejo
     if (userData.fcmToken && typeof userData.fcmToken === "string" && userData.fcmToken.length > 0) {
       tokens.push(userData.fcmToken);
     }
 
-    // 3) Fallback: devices map (si existe)
     if (userData.devices && typeof userData.devices === "object") {
       const deviceEntries = Object.values(userData.devices);
       for (const d of deviceEntries) {
@@ -617,33 +607,24 @@ async function sendPushNotification(userId, title, body, data = {}) {
       }
     }
 
-    // Deduplicar
     tokens = Array.from(new Set(tokens));
 
     if (tokens.length === 0) {
-      console.log(`${colors.yellow}⚠️ Usuario ${userId} sin token FCM (fcmTokens/fcmToken/devices)${colors.reset}`);
+      console.log(`${colors.yellow}⚠️ Usuario ${userId} sin token FCM${colors.reset}`);
       return false;
     }
 
-    // ✅ FCM data debe ser string->string
-    // ✅ Forzamos que SIEMPRE viajen los campos críticos de la emergencia
     const merged = {
       ...data,
-
-      // Notif data-only
       title,
       body,
       timestamp: Date.now(),
-
-      // 🔥 Campos críticos (no pueden faltar en el helper)
       emergency_user_id: data.emergency_user_id ?? data.userId ?? "",
       emergency_user_name: data.emergency_user_name ?? data.userName ?? "",
       emergency_latitude: data.emergency_latitude ?? data.latitude ?? "",
       emergency_longitude: data.emergency_longitude ?? data.longitude ?? "",
       emergency_avatar_url: data.emergency_avatar_url ?? data.avatarUrl ?? "",
       emergency_room_id: data.emergency_room_id ?? data.roomId ?? "",
-
-      // 🔥 Vehículo (para que no llegue "solo la foto")
       vehicle_foto: data.vehicle_foto ?? data.fotoVehiculoUri ?? "",
       vehicle_marca: data.vehicle_marca ?? data.marca ?? "",
       vehicle_modelo: data.vehicle_modelo ?? data.modelo ?? "",
@@ -655,8 +636,6 @@ async function sendPushNotification(userId, title, body, data = {}) {
       Object.entries(merged).map(([k, v]) => [k, v == null ? "" : String(v)])
     );
 
-    // ✅ DATA-ONLY: NO incluir message.notification
-    // Para Android: prioridad high
     const message = {
       tokens,
       android: {
@@ -676,7 +655,6 @@ async function sendPushNotification(userId, title, body, data = {}) {
     };
 
     const res = await messaging.sendEachForMulticast(message);
-
     usedTokens = tokens;
 
     const ok = res.successCount > 0;
@@ -684,7 +662,6 @@ async function sendPushNotification(userId, title, body, data = {}) {
       `${ok ? colors.green : colors.yellow}📱 Push multicast a ${userId}: ${res.successCount}/${tokens.length} ok${colors.reset}`
     );
 
-    // Limpieza de tokens inválidos (solo los que fallaron con NOT_REGISTERED)
     const invalidTokens = [];
     res.responses.forEach((r, idx) => {
       if (!r.success) {
@@ -699,7 +676,6 @@ async function sendPushNotification(userId, title, body, data = {}) {
       try {
         await db.collection(COLLECTIONS.USERS).doc(userId).update({
           fcmTokens: admin.firestore.FieldValue.arrayRemove(...invalidTokens),
-          // No borres fcmToken viejo a menos que coincida con alguno inválido
           ...(invalidTokens.includes(userData.fcmToken)
             ? { fcmToken: admin.firestore.FieldValue.delete() }
             : {}),
@@ -716,10 +692,6 @@ async function sendPushNotification(userId, title, body, data = {}) {
   } catch (error) {
     console.error(`${colors.red}❌ Error enviando notificación:${colors.reset}`, error);
 
-    // Si el error viene "global" (no por token), no borres nada a ciegas.
-    // (La limpieza fina ya la hacemos arriba con sendEachForMulticast)
-
-    // Aun así, si por alguna razón usaste un solo token (caso raro) y se marcó como no registrado:
     const code = error?.code || "";
     if (code === "messaging/registration-token-not-registered" && usedTokens.length > 0) {
       try {
@@ -735,7 +707,6 @@ async function sendPushNotification(userId, title, body, data = {}) {
     return false;
   }
 }
-
 
 // ============================================================
 // 🗑️ FUNCIÓN PARA ELIMINAR HISTORIAL DE CHAT
@@ -1056,7 +1027,7 @@ app.get("/emergencies/:userId/helpers", async (req, res) => {
 });
 
 // ============================================================
-// 🚗 ENDPOINTS PARA VEHÍCULOS
+// 🚗 ENDPOINTS PARA VEHÍCULOS (sin cambios)
 // ============================================================
 app.get("/vehicles/:userId", async (req, res) => {
   try {
@@ -1417,51 +1388,49 @@ app.post("/vehicles/photo", async (req, res) => {
 });
 
 // ============================================================
-// 🔌 SOCKET.IO - MANEJO DE CONEXIONES (CORREGIDO)
+// 🔌 SOCKET.IO - MANEJO DE CONEXIONES
 // ============================================================
 io.on("connection", (socket) => {
   console.log(`${colors.cyan}🔗 NUEVA CONEXIÓN SOCKET:${colors.reset} ${socket.id}`);
 
   // ============================================================
-// 🔑 EVENTO: REGISTRAR TOKEN FCM (CORREGIDO - MERGE REAL EN devices)
-// ============================================================
-socket.on("register_fcm_token", async (data = {}, callback) => {
-  try {
-    const { userId, fcmToken } = data;
+  // 🔑 EVENTO: REGISTRAR TOKEN FCM
+  // ============================================================
+  socket.on("register_fcm_token", async (data = {}, callback) => {
+    try {
+      const { userId, fcmToken } = data;
 
-    if (!userId || !fcmToken) {
-      return callback?.({ success: false, message: "userId y fcmToken requeridos" });
-    }
+      if (!userId || !fcmToken) {
+        return callback?.({ success: false, message: "userId y fcmToken requeridos" });
+      }
 
-    const userRef = db.collection(COLLECTIONS.USERS).doc(userId);
+      const userRef = db.collection(COLLECTIONS.USERS).doc(userId);
 
-    const deviceId = data.deviceId || socket.id;
-    const devicePath = `devices.${deviceId}`;
+      const deviceId = data.deviceId || socket.id;
+      const devicePath = `devices.${deviceId}`;
 
-    await userRef.set(
-      {
-        fcmTokens: admin.firestore.FieldValue.arrayUnion(fcmToken),
-        fcmTokensUpdatedAt: Date.now(),
-        [devicePath]: {
-          token: fcmToken,
-          platform: data.platform || "android",
-          deviceModel: data.deviceModel || null,
-          lastActive: Date.now(),
+      await userRef.set(
+        {
+          fcmTokens: admin.firestore.FieldValue.arrayUnion(fcmToken),
+          fcmTokensUpdatedAt: Date.now(),
+          [devicePath]: {
+            token: fcmToken,
+            platform: data.platform || "android",
+            deviceModel: data.deviceModel || null,
+            lastActive: Date.now(),
+          },
+          socketIds: admin.firestore.FieldValue.arrayUnion(socket.id),
         },
-        // (opcional pero recomendado para debug)
-        socketIds: admin.firestore.FieldValue.arrayUnion(socket.id),
-      },
-      { merge: true }
-    );
+        { merge: true }
+      );
 
-    console.log(`${colors.green}✅ Token FCM registrado para ${userId}${colors.reset}`);
-    callback?.({ success: true, message: "Token registrado" });
-  } catch (error) {
-    console.error(`${colors.red}❌ Error registrando token:${colors.reset}`, error);
-    callback?.({ success: false, message: error.message });
-  }
-});
-
+      console.log(`${colors.green}✅ Token FCM registrado para ${userId}${colors.reset}`);
+      callback?.({ success: true, message: "Token registrado" });
+    } catch (error) {
+      console.error(`${colors.red}❌ Error registrando token:${colors.reset}`, error);
+      callback?.({ success: false, message: error.message });
+    }
+  });
 
   // ============================================================
   // 👤 USUARIO CONECTADO AL CHAT
@@ -1479,22 +1448,18 @@ socket.on("register_fcm_token", async (data = {}, callback) => {
     const userId = user.id;
     const username = user.username;
 
-    // Guardar en el socket
     socket.userId = userId;
     socket.username = username;
 
-    // Unir automáticamente al chat general
     const defaultRoom = "general";
     socket.join(defaultRoom);
     socket.currentRoom = defaultRoom;
 
-    // Agregar usuario a la sala en memoria
     const generalRoom = state.chatRooms.get(defaultRoom);
     if (generalRoom) {
       generalRoom.users.add(userId);
     }
 
-    // Actualizar estado de usuarios conectados
     const now = Date.now();
     const incomingLoc = (typeof user.lat === "number" && typeof user.lng === "number")
       ? { lat: user.lat, lng: user.lng, ts: now }
@@ -1523,7 +1488,6 @@ socket.on("register_fcm_token", async (data = {}, callback) => {
     }
 
     try {
-      // Sincronizar con Firebase
       await db.collection(COLLECTIONS.USERS).doc(userId).set({
         ...user,
         isOnline: true,
@@ -1536,7 +1500,6 @@ socket.on("register_fcm_token", async (data = {}, callback) => {
       console.error(`${colors.red}❌ Error al registrar usuario:${colors.reset}`, error);
     }
 
-    // Notificar a todos los usuarios conectados
     io.emit(
       "connected_users",
       Array.from(state.connectedUsers.values()).map((u) => ({ 
@@ -1545,7 +1508,6 @@ socket.on("register_fcm_token", async (data = {}, callback) => {
       }))
     );
 
-    // Enviar información de salas disponibles
     socket.emit("available_rooms", 
       Array.from(state.chatRooms.values()).map(room => ({
         id: room.id,
@@ -1557,13 +1519,11 @@ socket.on("register_fcm_token", async (data = {}, callback) => {
       }))
     );
 
-    // Enviar mensaje de bienvenida
     socket.emit("join_success", { 
       room: "general", 
       message: `Bienvenido al chat general, ${username}!` 
     });
 
-    // Notificar a la sala general
     socket.to(defaultRoom).emit("user_joined_room", {
       userId: userId,
       username: username,
@@ -1572,7 +1532,6 @@ socket.on("register_fcm_token", async (data = {}, callback) => {
       timestamp: Date.now()
     });
 
-    // Actualizar lista de usuarios en la sala
     utils.updateRoomUserList(defaultRoom);
 
     ack?.({ success: true });
@@ -1580,7 +1539,7 @@ socket.on("register_fcm_token", async (data = {}, callback) => {
   });
 
   // ============================================================
-  // 📍 ACTUALIZAR UBICACIÓN (MEJORADO - PERSISTENCIA A FIRESTORE)
+  // 📍 ACTUALIZAR UBICACIÓN
   // ============================================================
   socket.on("update_location", async (data = {}, ack) => {
     try {
@@ -1593,7 +1552,6 @@ socket.on("register_fcm_token", async (data = {}, callback) => {
         const loc = { lat, lng, ts: typeof timestamp === "number" ? timestamp : Date.now() };
         entry.userData.lastKnownLocation = loc;
         
-        // ✅ PERSISTIR EN FIRESTORE PARA NOTIFICACIONES A OFFLINE
         await db.collection(COLLECTIONS.USERS).doc(userId).set({
           lastKnownLocation: loc,
           lastLocationUpdatedAt: Date.now(),
@@ -1610,7 +1568,7 @@ socket.on("register_fcm_token", async (data = {}, callback) => {
   });
 
   // ============================================================
-  // 🚪 MANEJO DE SALAS (CORREGIDO)
+  // 🚪 MANEJO DE SALAS
   // ============================================================
   socket.on("join_room", async (data = {}, ack) => {
     try {
@@ -1633,7 +1591,6 @@ socket.on("register_fcm_token", async (data = {}, callback) => {
         return;
       }
 
-      // 1. Salir de sala anterior si existe
       if (socket.currentRoom && socket.currentRoom !== roomId) {
         const previousRoom = state.chatRooms.get(socket.currentRoom);
         if (previousRoom) {
@@ -1653,24 +1610,20 @@ socket.on("register_fcm_token", async (data = {}, callback) => {
         utils.updateRoomUserList(socket.currentRoom);
       }
 
-      // 2. Unirse a nueva sala
       socket.join(roomId);
       socket.currentRoom = roomId;
       targetRoom.users.add(userId);
       
-      // ✅ ACTUALIZAR ESTADO DEL USUARIO EN MEMORIA
       const entry = state.connectedUsers.get(userId);
       if (entry) {
         entry.userData.currentRoom = roomId;
       }
 
-      // 3. Actualizar en Firestore (OPCIONAL, para debug)
       await db.collection(COLLECTIONS.USERS).doc(userId).set({
         currentRoom: roomId,
         lastActive: Date.now()
       }, { merge: true });
 
-      // 4. Enviar historial de mensajes
       try {
         const messagesSnapshot = await db.collection(COLLECTIONS.MESSAGES)
           .where("roomId", "==", roomId)
@@ -1691,7 +1644,6 @@ socket.on("register_fcm_token", async (data = {}, callback) => {
         console.warn(`${colors.yellow}⚠️ No se pudo cargar historial de mensajes:${colors.reset}`, dbError.message);
       }
 
-      // 5. Notificar a otros en la sala
       socket.to(roomId).emit("user_joined_room", {
         userId,
         username: socket.username,
@@ -1700,7 +1652,6 @@ socket.on("register_fcm_token", async (data = {}, callback) => {
         timestamp: Date.now(),
       });
 
-      // 6. Actualizar lista de usuarios
       utils.updateRoomUserList(roomId);
 
       ack?.({
@@ -1744,7 +1695,6 @@ socket.on("register_fcm_token", async (data = {}, callback) => {
         entry.userData.currentRoom = null;
       }
 
-      // Actualizar en Firestore (OPCIONAL)
       await db.collection(COLLECTIONS.USERS).doc(userId || socket.userId).set({
         currentRoom: null,
         lastActive: Date.now()
@@ -1770,7 +1720,7 @@ socket.on("register_fcm_token", async (data = {}, callback) => {
   });
 
   // ============================================================
-  // 💬 MENSAJES DE TEXTO (CORREGIDO - MEJORADA PERFORMANCE)
+  // 💬 MENSAJES DE TEXTO (CORREGIDO)
   // ============================================================
   socket.on("send_message", async (data = {}, ack) => {
     const { userId, username, text, roomId = socket.currentRoom || "general" } = data;
@@ -1794,7 +1744,6 @@ socket.on("register_fcm_token", async (data = {}, callback) => {
     };
 
     try {
-      // 1. Guardar en Firestore
       await db.collection(COLLECTIONS.MESSAGES).add(message);
       
       const room = state.chatRooms.get(roomId);
@@ -1802,67 +1751,40 @@ socket.on("register_fcm_token", async (data = {}, callback) => {
         room.messageCount++;
       }
       
-      // 2. Enviar por socket a TODOS en la sala
       io.to(roomId).emit("new_message", message);
       socket.emit("message_sent", message);
       
-      // 3. ENVIAR NOTIFICACIONES PUSH OPTIMIZADO (NO CONSULTAR TODOS LOS USUARIOS)
       let usersToNotify = [];
       
       if (roomId === "general") {
-        // ✅ MEJORA DE PERFORMANCE: Solo consultar usuarios offline
         const offlineUsersSnap = await db.collection(COLLECTIONS.USERS)
           .where("isOnline", "==", false)
           .get();
         
         usersToNotify = offlineUsersSnap.docs.map(doc => doc.id);
       } else {
-        // Para salas privadas, solo miembros de esa sala
         usersToNotify = room ? Array.from(room.users) : [];
       }
       
-      // Filtrar y enviar notificaciones
       for (const targetUserId of usersToNotify) {
-        // No enviar notificación al remitente
         if (targetUserId === userId) continue;
         
-        // Verificar si el usuario está presente en la sala
         const isPresent = utils.isUserPresentInRoom(targetUserId, roomId);
         
         if (!isPresent) {
-          // Solo enviar push si NO está presente
           await sendPushNotification(
-  targetUserId,
-  "🚨 EMERGENCIA",
-  `${userName} necesita ayuda`,
-  {
-    type: "emergency",
-
-    // 🔑 Identidad
-    emergencyUserId: userId,
-    emergencyUserName: userName,
-    emergencyType,
-
-    // 📍 Ubicación
-    latitude: latitude.toString(),
-    longitude: longitude.toString(),
-
-    // 🖼️ Usuario
-    avatarUrl: avatarUrl || "",
-
-    // 🚗 Vehículo (aplanado)
-    vehicleMarca: vehicleData?.brand || "",
-    vehicleModelo: vehicleData?.model || "",
-    vehiclePatente: vehicleData?.licensePlate || "",
-    vehicleColor: vehicleData?.color || "",
-    vehicleFoto: vehicleData?.photoUri || "",
-
-    // 🕒
-    timestamp: Date.now().toString(),
-    emergencyRoomId,
-  }
-);
-
+            targetUserId,
+            "💬 Nuevo mensaje",
+            `${username}: ${text}`,
+            {
+              type: "chat_message",
+              roomId: roomId,
+              userId: userId,
+              username: username,
+              text: text,
+              timestamp: Date.now().toString(),
+            }
+          );
         }
       }
       
@@ -1881,7 +1803,7 @@ socket.on("register_fcm_token", async (data = {}, callback) => {
   });
 
   // ============================================================
-  // 🎧 MENSAJES DE AUDIO
+  // 🎧 MENSAJES DE AUDIO (CORREGIDO)
   // ============================================================
   socket.on("audio_message", async (data = {}, ack) => {
     try {
@@ -1945,11 +1867,9 @@ socket.on("register_fcm_token", async (data = {}, callback) => {
       const room = state.chatRooms.get(roomId);
       if (room) room.messageCount++;
 
-      // 1. Enviar por socket a todos en la sala
       io.to(roomId).emit("audio_message", message);
       socket.emit("message_sent", { id: message.id, ...message });
 
-      // 2. Enviar notificaciones push a usuarios no presentes
       const roomUsers = room ? Array.from(room.users) : [];
       
       for (const targetUserId of roomUsers) {
@@ -1959,37 +1879,17 @@ socket.on("register_fcm_token", async (data = {}, callback) => {
         
         if (!isPresent) {
           await sendPushNotification(
-  targetUserId,
-  "🚨 EMERGENCIA",
-  `${userName} necesita ayuda`,
-  {
-    type: "emergency",
-
-    // 🔑 Identidad
-    emergencyUserId: userId,
-    emergencyUserName: userName,
-    emergencyType,
-
-    // 📍 Ubicación
-    latitude: latitude.toString(),
-    longitude: longitude.toString(),
-
-    // 🖼️ Usuario
-    avatarUrl: avatarUrl || "",
-
-    // 🚗 Vehículo (aplanado)
-    vehicleMarca: vehicleData?.brand || "",
-    vehicleModelo: vehicleData?.model || "",
-    vehiclePatente: vehicleData?.licensePlate || "",
-    vehicleColor: vehicleData?.color || "",
-    vehicleFoto: vehicleData?.photoUri || "",
-
-    // 🕒
-    timestamp: Date.now().toString(),
-    emergencyRoomId,
-  }
-);
-
+            targetUserId,
+            "🎧 Mensaje de audio",
+            `${username} envió un audio`,
+            {
+              type: "audio_message",
+              roomId: roomId,
+              userId: userId,
+              username: username,
+              timestamp: Date.now().toString(),
+            }
+          );
         }
       }
 
@@ -2122,520 +2022,459 @@ socket.on("register_fcm_token", async (data = {}, callback) => {
   });
 
   // ============================================================
-// 🚨 SISTEMA DE EMERGENCIA (CORREGIDO - CON LOCK STALE Y SCOPE SEGURO)
-// ============================================================
-socket.on("emergency_alert", async (data = {}, ack) => {
-  let lockAcquired = false; // Para manejo seguro de rollback
+  // 🚨 SISTEMA DE EMERGENCIA (CORREGIDO - USA LOCK_REF)
+  // ============================================================
+  socket.on("emergency_alert", async (data = {}, ack) => {
+    let lockAcquired = false;
+    let reqUserId = null;
+    let reqUserName = null;
+    let emergencyRoomId = null;
 
-  // ✅ Guardar para poder liberar lock incluso si falla antes del destructuring
-  let reqUserId = null;
-  let reqUserName = null;
-  let emergencyRoomId = null;
+    try {
+      const {
+        userId,
+        userName,
+        latitude,
+        longitude,
+        timestamp,
+        emergencyType = "general",
+      } = data;
 
-  try {
-    const {
-      userId,
-      userName,
-      latitude,
-      longitude,
-      timestamp,
-      emergencyType = "general",
-    } = data;
+      reqUserId = userId || null;
+      reqUserName = userName || null;
 
-    // ✅ Guardar para catch/rollback
-    reqUserId = userId || null;
-    reqUserName = userName || null;
+      console.log(
+        `${colors.red}🚨 Evento → emergency_alert:${colors.reset}`,
+        { userId, userName, latitude, longitude, emergencyType }
+      );
 
-    console.log(
-      `${colors.red}🚨 Evento → emergency_alert:${colors.reset}`,
-      { userId, userName, latitude, longitude, emergencyType }
-    );
+      if (!userId || !userName) {
+        console.warn(`${colors.yellow}⚠️ Datos de usuario faltantes${colors.reset}`);
+        return ack?.({
+          success: false,
+          code: "INVALID_DATA",
+          message: "Datos de usuario inválidos"
+        });
+      }
 
-    if (!userId || !userName) {
-      console.warn(`${colors.yellow}⚠️ Datos de usuario faltantes${colors.reset}`);
-      return ack?.({
-        success: false,
-        code: "INVALID_DATA",
-        message: "Datos de usuario inválidos"
-      });
-    }
+      if (typeof latitude !== "number" || typeof longitude !== "number") {
+        console.warn(`${colors.yellow}⚠️ Coordenadas inválidas${colors.reset}`);
+        return ack?.({
+          success: false,
+          code: "INVALID_LOCATION",
+          message: "Ubicación inválida"
+        });
+      }
 
-    if (typeof latitude !== "number" || typeof longitude !== "number") {
-      console.warn(`${colors.yellow}⚠️ Coordenadas inválidas${colors.reset}`);
-      return ack?.({
-        success: false,
-        code: "INVALID_LOCATION",
-        message: "Ubicación inválida"
-      });
-    }
+      emergencyRoomId = `emergencia_${userId}`;
 
-    // RoomId de emergencia (NORMALIZADO)
-    emergencyRoomId = `emergencia_${userId}`;
+      // 🔒 LOCK GLOBAL CON DETECCIÓN DE STALE LOCK - USA LOCK_REF
+      const lockResult = await db.runTransaction(async (tx) => {
+        const snap = await tx.get(LOCK_REF); // ✅ USA LOCK_REF DEFINIDO
+        const lock = snap.exists ? (snap.data() || {}) : null;
 
-    // ✅ LOCK DOC REAL: colección LOCKS, doc active_emergency, campo active
-    // (esto reemplaza tu LOCK_DOC que te daba "not defined" o apuntaba a otra colección)
-    const LOCK_DOC = db.collection("LOCKS").doc("active_emergency");
+        if (lock?.active === true) {
+          const startedAt = typeof lock.startedAt === "number" ? lock.startedAt : 0;
+          const age = Date.now() - startedAt;
 
-    // 🔒 LOCK GLOBAL CON DETECCIÓN DE STALE LOCK
-    const lockResult = await db.runTransaction(async (tx) => {
-      const snap = await tx.get(LOCK_DOC);
-      const lock = snap.exists ? (snap.data() || {}) : null;
+          if (startedAt > 0 && age > LOCK_TTL_MS) {
+            tx.set(LOCK_REF, {
+              active: true,
+              userId,
+              roomId: emergencyRoomId,
+              startedAt: Date.now(),
+              emergencyType,
+              replacedStaleLock: true,
+              previousLock: {
+                userId: lock.userId || null,
+                roomId: lock.roomId || null,
+                startedAt: lock.startedAt || null
+              }
+            }, { merge: true });
 
-      if (lock?.active === true) {
-        const startedAt = typeof lock.startedAt === "number" ? lock.startedAt : 0;
-        const age = Date.now() - startedAt;
+            return { allowed: true, staleReplaced: true };
+          }
 
-        // ✅ DETECTAR STALE LOCK (> TTL)
-        if (startedAt > 0 && age > LOCK_TTL_MS) {
-          tx.set(LOCK_DOC, {
-            active: true,
-            userId,
-            roomId: emergencyRoomId,
-            startedAt: Date.now(),
-            emergencyType,
-            replacedStaleLock: true,
-            previousLock: {
+          return {
+            allowed: false,
+            activeEmergency: {
               userId: lock.userId || null,
               roomId: lock.roomId || null,
-              startedAt: lock.startedAt || null
+              startedAt: lock.startedAt || null,
             }
-          }, { merge: true });
-
-          return { allowed: true, staleReplaced: true };
+          };
         }
 
-        // ❌ LOCK ACTIVO Y NO VENCIDO
-        return {
-          allowed: false,
-          activeEmergency: {
-            userId: lock.userId || null,
-            roomId: lock.roomId || null,
-            startedAt: lock.startedAt || null,
-          }
-        };
-      }
+        tx.set(LOCK_REF, {
+          active: true,
+          userId,
+          roomId: emergencyRoomId,
+          startedAt: Date.now(),
+          emergencyType,
+        }, { merge: true });
 
-      // ✅ NO HAY LOCK ACTIVO, TOMARLO
-      tx.set(LOCK_DOC, {
-        active: true,
-        userId,
-        roomId: emergencyRoomId,
-        startedAt: Date.now(),
-        emergencyType,
-      }, { merge: true });
-
-      return { allowed: true };
-    });
-
-    if (!lockResult.allowed) {
-      return ack?.({
-        success: false,
-        code: "EMERGENCY_ALREADY_ACTIVE",
-        message: "⚠️ Esta es una versión de prueba. Actualmente manejamos una emergencia a la vez, y ya hay una en curso. Volvé a intentarlo más tarde.",
-        activeEmergency: lockResult.activeEmergency,
+        return { allowed: true };
       });
-    }
 
-    lockAcquired = true; // ✅ ya tomamos lock
-
-    // ✅ Unir al socket dueño a SU sala de emergencia (evita que quede en general)
-    try {
-      socket.join(emergencyRoomId);
-      socket.currentRoom = emergencyRoomId;
-    } catch (joinErr) {
-      console.warn(`${colors.yellow}⚠️ No se pudo unir socket a ${emergencyRoomId}:${colors.reset}`, joinErr.message);
-    }
-
-    // Obtener avatar
-    let avatarUrl = null;
-    try {
-      const userDoc = await db.collection(COLLECTIONS.USERS).doc(userId).get();
-      if (userDoc.exists) {
-        const userData = userDoc.data() || {};
-        avatarUrl = userData.avatarUrl || userData.avatarUri || null;
+      if (!lockResult.allowed) {
+        return ack?.({
+          success: false,
+          code: "EMERGENCY_ALREADY_ACTIVE",
+          message: "⚠️ Esta es una versión de prueba. Actualmente manejamos una emergencia a la vez, y ya hay una en curso. Volvé a intentarlo más tarde.",
+          activeEmergency: lockResult.activeEmergency,
+        });
       }
-    } catch (e) {
-      console.warn(`${colors.yellow}⚠️ Error obteniendo avatar:${colors.reset} ${e.message}`);
-    }
 
-    // Obtener vehículo primario
-    let vehicleData = null;
-    try {
-      const vehiculoSnap = await db
-        .collection(COLLECTIONS.VEHICLES)
-        .where("userId", "==", userId)
-        .where("isPrimary", "==", true)
-        .where("isActive", "==", true)
-        .limit(1)
-        .get();
+      lockAcquired = true;
 
-      if (!vehiculoSnap.empty) {
-        const vehiculoDoc = vehiculoSnap.docs[0];
-        const vehiculo = vehiculoDoc.data() || {};
-        const typeRaw = vehiculo.type || vehiculo.tipo || null;
-
-        vehicleData = {
-          id: vehiculoDoc.id,
-          type: typeRaw,
-          name: vehiculo.name || vehiculo.nombre || null,
-          brand: vehiculo.brand || vehiculo.marca || null,
-          model: vehiculo.model || vehiculo.modelo || null,
-          year: vehiculo.year || null,
-          color: vehiculo.color || null,
-          licensePlate: vehiculo.licensePlate || vehiculo.patente || null,
-          photoUri: vehiculo.photoUri || vehiculo.fotoVehiculoUri || null,
-          ...(typeRaw === "CAR" && { doors: vehiculo.doors }),
-          ...(typeRaw === "MOTORCYCLE" && {
-            cylinderCapacity: vehiculo.cylinderCapacity,
-            mileage: vehiculo.mileage,
-          }),
-          ...(typeRaw === "BICYCLE" && {
-            frameSerialNumber: vehiculo.frameSerialNumber,
-            hasElectricMotor: vehiculo.hasElectricMotor,
-            frameSize: vehiculo.frameSize,
-          }),
-        };
+      try {
+        socket.join(emergencyRoomId);
+        socket.currentRoom = emergencyRoomId;
+      } catch (joinErr) {
+        console.warn(`${colors.yellow}⚠️ No se pudo unir socket a ${emergencyRoomId}:${colors.reset}`, joinErr.message);
       }
-    } catch (vehErr) {
-      console.warn(`${colors.yellow}⚠️ Error obteniendo vehículo:${colors.reset} ${vehErr.message}`);
-    }
 
-    const emergencyData = {
-      userId,
-      userName,
-      avatarUrl: avatarUrl,
-      latitude,
-      longitude,
-      timestamp: (typeof timestamp === "number" ? timestamp : Date.now()),
-      socketId: socket.id,
-      emergencyType,
-      status: "active",
-      emergencyRoomId,          // ✅ CLAVE
-      roomId: emergencyRoomId,  // ✅ compat
-      vehicleInfo: vehicleData,
-    };
+      let avatarUrl = null;
+      try {
+        const userDoc = await db.collection(COLLECTIONS.USERS).doc(userId).get();
+        if (userDoc.exists) {
+          const userData = userDoc.data() || {};
+          avatarUrl = userData.avatarUrl || userData.avatarUri || null;
+        }
+      } catch (e) {
+        console.warn(`${colors.yellow}⚠️ Error obteniendo avatar:${colors.reset} ${e.message}`);
+      }
 
-    state.emergencyAlerts.set(userId, emergencyData);
-    if (!state.emergencyHelpers.has(userId)) {
-      state.emergencyHelpers.set(userId, new Set());
-    }
+      let vehicleData = null;
+      try {
+        const vehiculoSnap = await db
+          .collection(COLLECTIONS.VEHICLES)
+          .where("userId", "==", userId)
+          .where("isPrimary", "==", true)
+          .where("isActive", "==", true)
+          .limit(1)
+          .get();
 
-    // Guardar en Firestore
-    try {
-      await db
-        .collection(COLLECTIONS.EMERGENCIES)
-        .doc(userId)
-        .set(
+        if (!vehiculoSnap.empty) {
+          const vehiculoDoc = vehiculoSnap.docs[0];
+          const vehiculo = vehiculoDoc.data() || {};
+          const typeRaw = vehiculo.type || vehiculo.tipo || null;
+
+          vehicleData = {
+            id: vehiculoDoc.id,
+            type: typeRaw,
+            name: vehiculo.name || vehiculo.nombre || null,
+            brand: vehiculo.brand || vehiculo.marca || null,
+            model: vehiculo.model || vehiculo.modelo || null,
+            year: vehiculo.year || null,
+            color: vehiculo.color || null,
+            licensePlate: vehiculo.licensePlate || vehiculo.patente || null,
+            photoUri: vehiculo.photoUri || vehiculo.fotoVehiculoUri || null,
+            ...(typeRaw === "CAR" && { doors: vehiculo.doors }),
+            ...(typeRaw === "MOTORCYCLE" && {
+              cylinderCapacity: vehiculo.cylinderCapacity,
+              mileage: vehiculo.mileage,
+            }),
+            ...(typeRaw === "BICYCLE" && {
+              frameSerialNumber: vehiculo.frameSerialNumber,
+              hasElectricMotor: vehiculo.hasElectricMotor,
+              frameSize: vehiculo.frameSize,
+            }),
+          };
+        }
+      } catch (vehErr) {
+        console.warn(`${colors.yellow}⚠️ Error obteniendo vehículo:${colors.reset} ${vehErr.message}`);
+      }
+
+      const emergencyData = {
+        userId,
+        userName,
+        avatarUrl: avatarUrl,
+        latitude,
+        longitude,
+        timestamp: (typeof timestamp === "number" ? timestamp : Date.now()),
+        socketId: socket.id,
+        emergencyType,
+        status: "active",
+        emergencyRoomId,
+        roomId: emergencyRoomId,
+        vehicleInfo: vehicleData,
+      };
+
+      state.emergencyAlerts.set(userId, emergencyData);
+      if (!state.emergencyHelpers.has(userId)) {
+        state.emergencyHelpers.set(userId, new Set());
+      }
+
+      try {
+        await db
+          .collection(COLLECTIONS.EMERGENCIES)
+          .doc(userId)
+          .set(
+            {
+              ...emergencyData,
+              isActive: true,
+              createdAt: Date.now(),
+            },
+            { merge: true }
+          );
+
+        await db.collection(COLLECTIONS.USERS).doc(userId).set({
+          hasActiveEmergency: true,
+          emergencyRoomId,
+          lastEmergencyStarted: Date.now(),
+        }, { merge: true });
+
+      } catch (fireErr) {
+        console.error(`${colors.red}❌ Error guardando emergencia:${colors.reset}`, fireErr.message);
+      }
+
+      const createdAt = Date.now();
+      const emergencyRoom = {
+        id: emergencyRoomId,
+        name: `Emergencia ${userName}`,
+        type: "emergency",
+        description: `Sala de emergencia para ${userName}`,
+        users: new Set([userId]),
+        createdAt,
+        messageCount: 0,
+        emergencyData: emergencyData,
+      };
+
+      state.chatRooms.set(emergencyRoomId, emergencyRoom);
+      state.emergencyUserRoom.set(userId, emergencyRoomId);
+
+      socket.emit("emergency_room_created", {
+        emergencyUserId: userId,
+        emergencyRoomId,
+      });
+
+      io.emit("new_room_created", {
+        id: emergencyRoom.id,
+        name: emergencyRoom.name,
+        type: emergencyRoom.type,
+        description: emergencyRoom.description,
+        userCount: emergencyRoom.users.size,
+        messageCount: emergencyRoom.messageCount,
+        createdAt: emergencyRoom.createdAt,
+      });
+
+      console.log(`${colors.red}🚨 Sala de emergencia creada: ${emergencyRoomId}${colors.reset}`);
+
+      let socketNotifications = 0;
+      const notifiedUsers = new Set();
+
+      for (const [sid, s] of io.sockets.sockets) {
+        if (sid === socket.id) continue;
+        if (s?.userId && s.userId === userId) continue;
+
+        io.to(sid).emit("emergency_alert", {
+          ...emergencyData,
+          emergencyRoomId,
+        });
+        socketNotifications++;
+
+        if (s?.userId) notifiedUsers.add(s.userId);
+      }
+
+      const usersSnapshot = await db.collection(COLLECTIONS.USERS).get();
+      let pushNotifications = 0;
+
+      for (const doc of usersSnapshot.docs) {
+        const targetUserId = doc.id;
+
+        if (targetUserId === userId) continue;
+        if (notifiedUsers.has(targetUserId)) continue;
+
+        const ok = await sendPushNotification(
+          targetUserId,
+          "🚨 EMERGENCIA",
+          `${userName} necesita ayuda`,
           {
-            ...emergencyData,
-            isActive: true,
-            createdAt: Date.now(),
-          },
-          { merge: true }
+            type: "emergency",
+            emergencyUserId: userId,
+            emergencyUserName: userName,
+            emergencyType,
+            open_emergency_screen: "true",
+            is_helper: "true",
+            emergency_user_id: userId,
+            emergency_user_name: userName,
+            emergency_type: emergencyType,
+            emergency_room_id: emergencyRoomId,
+            latitude: latitude.toString(),
+            longitude: longitude.toString(),
+            emergency_latitude: latitude.toString(),
+            emergency_longitude: longitude.toString(),
+            avatarUrl: avatarUrl || "",
+            emergency_avatar_url: avatarUrl || "",
+            vehicleMarca: vehicleData?.brand || "",
+            vehicleModelo: vehicleData?.model || "",
+            vehiclePatente: vehicleData?.licensePlate || "",
+            vehicleColor: vehicleData?.color || "",
+            vehicleFoto: vehicleData?.photoUri || "",
+            vehicle_marca: vehicleData?.brand || "",
+            vehicle_modelo: vehicleData?.model || "",
+            vehicle_patente: vehicleData?.licensePlate || "",
+            vehicle_color: vehicleData?.color || "",
+            vehicle_foto: vehicleData?.photoUri || "",
+            timestamp: Date.now().toString(),
+            emergencyRoomId,
+          }
         );
 
-      // ✅ útil para tu app si lee esto
-      await db.collection(COLLECTIONS.USERS).doc(userId).set({
-        hasActiveEmergency: true,
-        emergencyRoomId,
-        lastEmergencyStarted: Date.now(),
-      }, { merge: true });
-
-    } catch (fireErr) {
-      console.error(`${colors.red}❌ Error guardando emergencia:${colors.reset}`, fireErr.message);
-    }
-
-    // Crear sala de emergencia
-    const createdAt = Date.now();
-    const emergencyRoom = {
-      id: emergencyRoomId,
-      name: `Emergencia ${userName}`,
-      type: "emergency",
-      description: `Sala de emergencia para ${userName}`,
-      users: new Set([userId]),
-      createdAt,
-      messageCount: 0,
-      emergencyData: emergencyData,
-    };
-
-    state.chatRooms.set(emergencyRoomId, emergencyRoom);
-    state.emergencyUserRoom.set(userId, emergencyRoomId);
-
-    socket.emit("emergency_room_created", {
-      emergencyUserId: userId,
-      emergencyRoomId,
-    });
-
-    io.emit("new_room_created", {
-      id: emergencyRoom.id,
-      name: emergencyRoom.name,
-      type: emergencyRoom.type,
-      description: emergencyRoom.description,
-      userCount: emergencyRoom.users.size,
-      messageCount: emergencyRoom.messageCount,
-      createdAt: emergencyRoom.createdAt,
-    });
-
-    console.log(`${colors.red}🚨 Sala de emergencia creada: ${emergencyRoomId}${colors.reset}`);
-
-    // ============================================================
-    // ✅ NOTIFICAR A TODOS (SIN DISTANCIA)
-    // ============================================================
-
-    // 1) SOCKET: a TODOS los conectados (menos el emisor)
-    let socketNotifications = 0;
-    const notifiedUsers = new Set(); // userIds ya notificados por socket
-
-    for (const [sid, s] of io.sockets.sockets) {
-      // saltar el socket del que originó la emergencia
-      if (sid === socket.id) continue;
-
-      // si el socket pertenece al mismo userId (por si tiene 2 dispositivos)
-      if (s?.userId && s.userId === userId) continue;
-
-      io.to(sid).emit("emergency_alert", {
-        ...emergencyData,
-        emergencyRoomId,
-      });
-      socketNotifications++;
-
-      if (s?.userId) notifiedUsers.add(s.userId);
-    }
-
-    // 2) PUSH: a TODOS los usuarios de Firestore (menos el solicitante)
-    const usersSnapshot = await db.collection(COLLECTIONS.USERS).get();
-    let pushNotifications = 0;
-
-    for (const doc of usersSnapshot.docs) {
-      const targetUserId = doc.id;
-
-      if (targetUserId === userId) continue;
-      if (notifiedUsers.has(targetUserId)) continue;
-
-      const ok = await sendPushNotification(
-        targetUserId,
-        "🚨 EMERGENCIA",
-        `${userName} necesita ayuda`,
-        {
-          type: "emergency",
-
-          // 🔑 Identidad (claves que vos ya usabas)
-          emergencyUserId: userId,
-          emergencyUserName: userName,
-          emergencyType,
-
-          // ✅ Compat con tu Android (por si lee estas keys)
-          open_emergency_screen: "true",
-          is_helper: "true",
-          emergency_user_id: userId,
-          emergency_user_name: userName,
-          emergency_type: emergencyType,
-          emergency_room_id: emergencyRoomId,
-
-          // 📍 Ubicación
-          latitude: latitude.toString(),
-          longitude: longitude.toString(),
-          emergency_latitude: latitude.toString(),
-          emergency_longitude: longitude.toString(),
-
-          // 🖼️ Usuario
-          avatarUrl: avatarUrl || "",
-          emergency_avatar_url: avatarUrl || "",
-
-          // 🚗 Vehículo (aplanado)
-          vehicleMarca: vehicleData?.brand || "",
-          vehicleModelo: vehicleData?.model || "",
-          vehiclePatente: vehicleData?.licensePlate || "",
-          vehicleColor: vehicleData?.color || "",
-          vehicleFoto: vehicleData?.photoUri || "",
-
-          // ✅ Compat con tu receiver anterior (si usa estas)
-          vehicle_marca: vehicleData?.brand || "",
-          vehicle_modelo: vehicleData?.model || "",
-          vehicle_patente: vehicleData?.licensePlate || "",
-          vehicle_color: vehicleData?.color || "",
-          vehicle_foto: vehicleData?.photoUri || "",
-
-          // 🕒
-          timestamp: Date.now().toString(),
-          emergencyRoomId,
-        }
-      );
-
-      if (ok) pushNotifications++;
-    }
-
-    console.log(`${colors.red}📢 ALERTA DIFUNDIDA:${colors.reset} ${userName}`);
-    console.log(`${colors.blue}   → Sockets: ${socketNotifications} usuarios conectados${colors.reset}`);
-    console.log(`${colors.magenta}   → Push: ${pushNotifications} usuarios no conectados${colors.reset}`);
-
-    // Respuesta al cliente que originó la emergencia
-    return ack?.({
-      success: true,
-      message: "Alerta de emergencia enviada correctamente",
-      vehicle: vehicleData,
-      avatarUrl: avatarUrl,
-      socketNotifications: socketNotifications,
-      pushNotifications: pushNotifications,
-      emergencyRoomId,
-      staleReplaced: !!lockResult.staleReplaced,
-    });
-
-  } catch (error) {
-    console.error(`${colors.red}❌ Error en emergency_alert:${colors.reset}`, error);
-
-    // ✅ ROLLBACK SEGURO: Si adquirimos lock pero algo falló, liberarlo
-    if (lockAcquired) {
-      console.log(`${colors.yellow}⚠️ Error después de adquirir lock, liberando...${colors.reset}`);
-      try {
-        await releaseEmergencyLock({
-          userId: reqUserId,
-          roomId: emergencyRoomId || (reqUserId ? `emergencia_${reqUserId}` : null),
-          reason: "error_during_emergency",
-        });
-      } catch (e) {
-        console.warn(`${colors.yellow}⚠️ Falló releaseEmergencyLock en rollback:${colors.reset}`, e.message);
+        if (ok) pushNotifications++;
       }
-    }
 
-    return ack?.({
-      success: false,
-      code: "SERVER_ERROR",
-      message: "Error procesando alerta de emergencia",
-    });
-  }
-});
+      console.log(`${colors.red}📢 ALERTA DIFUNDIDA:${colors.reset} ${userName}`);
+      console.log(`${colors.blue}   → Sockets: ${socketNotifications} usuarios conectados${colors.reset}`);
+      console.log(`${colors.magenta}   → Push: ${pushNotifications} usuarios no conectados${colors.reset}`);
 
+      return ack?.({
+        success: true,
+        message: "Alerta de emergencia enviada correctamente",
+        vehicle: vehicleData,
+        avatarUrl: avatarUrl,
+        socketNotifications: socketNotifications,
+        pushNotifications: pushNotifications,
+        emergencyRoomId,
+        staleReplaced: !!lockResult.staleReplaced,
+      });
 
-  // ============================================================
-// ✅ EVENTOS DE EMERGENCIA RESTANTES
-// ============================================================
-socket.on("emergency_resolve", async (data = {}, ack) => {
-  try {
-    const { userId, reason = "resolved_by_user" } = data;
+    } catch (error) {
+      console.error(`${colors.red}❌ Error en emergency_alert:${colors.reset}`, error);
 
-    console.log(`${colors.green}✅ Evento → emergency_resolve:${colors.reset}`, { userId, reason });
-
-    if (!userId) {
-      return ack?.({ success: false, message: "userId requerido" });
-    }
-
-    // ✅ Determinar roomId REAL a limpiar (SIEMPRE definido)
-    const emergencyRoomId =
-      state.emergencyUserRoom.get(userId) || `emergencia_${userId}`;
-
-    // ✅ 1) LIBERAR LOCK GLOBAL (ACTIVO = FALSE)
-    // (roomId acá es válido; antes estabas usando roomIdToClean/reason sin definir)
-    await releaseEmergencyLock({
-      userId,
-      roomId: emergencyRoomId,
-      reason,
-    });
-
-    // ✅ 2) NOTIFICAR RESOLUCIÓN / CANCELACIÓN a todos
-    // Si tu app usa "emergency_cancelled" para cerrar pantallas, lo emitimos también
-   // 3. NOTIFICAR A TODOS ANTES DE LIMPIAR LA SALA
-const safeRoomId = roomIdToClean || state.emergencyUserRoom.get(userId) || `emergencia_${userId}`;
-const safeUserName = username || state.emergencyAlerts.get(userId)?.userName || "Usuario desconocido";
-
-io.emit("emergency_cancelled", {
-  userId,
-  userName: safeUserName,     // ✅ unificado
-  username: safeUserName,     // ✅ compat (por si tu Android lee "username")
-  roomId: safeRoomId,
-  reason,
-  timestamp: Date.now(),
-  isActive: false,
-});
-
-    // A los que están en la sala
-    io.to(emergencyRoomId).emit("emergency_resolved", {
-      roomId: emergencyRoomId,
-      userId,
-      message: "Emergencia resuelta",
-      reason,
-      timestamp: Date.now(),
-    });
-
-    // ✅ 3) ELIMINAR HISTORIAL (opcional)
-    try {
-      await deleteEmergencyChatHistory(emergencyRoomId);
-      console.log(`${colors.green}🗑️ Historial eliminado: ${emergencyRoomId}${colors.reset}`);
-    } catch (deleteError) {
-      console.warn(
-        `${colors.yellow}⚠️ No se pudo eliminar el historial:${colors.reset}`,
-        deleteError.message
-      );
-    }
-
-    // ✅ 4) SACAR A TODOS DE LA SALA Y LIMPIAR currentRoom en memoria
-    const room = state.chatRooms.get(emergencyRoomId);
-    if (room) {
-      room.users.forEach((roomUserId) => {
-        const entry = state.connectedUsers.get(roomUserId);
-        if (entry) {
-          entry.sockets.forEach((socketId) => {
-            const s = io.sockets.sockets.get(socketId);
-            s?.leave(emergencyRoomId);
-
-            // si este socket estaba "parado" en esa room
-            if (s && s.currentRoom === emergencyRoomId) s.currentRoom = null;
+      if (lockAcquired) {
+        console.log(`${colors.yellow}⚠️ Error después de adquirir lock, liberando...${colors.reset}`);
+        try {
+          await releaseEmergencyLock({
+            userId: reqUserId,
+            roomId: emergencyRoomId || (reqUserId ? `emergencia_${reqUserId}` : null),
+            reason: "error_during_emergency",
           });
-
-          // userData currentRoom (si lo estás usando en tu UI)
-          if (entry.userData?.currentRoom === emergencyRoomId) {
-            entry.userData.currentRoom = null;
-          }
+        } catch (e) {
+          console.warn(`${colors.yellow}⚠️ Falló releaseEmergencyLock en rollback:${colors.reset}`, e.message);
         }
+      }
+
+      return ack?.({
+        success: false,
+        code: "SERVER_ERROR",
+        message: "Error procesando alerta de emergencia",
       });
     }
-
-    // ✅ 5) LIMPIAR ESTADO EN MEMORIA
-    state.chatRooms.delete(emergencyRoomId);
-    state.emergencyUserRoom.delete(userId);
-    state.emergencyAlerts.delete(userId);
-    state.emergencyHelpers.delete(userId);
-
-    // ✅ 6) ACTUALIZAR FIRESTORE (esto es clave para que al volver atrás no reaparezca)
-    await db.collection(COLLECTIONS.EMERGENCIES).doc(userId).set(
-      {
-        status: "resolved",
-        isActive: false,
-        resolvedAt: Date.now(),
-        endedAt: Date.now(),
-        roomId: emergencyRoomId,
-        endReason: reason,
-      },
-      { merge: true }
-    );
-
-    // También el usuario
-    await db.collection(COLLECTIONS.USERS).doc(userId).set(
-      {
-        hasActiveEmergency: false,
-        emergencyRoomId: null,
-        lastEmergencyEnded: Date.now(),
-      },
-      { merge: true }
-    );
-
-    console.log(`${colors.green}✅ Emergencia resuelta para usuario: ${userId}${colors.reset}`);
-
-    return ack?.({
-      success: true,
-      message: "Emergencia resuelta correctamente",
-      emergencyRoomId,
-      chatHistoryDeleted: true,
-    });
-  } catch (error) {
-    console.error(`${colors.red}❌ Error en emergency_resolve:${colors.reset}`, error);
-    return ack?.({ success: false, message: error.message });
-  }
-});
-
+  });
 
   // ============================================================
-  // 🔴 DESCONEXIÓN (CORREGIDA - SCOPE SEGURO PARA isLastConnection)
+  // ✅ EVENTO DE RESOLUCIÓN DE EMERGENCIA (CORREGIDO)
+  // ============================================================
+  socket.on("emergency_resolve", async (data = {}, ack) => {
+    try {
+      const { userId, reason = "resolved_by_user" } = data;
+
+      console.log(`${colors.green}✅ Evento → emergency_resolve:${colors.reset}`, { userId, reason });
+
+      if (!userId) {
+        return ack?.({ success: false, message: "userId requerido" });
+      }
+
+      const emergencyRoomId = state.emergencyUserRoom.get(userId) || `emergencia_${userId}`;
+      const emergencyData = state.emergencyAlerts.get(userId);
+      const username = emergencyData?.userName || socket.username || "Usuario";
+
+      await releaseEmergencyLock({
+        userId,
+        roomId: emergencyRoomId,
+        reason,
+      });
+
+      io.emit("emergency_cancelled", {
+        userId,
+        userName: username,
+        username: username,
+        roomId: emergencyRoomId,
+        reason,
+        timestamp: Date.now(),
+        isActive: false,
+      });
+
+      io.to(emergencyRoomId).emit("emergency_resolved", {
+        roomId: emergencyRoomId,
+        userId,
+        message: "Emergencia resuelta",
+        reason,
+        timestamp: Date.now(),
+      });
+
+      try {
+        await deleteEmergencyChatHistory(emergencyRoomId);
+        console.log(`${colors.green}🗑️ Historial eliminado: ${emergencyRoomId}${colors.reset}`);
+      } catch (deleteError) {
+        console.warn(
+          `${colors.yellow}⚠️ No se pudo eliminar el historial:${colors.reset}`,
+          deleteError.message
+        );
+      }
+
+      const room = state.chatRooms.get(emergencyRoomId);
+      if (room) {
+        room.users.forEach((roomUserId) => {
+          const entry = state.connectedUsers.get(roomUserId);
+          if (entry) {
+            entry.sockets.forEach((socketId) => {
+              const s = io.sockets.sockets.get(socketId);
+              s?.leave(emergencyRoomId);
+              if (s && s.currentRoom === emergencyRoomId) s.currentRoom = null;
+            });
+
+            if (entry.userData?.currentRoom === emergencyRoomId) {
+              entry.userData.currentRoom = null;
+            }
+          }
+        });
+      }
+
+      state.chatRooms.delete(emergencyRoomId);
+      state.emergencyUserRoom.delete(userId);
+      state.emergencyAlerts.delete(userId);
+      state.emergencyHelpers.delete(userId);
+
+      await db.collection(COLLECTIONS.EMERGENCIES).doc(userId).set(
+        {
+          status: "resolved",
+          isActive: false,
+          resolvedAt: Date.now(),
+          endedAt: Date.now(),
+          roomId: emergencyRoomId,
+          endReason: reason,
+        },
+        { merge: true }
+      );
+
+      await db.collection(COLLECTIONS.USERS).doc(userId).set(
+        {
+          hasActiveEmergency: false,
+          emergencyRoomId: null,
+          lastEmergencyEnded: Date.now(),
+        },
+        { merge: true }
+      );
+
+      console.log(`${colors.green}✅ Emergencia resuelta para usuario: ${userId}${colors.reset}`);
+
+      return ack?.({
+        success: true,
+        message: "Emergencia resuelta correctamente",
+        emergencyRoomId,
+        chatHistoryDeleted: true,
+      });
+    } catch (error) {
+      console.error(`${colors.red}❌ Error en emergency_resolve:${colors.reset}`, error);
+      return ack?.({ success: false, message: error.message });
+    }
+  });
+
+  // ============================================================
+  // 🔴 DESCONEXIÓN
   // ============================================================
   socket.on("disconnect", async (reason) => {
     const userId = socket.userId;
@@ -2644,29 +2483,25 @@ io.emit("emergency_cancelled", {
     
     console.log(`${colors.red}🔌 Socket desconectado:${colors.reset} ${username || socket.id} (${reason})`);
 
-    // ✅ CORRECCIÓN: Declarar variables con scope seguro
     let entry = userId ? state.connectedUsers.get(userId) : null;
-    let isLastConnection = true; // default seguro
+    let isLastConnection = true;
     
     if (entry) {
       entry.sockets.delete(socket.id);
       isLastConnection = entry.sockets.size === 0;
     }
 
-    // 🔍 1. VERIFICAR SI EL USUARIO TIENE UNA EMERGENCIA ACTIVA
     const hasActiveEmergency = state.emergencyAlerts.has(userId);
     const emergencyRoomId = state.emergencyUserRoom.get(userId);
     
     if (userId) {
-      // 📝 2. ACTUALIZAR FIRESTORE (remover socketId)
       try {
         await db.collection(COLLECTIONS.USERS).doc(userId).update({
           socketIds: admin.firestore.FieldValue.arrayRemove(socket.id),
           lastSeen: Date.now(),
-          // Si es la última conexión, marcar como offline
           ...(isLastConnection && { 
             isOnline: false,
-            currentRoom: "general" // 🔄 Mover a sala general
+            currentRoom: "general"
           })
         });
       } catch (error) {
@@ -2674,37 +2509,31 @@ io.emit("emergency_cancelled", {
       }
       
       if (isLastConnection && entry) {
-        // 👤 Usuario completamente offline
         entry.userData.isOnline = false;
-        entry.userData.currentRoom = "general"; // 🔄 Actualizar estado local
+        entry.userData.currentRoom = "general";
         state.connectedUsers.delete(userId);
         
-        // 🚨 3. SI TIENE EMERGENCIA ACTIVA, LIMPIARLA COMPLETAMENTE
         if (hasActiveEmergency) {
           console.log(`${colors.red}🚨 USUARIO CON EMERGENCIA ACTIVA SE DESCONECTÓ: ${username}${colors.reset}`);
           await cleanupUserEmergency(userId, username, emergencyRoomId);
         }
         
-        // 📢 4. NOTIFICAR A OTROS USUARIOS
         io.emit('user_status_changed', {
           userId,
           username,
           isOnline: false,
-          currentRoom: "general", // 🔄 Informar que está en general
+          currentRoom: "general",
           emergencyCleared: hasActiveEmergency,
           timestamp: Date.now()
         });
         
         console.log(`${colors.red}🔴 Usuario ${username} completamente desconectado. ${hasActiveEmergency ? '(Emergencia limpiada)' : ''}${colors.reset}`);
       } else if (entry) {
-        // 🔄 5. USUARIO CON MÚLTIPLES CONEXIONES - Mover a general solo esta conexión
         console.log(`${colors.yellow}⚠️ Usuario ${username} tiene ${entry.sockets.size} conexiones restantes${colors.reset}`);
         
-        // Solo mover esta conexión específica a general
         socket.leave(currentRoom);
         socket.currentRoom = "general";
         
-        // Notificar a la sala actual que este socket salió
         if (currentRoom && currentRoom !== "general") {
           socket.to(currentRoom).emit("user_left_room", {
             userId: userId,
@@ -2717,11 +2546,9 @@ io.emit("emergency_cancelled", {
           });
         }
       } else if (hasActiveEmergency) {
-        // 🚨 6. CASO ESPECIAL: USUARIO CON EMERGENCIA PERO NO EN CONNECTEDUSERS
         console.log(`${colors.red}🚨 USUARIO NO ENCONTRADO PERO CON EMERGENCIA ACTIVA: ${userId}${colors.reset}`);
         await cleanupUserEmergency(userId, username, emergencyRoomId);
         
-        // Actualizar Firestore para mover a general
         try {
           await db.collection(COLLECTIONS.USERS).doc(userId).update({
             socketIds: admin.firestore.FieldValue.arrayRemove(socket.id),
@@ -2736,9 +2563,7 @@ io.emit("emergency_cancelled", {
         }
       }
 
-      // 🏠 7. MANEJAR SALA ACTUAL (si está en una sala diferente a general)
       if (currentRoom && currentRoom !== "general") {
-        // a) Notificar salida de la sala actual
         socket.to(currentRoom).emit("user_left_room", {
           userId: userId,
           username: username,
@@ -2747,20 +2572,15 @@ io.emit("emergency_cancelled", {
           timestamp: Date.now(),
           socketId: socket.id,
           hadEmergency: hasActiveEmergency,
-          movedToGeneral: true // 🔄 Indicar que fue movido a general
+          movedToGeneral: true
         });
 
-        // b) Actualizar lista de usuarios en la sala
         utils.updateRoomUserList(currentRoom);
-        
-        // c) Sacar al usuario de la sala (si aún está conectado)
         socket.leave(currentRoom);
         
-        // d) Si el usuario tenía una sala de emergencia activa, limpiarla
         if (hasActiveEmergency && currentRoom === emergencyRoomId) {
           console.log(`${colors.yellow}⚠️ Usuario abandonó sala de emergencia por desconexión${colors.reset}`);
           
-          // Notificar a los helpers en la sala de emergencia
           io.to(emergencyRoomId).emit("emergency_user_disconnected", {
             userId,
             username,
@@ -2772,12 +2592,10 @@ io.emit("emergency_cancelled", {
         }
       }
       
-      // 🔄 8. Mover el socket a la sala general (si no es la última conexión)
       if (!isLastConnection && entry) {
         socket.join("general");
         socket.currentRoom = "general";
         
-        // Notificar entrada a general
         socket.to("general").emit("user_joined_room", {
           userId: userId,
           username: username,
@@ -2789,7 +2607,6 @@ io.emit("emergency_cancelled", {
       }
     }
 
-    // 🔄 9. SI EL USUARIO ESTABA EN UNA SALA DE EMERGENCIA, SACARLO AUTOMÁTICAMENTE
     if (socket.rooms) {
       const rooms = Array.from(socket.rooms);
       const emergencyRooms = rooms.filter(room => room.startsWith('emergencia_'));
@@ -2800,16 +2617,13 @@ io.emit("emergency_cancelled", {
       }
     }
 
-    // 👥 10. ACTUALIZAR LISTA DE USUARIOS CONECTADOS
     const connectedUsersList = Array.from(state.connectedUsers.values()).map((u) => ({
       ...u.userData,
       socketCount: u.sockets.size,
-      currentRoom: u.userData.currentRoom || "general" // 🔄 Asegurar sala general
+      currentRoom: u.userData.currentRoom || "general"
     }));
     
     io.emit("connected_users", connectedUsersList);
-    
-    // 🏠 11. ACTUALIZAR LISTA DE USUARIOS EN SALA GENERAL
     utils.updateRoomUserList("general");
   });
 });
@@ -2820,21 +2634,15 @@ io.emit("emergency_cancelled", {
 initializeDefaultRooms();
 
 const PORT = process.env.PORT || 8080;
-// ============================================================
-// 🛡️ MANEJO DE ERRORES GLOBAL
-// ============================================================
+
 process.on('uncaughtException', (error) => {
   console.error(`${colors.red}🔥 ERROR NO CAPTURADO:${colors.reset}`, error);
-  // No salir del proceso, solo loguear
 });
 
 process.on('unhandledRejection', (reason, promise) => {
   console.error(`${colors.red}🔥 PROMESA RECHAZADA NO MANEJADA:${colors.reset}`, reason);
 });
 
-// ============================================================
-// 🧹 LIMPIEZA DE MEMORIA PERIÓDICA
-// ============================================================
 setInterval(() => {
   const memoryUsage = process.memoryUsage();
   console.log(`${colors.gray}🧠 Uso de memoria:${colors.reset}`, {
@@ -2842,21 +2650,12 @@ setInterval(() => {
     heapTotal: Math.round(memoryUsage.heapTotal / 1024 / 1024) + 'MB',
     heapUsed: Math.round(memoryUsage.heapUsed / 1024 / 1024) + 'MB',
   });
-}, 300000); // Cada 5 minutos
+}, 300000);
+
 server.listen(PORT, () => {
   console.log(`${colors.green}🚀 Servidor de chat corriendo en puerto ${PORT}${colors.reset}`);
   console.log(`${colors.cyan}🌐 http://localhost:${PORT}${colors.reset}`);
   console.log(`${colors.blue}💬 Sistema de salas activo${colors.reset}`);
   console.log(`${colors.red}🚨 Sistema de Emergencia activo${colors.reset}`);
-  console.log(`${colors.yellow}🔒 Sistema de LOCK global (1 emergencia a la vez) con detección de stale locks${colors.reset}`);
-  console.log(`${colors.green}✅ Sistema de notificaciones push configurado${colors.reset}`);
-  console.log(`${colors.magenta}📱 Notificaciones solo a usuarios NO presentes${colors.reset}`);
-  console.log(`${colors.red}🧹 Sistema de limpieza automática de emergencias activo${colors.reset}`);
-  console.log(`${colors.green}✅ Correcciones aplicadas:${colors.reset}`);
-  console.log(`${colors.blue}   - Scope seguro en disconnect${colors.reset}`);
-  console.log(`${colors.blue}   - Token FCM en scope del catch${colors.reset}`);
-  console.log(`${colors.blue}   - Ubicación consistente (lastKnownLocation)${colors.reset}`);
-  console.log(`${colors.blue}   - Performance mejorada en notificaciones${colors.reset}`);
-  console.log(`${colors.blue}   - Lock cleanup mejorado${colors.reset}`);
-  console.log(`${colors.blue}   - Stale lock detection (${LOCK_TTL_MS/1000}s)${colors.reset}`);
+  console.log(`${colors.yellow}🔒 Sistema de LOCK global (1 emergencia a la vez)${colors.reset}`);
 });
