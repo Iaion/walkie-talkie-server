@@ -1,6 +1,7 @@
 // ============================================================
 // 🌐 Servidor Node.js con Socket.IO, Firebase Firestore y Storage
 // 💬 Chat General + Sistema de Emergencia + Gestión de Vehículos
+// 🔥 CON MEJORAS PARA TOKENS FCM - VERSIÓN CORREGIDA
 // ============================================================
 
 const express = require("express");
@@ -74,10 +75,6 @@ const COLLECTIONS = {
 
 // ============================================================
 // 🔒 CONFIGURACIÓN DE LOCKS
-// ============================================================
-// ============================================================
-// 🔒 FIRESTORE LOCK (1 emergencia activa global)
-// Colección: LOCKS | Doc: active_emergency | Campo: active
 // ============================================================
 const LOCK_REF = db.collection("LOCKS").doc("active_emergency");
 const LOCK_TTL_MS = 5 * 60 * 1000; // 5 minutos (ajustable)
@@ -301,7 +298,7 @@ async function releaseEmergencyLock(
 }
 
 // ============================================================
-// 🧹 FUNCIÓN PARA LIMPIAR EMERGENCIA (CORREGIDA - PRESERVA TOKENS FCM)
+// 🧹 FUNCIÓN PARA LIMPIAR EMERGENCIA (MEJORADA - SEGURA CON TOKENS)
 // ============================================================
 async function cleanupUserEmergency(userId, username, emergencyRoomId, reason = "user_disconnected") {
   try {
@@ -382,75 +379,25 @@ async function cleanupUserEmergency(userId, username, emergencyRoomId, reason = 
       }
     }
 
-    // 5. ACTUALIZAR FIRESTORE - CON TRANSACCIÓN PARA PRESERVAR TOKENS
+    // 5. ACTUALIZAR FIRESTORE - USANDO UPDATE() PARA SEGURIDAD
     try {
       const userRef = db.collection(COLLECTIONS.USERS).doc(userId);
       
-      // Verificar tokens antes de la limpieza
-      const docParaRevisar = await userRef.get();
-      console.log("🔍 ANTES DE LIMPIAR, TOKENS SON:", {
-        fcmTokens: docParaRevisar.data()?.fcmTokens,
-        fcmToken: docParaRevisar.data()?.fcmToken,
-        devices: docParaRevisar.data()?.devices,
-        userId: userId
+      // Usar update() en lugar de set() para no sobrescribir tokens
+      await userRef.update({
+        hasActiveEmergency: false,
+        emergencyRoomId: null,
+        lastEmergencyEnded: Date.now(),
+        lastSeen: Date.now(),
       });
       
-      await db.runTransaction(async (transaction) => {
-        const userSnap = await transaction.get(userRef);
-        if (!userSnap.exists) {
-          console.log(`${colors.yellow}⚠️ Usuario no encontrado en Firestore: ${userId}${colors.reset}`);
-          return;
-        }
-
-        const userData = userSnap.data() || {};
-        
-        // Solo actualizamos los campos de emergencia específicos,
-        // manteniendo INTACTOS fcmTokens, fcmToken y devices.
-        transaction.update(userRef, {
-          hasActiveEmergency: false,
-          emergencyRoomId: null,
-          lastEmergencyEnded: Date.now(),
-          lastSeen: Date.now(),
-          // No tocamos: fcmTokens, fcmToken, devices, socketIds
-        });
-        
-        console.log(`${colors.green}✅ Transaction preparada: campos de emergencia actualizados${colors.reset}`);
-      });
-
-      // Verificar tokens después de la transacción
-      const docDespues = await userRef.get();
-      console.log("🔍 DESPUÉS DE LIMPIAR, TOKENS SON:", {
-        fcmTokens: docDespues.data()?.fcmTokens,
-        fcmToken: docDespues.data()?.fcmToken,
-        devices: docDespues.data()?.devices,
-        userId: userId
-      });
-
-      console.log(`${colors.green}✅ Firestore actualizado (Tokens preservados) para usuario: ${userId}${colors.reset}`);
+      console.log(`${colors.green}✅ Firestore actualizado (Update seguro) para usuario: ${userId}${colors.reset}`);
       
     } catch (firestoreError) {
       console.error(
         `${colors.red}❌ Error actualizando Firestore:${colors.reset}`,
         firestoreError.message
       );
-      
-      // Fallback seguro: actualizar solo los campos necesarios sin transaction
-      try {
-        const userRef = db.collection(COLLECTIONS.USERS).doc(userId);
-        await userRef.set({
-          hasActiveEmergency: false,
-          emergencyRoomId: null,
-          lastEmergencyEnded: Date.now(),
-          lastSeen: Date.now(),
-        }, { merge: true });
-        
-        console.log(`${colors.yellow}🔄 Fallback ejecutado: campos de emergencia actualizados sin transaction${colors.reset}`);
-      } catch (fallbackError) {
-        console.error(
-          `${colors.red}❌ Error incluso en fallback:${colors.reset}`,
-          fallbackError.message
-        );
-      }
     }
 
     // 6. ACTUALIZAR DOCUMENTO DE EMERGENCIA
@@ -540,6 +487,7 @@ async function cleanupUserEmergency(userId, username, emergencyRoomId, reason = 
     return false;
   }
 }
+
 // ============================================================
 // 🛠️ FUNCIONES UTILITARIAS
 // ============================================================
@@ -738,7 +686,7 @@ async function sendPushNotification(userId, title, body, data = {}) {
       console.log(
         `${colors.yellow}⚠️ Tokens inválidos detectados para ${userId}: ${invalidTokens.length}${colors.reset}`
       );
-      // ⚠️ NO LOS ELIMINAMOS AUTOMÁTICAMENTE
+      // ⚠️ NO LOS ELIMINAMOS AUTOMÁTICAMENTE - El cliente debe llamar al endpoint
     }
 
     return ok;
@@ -826,7 +774,6 @@ async function sendEmergencyNotification(userId, title, body, data = {}) {
     );
 
     // ⚠️ IMPORTANTE: NO ELIMINAMOS TOKENS EN EMERGENCIAS
-    // Sólo registramos si hay problemas
     const invalidTokens = [];
     res.responses.forEach((r, idx) => {
       if (!r.success) {
@@ -885,6 +832,100 @@ const deleteEmergencyChatHistory = async (emergencyRoomId) => {
     throw error;
   }
 };
+
+// ============================================================
+// 🧹 FUNCIÓN PARA LIMPIAR TOKENS INVALIDOS (OPCIONAL - CRON JOB)
+// ============================================================
+async function cleanupInvalidTokens() {
+  console.log(`${colors.cyan}🧹 Iniciando limpieza de tokens FCM inválidos...${colors.reset}`);
+  
+  try {
+    const usersSnapshot = await db.collection(COLLECTIONS.USERS).get();
+    let totalCleaned = 0;
+    let usersProcessed = 0;
+    
+    for (const doc of usersSnapshot.docs) {
+      const userId = doc.id;
+      const userData = doc.data() || {};
+      const tokens = Array.isArray(userData.fcmTokens) ? userData.fcmTokens : [];
+      
+      if (tokens.length === 0) continue;
+      
+      // Verificar tokens en lote
+      try {
+        const response = await messaging.sendEachForMulticast({
+          tokens: tokens,
+          data: { type: 'token_validation_check' }
+        });
+        
+        const invalidTokens = [];
+        response.responses.forEach((resp, idx) => {
+          if (!resp.success) {
+            const code = resp.error?.code || '';
+            if (code === 'messaging/registration-token-not-registered' || 
+                code === 'messaging/invalid-registration-token') {
+              invalidTokens.push(tokens[idx]);
+            }
+          }
+        });
+        
+        if (invalidTokens.length > 0) {
+          const userRef = db.collection(COLLECTIONS.USERS).doc(userId);
+          
+          // Actualizar en transacción
+          await db.runTransaction(async (transaction) => {
+            const userDoc = await transaction.get(userRef);
+            if (!userDoc.exists) return;
+            
+            const currentData = userDoc.data();
+            const currentTokens = Array.isArray(currentData.fcmTokens) ? currentData.fcmTokens : [];
+            const currentDevices = currentData.devices || {};
+            
+            // Filtrar tokens válidos
+            const validTokens = currentTokens.filter(t => !invalidTokens.includes(t));
+            
+            // Filtrar dispositivos con tokens inválidos
+            const validDevices = {};
+            Object.entries(currentDevices).forEach(([deviceId, deviceInfo]) => {
+              if (deviceInfo.token && !invalidTokens.includes(deviceInfo.token)) {
+                validDevices[deviceId] = deviceInfo;
+              }
+            });
+            
+            // Actualizar solo si hay cambios
+            if (validTokens.length !== currentTokens.length || 
+                Object.keys(validDevices).length !== Object.keys(currentDevices).length) {
+              
+              transaction.update(userRef, {
+                fcmTokens: validTokens,
+                devices: validDevices,
+                lastTokenCleanup: Date.now(),
+                cleanupRemoved: invalidTokens.length
+              });
+              
+              totalCleaned += invalidTokens.length;
+            }
+          });
+          
+          console.log(`${colors.yellow}🧹 Limpiados ${invalidTokens.length} tokens inválidos de ${userId}${colors.reset}`);
+        }
+        
+      } catch (error) {
+        console.warn(`${colors.yellow}⚠️ Error validando tokens para ${userId}:${colors.reset}`, error.message);
+      }
+      
+      usersProcessed++;
+      if (usersProcessed % 10 === 0) {
+        console.log(`${colors.gray}📊 Procesados ${usersProcessed} usuarios...${colors.reset}`);
+      }
+    }
+    
+    console.log(`${colors.green}✅ Limpieza completada: ${totalCleaned} tokens eliminados de ${usersProcessed} usuarios${colors.reset}`);
+    
+  } catch (error) {
+    console.error(`${colors.red}❌ Error en limpieza automática:${colors.reset}`, error);
+  }
+}
 
 // ============================================================
 // 🗄️ MANEJO DE ARCHIVOS - STORAGE
@@ -1172,7 +1213,191 @@ app.get("/emergencies/:userId/helpers", async (req, res) => {
 });
 
 // ============================================================
-// 🚗 ENDPOINTS PARA VEHÍCULOS (sin cambios)
+// 🔥 NUEVOS ENDPOINTS PARA GESTIÓN DE TOKENS FCM
+// ============================================================
+app.post("/fcm/cleanup-tokens", async (req, res) => {
+  try {
+    const { userId, invalidTokens } = req.body;
+    
+    if (!userId || !Array.isArray(invalidTokens)) {
+      return res.status(400).json({ 
+        success: false, 
+        message: "userId y invalidTokens array son requeridos" 
+      });
+    }
+
+    const userRef = db.collection(COLLECTIONS.USERS).doc(userId);
+    let removedCount = 0;
+    
+    await db.runTransaction(async (transaction) => {
+      const userDoc = await transaction.get(userRef);
+      
+      if (!userDoc.exists) {
+        throw new Error("Usuario no encontrado");
+      }
+      
+      const userData = userDoc.data();
+      const currentTokens = userData.fcmTokens || [];
+      const currentFcmToken = userData.fcmToken || "";
+      const currentDevices = userData.devices || {};
+      
+      // Filtrar tokens válidos
+      const validTokens = currentTokens.filter(
+        token => !invalidTokens.includes(token)
+      );
+      
+      // Si el token principal es inválido, limpiarlo
+      const newFcmToken = invalidTokens.includes(currentFcmToken) ? "" : currentFcmToken;
+      
+      // Limpiar devices con tokens inválidos
+      const validDevices = {};
+      Object.entries(currentDevices).forEach(([deviceId, deviceInfo]) => {
+        if (deviceInfo.token && !invalidTokens.includes(deviceInfo.token)) {
+          validDevices[deviceId] = deviceInfo;
+        } else {
+          removedCount++;
+        }
+      });
+      
+      transaction.update(userRef, {
+        fcmTokens: validTokens,
+        fcmToken: newFcmToken,
+        devices: validDevices,
+        tokensCleanedAt: Date.now(),
+        tokensCleanedCount: invalidTokens.length
+      });
+    });
+    
+    console.log(`${colors.green}✅ Tokens limpiados para ${userId}: ${removedCount} tokens inválidos eliminados${colors.reset}`);
+    
+    res.json({ 
+      success: true, 
+      message: `Se eliminaron ${removedCount} tokens inválidos`,
+      removedCount,
+      cleanedAt: Date.now()
+    });
+    
+  } catch (error) {
+    console.error(`${colors.red}❌ Error limpiando tokens:${colors.reset}`, error);
+    res.status(500).json({ 
+      success: false, 
+      message: error.message 
+    });
+  }
+});
+
+app.get("/fcm/user-tokens/:userId", async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const userDoc = await db.collection(COLLECTIONS.USERS).doc(userId).get();
+    
+    if (!userDoc.exists) {
+      return res.status(404).json({ 
+        success: false, 
+        message: "Usuario no encontrado" 
+      });
+    }
+    
+    const userData = userDoc.data();
+    const tokens = {
+      fcmTokens: userData.fcmTokens || [],
+      fcmToken: userData.fcmToken || "",
+      devices: userData.devices || {},
+      count: (userData.fcmTokens?.length || 0) + (userData.fcmToken ? 1 : 0),
+      lastUpdated: userData.fcmTokensUpdatedAt || null,
+      tokensCleanedAt: userData.tokensCleanedAt || null
+    };
+    
+    res.json({
+      success: true,
+      userId,
+      tokens,
+      totalTokens: tokens.count
+    });
+    
+  } catch (error) {
+    console.error(`${colors.red}❌ Error obteniendo tokens:${colors.reset}`, error);
+    res.status(500).json({ 
+      success: false, 
+      message: error.message 
+    });
+  }
+});
+
+app.post("/fcm/refresh-token", async (req, res) => {
+  try {
+    const { userId, oldToken, newToken, deviceId } = req.body;
+    
+    if (!userId || !newToken) {
+      return res.status(400).json({ 
+        success: false, 
+        message: "userId y newToken son requeridos" 
+      });
+    }
+
+    const userRef = db.collection(COLLECTIONS.USERS).doc(userId);
+    const now = Date.now();
+    
+    await db.runTransaction(async (transaction) => {
+      const userDoc = await transaction.get(userRef);
+      
+      if (!userDoc.exists) {
+        throw new Error("Usuario no encontrado");
+      }
+      
+      const userData = userDoc.data();
+      let currentTokens = userData.fcmTokens || [];
+      const currentDevices = userData.devices || {};
+      
+      // Si hay oldToken, reemplazarlo
+      if (oldToken && currentTokens.includes(oldToken)) {
+        currentTokens = currentTokens.filter(token => token !== oldToken);
+      }
+      
+      // Agregar el nuevo token si no existe
+      if (!currentTokens.includes(newToken)) {
+        currentTokens.push(newToken);
+      }
+      
+      // Actualizar device si se proporciona deviceId
+      let updatedDevices = { ...currentDevices };
+      if (deviceId && updatedDevices[deviceId]) {
+        updatedDevices[deviceId] = {
+          ...updatedDevices[deviceId],
+          token: newToken,
+          lastActive: now,
+          lastTokenRefresh: now
+        };
+      }
+      
+      transaction.update(userRef, {
+        fcmTokens: currentTokens,
+        fcmToken: newToken,
+        fcmTokensUpdatedAt: now,
+        devices: updatedDevices,
+        lastTokenRefresh: now
+      });
+    });
+    
+    console.log(`${colors.green}✅ Token refrescado para ${userId}${colors.reset}`);
+    
+    res.json({ 
+      success: true, 
+      message: "Token actualizado correctamente",
+      updatedAt: Date.now()
+    });
+    
+  } catch (error) {
+    console.error(`${colors.red}❌ Error refrescando token:${colors.reset}`, error);
+    res.status(500).json({ 
+      success: false, 
+      message: error.message 
+    });
+  }
+});
+
+// ============================================================
+// 🚗 ENDPOINTS PARA VEHÍCULOS
 // ============================================================
 app.get("/vehicles/:userId", async (req, res) => {
   try {
@@ -1539,38 +1764,73 @@ io.on("connection", (socket) => {
   console.log(`${colors.cyan}🔗 NUEVA CONEXIÓN SOCKET:${colors.reset} ${socket.id}`);
 
   // ============================================================
-  // 🔑 EVENTO: REGISTRAR TOKEN FCM
+  // 🔑 EVENTO: REGISTRAR TOKEN FCM (MEJORADO)
   // ============================================================
   socket.on("register_fcm_token", async (data = {}, callback) => {
     try {
-      const { userId, fcmToken } = data;
+      const { userId, fcmToken, deviceId, platform, deviceModel } = data;
 
       if (!userId || !fcmToken) {
         return callback?.({ success: false, message: "userId y fcmToken requeridos" });
       }
 
+      // Generar un deviceId único si no viene
+      const uniqueDeviceId = deviceId || `device_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+      
       const userRef = db.collection(COLLECTIONS.USERS).doc(userId);
+      const now = Date.now();
 
-      const deviceId = data.deviceId || socket.id;
-      const devicePath = `devices.${deviceId}`;
-
-      await userRef.set(
-        {
-          fcmTokens: admin.firestore.FieldValue.arrayUnion(fcmToken),
-          fcmTokensUpdatedAt: Date.now(),
-          [devicePath]: {
+      await db.runTransaction(async (transaction) => {
+        const userDoc = await transaction.get(userRef);
+        
+        let currentData = {};
+        if (userDoc.exists) {
+          currentData = userDoc.data();
+        }
+        
+        // Obtener tokens actuales
+        const currentTokens = Array.isArray(currentData.fcmTokens) ? currentData.fcmTokens : [];
+        const currentDevices = currentData.devices || {};
+        
+        // Evitar duplicados
+        let updatedTokens = [...currentTokens];
+        if (!updatedTokens.includes(fcmToken)) {
+          updatedTokens.push(fcmToken);
+        }
+        
+        // Actualizar dispositivo
+        const updatedDevices = {
+          ...currentDevices,
+          [uniqueDeviceId]: {
             token: fcmToken,
-            platform: data.platform || "android",
-            deviceModel: data.deviceModel || null,
-            lastActive: Date.now(),
-          },
-          socketIds: admin.firestore.FieldValue.arrayUnion(socket.id),
-        },
-        { merge: true }
-      );
+            platform: platform || "android",
+            deviceModel: deviceModel || null,
+            lastActive: now,
+            socketId: socket.id,
+            registeredAt: currentDevices[uniqueDeviceId]?.registeredAt || now
+          }
+        };
+        
+        // Actualizar campos
+        const updates = {
+          fcmTokens: updatedTokens,
+          fcmToken: fcmToken, // Último token usado
+          fcmTokensUpdatedAt: now,
+          devices: updatedDevices,
+          socketIds: admin.firestore.FieldValue.arrayUnion(socket.id)
+        };
+        
+        transaction.set(userRef, updates, { merge: true });
+      });
 
-      console.log(`${colors.green}✅ Token FCM registrado para ${userId}${colors.reset}`);
-      callback?.({ success: true, message: "Token registrado" });
+      console.log(`${colors.green}✅ Token FCM registrado para ${userId} (dispositivo: ${uniqueDeviceId})${colors.reset}`);
+      
+      callback?.({ 
+        success: true, 
+        message: "Token registrado",
+        deviceId: uniqueDeviceId 
+      });
+      
     } catch (error) {
       console.error(`${colors.red}❌ Error registrando token:${colors.reset}`, error);
       callback?.({ success: false, message: error.message });
@@ -1633,13 +1893,14 @@ io.on("connection", (socket) => {
     }
 
     try {
-      await db.collection(COLLECTIONS.USERS).doc(userId).set({
-        ...user,
+      // Usar update() en lugar de set() para mayor seguridad
+      await db.collection(COLLECTIONS.USERS).doc(userId).update({
         isOnline: true,
         lastLogin: Date.now(),
         currentRoom: defaultRoom,
-        socketIds: admin.firestore.FieldValue.arrayUnion(socket.id)
-      }, { merge: true });
+        socketIds: admin.firestore.FieldValue.arrayUnion(socket.id),
+        lastSeen: Date.now()
+      });
       console.log(`${colors.green}🔑 Usuario sincronizado con Firebase: ${username}${colors.reset}`);
     } catch (error) {
       console.error(`${colors.red}❌ Error al registrar usuario:${colors.reset}`, error);
@@ -1697,10 +1958,10 @@ io.on("connection", (socket) => {
         const loc = { lat, lng, ts: typeof timestamp === "number" ? timestamp : Date.now() };
         entry.userData.lastKnownLocation = loc;
         
-        await db.collection(COLLECTIONS.USERS).doc(userId).set({
+        await db.collection(COLLECTIONS.USERS).doc(userId).update({
           lastKnownLocation: loc,
           lastLocationUpdatedAt: Date.now(),
-        }, { merge: true });
+        });
         
         ack?.({ success: true });
       } else {
@@ -1764,10 +2025,10 @@ io.on("connection", (socket) => {
         entry.userData.currentRoom = roomId;
       }
 
-      await db.collection(COLLECTIONS.USERS).doc(userId).set({
+      await db.collection(COLLECTIONS.USERS).doc(userId).update({
         currentRoom: roomId,
         lastActive: Date.now()
-      }, { merge: true });
+      });
 
       try {
         const messagesSnapshot = await db.collection(COLLECTIONS.MESSAGES)
@@ -1840,10 +2101,10 @@ io.on("connection", (socket) => {
         entry.userData.currentRoom = null;
       }
 
-      await db.collection(COLLECTIONS.USERS).doc(userId || socket.userId).set({
+      await db.collection(COLLECTIONS.USERS).doc(userId || socket.userId).update({
         currentRoom: null,
         lastActive: Date.now()
-      }, { merge: true });
+      });
 
       socket.to(roomId).emit("user_left_room", {
         userId: userId || socket.userId,
@@ -2124,7 +2385,7 @@ io.on("connection", (socket) => {
         updatedAt: Date.now(),
       };
 
-      await db.collection(COLLECTIONS.USERS).doc(userId).set(updatedUser, { merge: true });
+      await db.collection(COLLECTIONS.USERS).doc(userId).update(updatedUser);
 
       const entry = state.connectedUsers.get(userId);
       if (entry) {
@@ -2364,11 +2625,11 @@ io.on("connection", (socket) => {
             { merge: true }
           );
 
-        await db.collection(COLLECTIONS.USERS).doc(userId).set({
+        await db.collection(COLLECTIONS.USERS).doc(userId).update({
           hasActiveEmergency: true,
           emergencyRoomId,
           lastEmergencyStarted: Date.now(),
-        }, { merge: true });
+        });
 
       } catch (fireErr) {
         console.error(`${colors.red}❌ Error guardando emergencia:${colors.reset}`, fireErr.message);
@@ -2583,26 +2844,20 @@ io.on("connection", (socket) => {
       state.emergencyAlerts.delete(userId);
       state.emergencyHelpers.delete(userId);
 
-      await db.collection(COLLECTIONS.EMERGENCIES).doc(userId).set(
-        {
-          status: "resolved",
-          isActive: false,
-          resolvedAt: Date.now(),
-          endedAt: Date.now(),
-          roomId: emergencyRoomId,
-          endReason: reason,
-        },
-        { merge: true }
-      );
+      await db.collection(COLLECTIONS.EMERGENCIES).doc(userId).update({
+        status: "resolved",
+        isActive: false,
+        resolvedAt: Date.now(),
+        endedAt: Date.now(),
+        roomId: emergencyRoomId,
+        endReason: reason,
+      });
 
-      await db.collection(COLLECTIONS.USERS).doc(userId).set(
-        {
-          hasActiveEmergency: false,
-          emergencyRoomId: null,
-          lastEmergencyEnded: Date.now(),
-        },
-        { merge: true }
-      );
+      await db.collection(COLLECTIONS.USERS).doc(userId).update({
+        hasActiveEmergency: false,
+        emergencyRoomId: null,
+        lastEmergencyEnded: Date.now(),
+      });
 
       console.log(`${colors.green}✅ Emergencia resuelta para usuario: ${userId}${colors.reset}`);
 
@@ -2788,6 +3043,9 @@ process.on('unhandledRejection', (reason, promise) => {
   console.error(`${colors.red}🔥 PROMESA RECHAZADA NO MANEJADA:${colors.reset}`, reason);
 });
 
+// Programa una limpieza automática de tokens cada 24 horas (opcional)
+// setInterval(cleanupInvalidTokens, 24 * 60 * 60 * 1000);
+
 setInterval(() => {
   const memoryUsage = process.memoryUsage();
   console.log(`${colors.gray}🧠 Uso de memoria:${colors.reset}`, {
@@ -2803,4 +3061,9 @@ server.listen(PORT, () => {
   console.log(`${colors.blue}💬 Sistema de salas activo${colors.reset}`);
   console.log(`${colors.red}🚨 Sistema de Emergencia activo${colors.reset}`);
   console.log(`${colors.yellow}🔒 Sistema de LOCK global (1 emergencia a la vez)${colors.reset}`);
+  console.log(`${colors.magenta}🔥 Sistema de Tokens FCM mejorado${colors.reset}`);
+  console.log(`${colors.green}📱 Nuevos endpoints FCM disponibles:${colors.reset}`);
+  console.log(`${colors.cyan}   POST /fcm/cleanup-tokens - Para limpiar tokens inválidos${colors.reset}`);
+  console.log(`${colors.cyan}   GET /fcm/user-tokens/:userId - Para debug de tokens${colors.reset}`);
+  console.log(`${colors.cyan}   POST /fcm/refresh-token - Para refrescar tokens${colors.reset}`);
 });
