@@ -585,42 +585,61 @@ const utils = {
   }
 };
 
+async function getActiveFcmTokens(userId) {
+  const snap = await db
+    .collection(COLLECTIONS.USERS).doc(userId)
+    .collection("fcmTokens")
+    .where("enabled", "==", true)
+    .get();
+
+  const out = [];
+  snap.forEach(doc => {
+    const d = doc.data() || {};
+    if (typeof d.token === "string" && d.token.length > 0) {
+      out.push({ deviceId: doc.id, token: d.token });
+    }
+  });
+  return out;
+}
+
+async function disableInvalidDevices(userId, deviceIds = []) {
+  if (!deviceIds.length) return;
+
+  const batch = db.batch();
+  const base = db.collection(COLLECTIONS.USERS).doc(userId).collection("fcmTokens");
+
+  for (const deviceId of deviceIds) {
+    const ref = base.doc(deviceId);
+    batch.set(ref, {
+      enabled: false,
+      disabledReason: "invalid_fcm_token",
+      disabledAt: admin.firestore.FieldValue.serverTimestamp(),
+    }, { merge: true });
+  }
+
+  await batch.commit();
+}
+
+
 // ============================================================
 // 🚀 FUNCIÓN SEGURA PARA ENVIAR NOTIFICACIONES PUSH (NO ELIMINA TOKENS)
 // ============================================================
 async function sendPushNotification(userId, title, body, data = {}) {
-  let tokens = [];
-
   try {
-    const userDoc = await db.collection(COLLECTIONS.USERS).doc(userId).get();
+    const userRef = db.collection(COLLECTIONS.USERS).doc(userId);
+    const userDoc = await userRef.get();
+
     if (!userDoc.exists) {
       console.log(`${colors.yellow}⚠️ Usuario ${userId} no encontrado${colors.reset}`);
       return false;
     }
 
-    const userData = userDoc.data() || {};
+    // ✅ NUEVO: leer desde subcolección (fuente de verdad)
+    const devices = await getActiveFcmTokens(userId);
+    const tokens = devices.map(d => d.token);
 
-    if (Array.isArray(userData.fcmTokens) && userData.fcmTokens.length > 0) {
-      tokens.push(...userData.fcmTokens.filter(t => typeof t === "string" && t.length > 0));
-    }
-
-    if (userData.fcmToken && typeof userData.fcmToken === "string" && userData.fcmToken.length > 0) {
-      tokens.push(userData.fcmToken);
-    }
-
-    if (userData.devices && typeof userData.devices === "object") {
-      const deviceEntries = Object.values(userData.devices);
-      for (const d of deviceEntries) {
-        if (d && typeof d.token === "string" && d.token.length > 0) {
-          tokens.push(d.token);
-        }
-      }
-    }
-
-    tokens = Array.from(new Set(tokens));
-
-    if (tokens.length === 0) {
-      console.log(`${colors.yellow}⚠️ Usuario ${userId} sin token FCM${colors.reset}`);
+    if (!tokens.length) {
+      console.log(`${colors.yellow}⚠️ Usuario ${userId} sin tokens activos${colors.reset}`);
       return false;
     }
 
@@ -648,55 +667,67 @@ async function sendPushNotification(userId, title, body, data = {}) {
 
     const message = {
       tokens,
-      android: {
-        priority: "high",
-      },
+      android: { priority: "high" },
       data: safeData,
       apns: {
-        headers: {
-          "apns-priority": "10",
-        },
-        payload: {
-          aps: {
-            "content-available": 1,
-          },
-        },
+        headers: { "apns-priority": "10" },
+        payload: { aps: { "content-available": 1 } },
       },
     };
 
     const res = await messaging.sendEachForMulticast(message);
-    
+
     const ok = res.successCount > 0;
     console.log(
-      `${ok ? colors.green : colors.yellow}📱 Push multicast a ${userId}: ${res.successCount}/${tokens.length} ok${colors.reset}`
+      `${ok ? colors.green : colors.yellow}📱 Push a ${userId}: ${res.successCount}/${tokens.length} ok${colors.reset}`
     );
 
-    // ⚠️ NO ELIMINAMOS TOKENS AUTOMÁTICAMENTE - SÓLO REGISTRAMOS ERRORES
-    const invalidTokens = [];
+    // ✅ NUEVO: deshabilitar automáticamente tokens inválidos
+    const invalidDeviceIds = [];
     res.responses.forEach((r, idx) => {
       if (!r.success) {
         const code = r.error?.code || "";
-        if (code === "messaging/registration-token-not-registered") {
-          invalidTokens.push(tokens[idx]);
+        if (
+          code === "messaging/registration-token-not-registered" ||
+          code === "messaging/invalid-registration-token"
+        ) {
+          invalidDeviceIds.push(devices[idx].deviceId);
         }
       }
     });
 
-    if (invalidTokens.length > 0) {
-      console.log(
-        `${colors.yellow}⚠️ Tokens inválidos detectados para ${userId}: ${invalidTokens.length}${colors.reset}`
-      );
-      // ⚠️ NO LOS ELIMINAMOS AUTOMÁTICAMENTE - El cliente debe llamar al endpoint
+    if (invalidDeviceIds.length) {
+      console.log(`${colors.yellow}🧹 Deshabilitando ${invalidDeviceIds.length} tokens inválidos de ${userId}${colors.reset}`);
+      await disableInvalidDevices(userId, invalidDeviceIds);
     }
 
     return ok;
   } catch (error) {
     console.error(`${colors.red}❌ Error enviando notificación:${colors.reset}`, error);
-    
-    // ⚠️ NO MANIPULAMOS TOKENS EN CASO DE ERROR
     return false;
   }
 }
+
+async function upsertFcmToken({ userId, deviceId, token, platform, deviceModel }) {
+  if (!userId || !deviceId || !token) return { success: false, error: "missing_fields" };
+
+  const ref = db.collection(COLLECTIONS.USERS).doc(userId)
+    .collection("fcmTokens").doc(deviceId);
+
+  await ref.set({
+    token,
+    platform: platform || "unknown",
+    deviceModel: deviceModel || "unknown",
+    enabled: true,
+    lastActiveAt: admin.firestore.FieldValue.serverTimestamp(),
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    createdAt: admin.firestore.FieldValue.serverTimestamp(), // merge no lo pisa
+  }, { merge: true });
+
+  return { success: true };
+}
+
+
 
 // ============================================================
 // 🚨 FUNCIÓN ESPECÍFICA PARA NOTIFICACIONES DE EMERGENCIA
