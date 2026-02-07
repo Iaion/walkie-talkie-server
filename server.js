@@ -592,15 +592,27 @@ async function getActiveFcmTokens(userId) {
     .where("enabled", "==", true)
     .get();
 
-  const out = [];
+  const devices = [];
   snap.forEach(doc => {
     const d = doc.data() || {};
-    if (typeof d.token === "string" && d.token.length > 0) {
-      out.push({ deviceId: doc.id, token: d.token });
+    const token = typeof d.token === "string" ? d.token.trim() : "";
+    if (token.length > 0) {
+      devices.push({ deviceId: doc.id, token });
     }
   });
-  return out;
+
+  // dedupe tokens manteniendo el primer deviceId
+  const seen = new Set();
+  const uniq = [];
+  for (const d of devices) {
+    if (!seen.has(d.token)) {
+      seen.add(d.token);
+      uniq.push(d);
+    }
+  }
+  return uniq;
 }
+
 
 async function disableInvalidDevices(userId, deviceIds = []) {
   if (!deviceIds.length) return;
@@ -608,38 +620,31 @@ async function disableInvalidDevices(userId, deviceIds = []) {
   const batch = db.batch();
   const base = db.collection(COLLECTIONS.USERS).doc(userId).collection("fcmTokens");
 
-  for (const deviceId of deviceIds) {
-    const ref = base.doc(deviceId);
+  deviceIds.forEach(id => {
+    const ref = base.doc(id);
     batch.set(ref, {
       enabled: false,
-      disabledReason: "invalid_fcm_token",
-      disabledAt: admin.firestore.FieldValue.serverTimestamp(),
+      invalidatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     }, { merge: true });
-  }
+  });
 
   await batch.commit();
 }
 
 
+
 // ============================================================
 // 🚀 FUNCIÓN SEGURA PARA ENVIAR NOTIFICACIONES PUSH (NO ELIMINA TOKENS)
 // ============================================================
-async function sendPushNotification(userId, title, body, data = {}) {
+
+async function sendToUserDevices(userId, title, body, data = {}) {
   try {
-    const userRef = db.collection(COLLECTIONS.USERS).doc(userId);
-    const userDoc = await userRef.get();
-
-    if (!userDoc.exists) {
-      console.log(`${colors.yellow}⚠️ Usuario ${userId} no encontrado${colors.reset}`);
-      return false;
-    }
-
-    // ✅ NUEVO: leer desde subcolección (fuente de verdad)
     const devices = await getActiveFcmTokens(userId);
     const tokens = devices.map(d => d.token);
 
     if (!tokens.length) {
-      console.log(`${colors.yellow}⚠️ Usuario ${userId} sin tokens activos${colors.reset}`);
+      console.log(`${colors.yellow}⚠️ Usuario ${userId} sin tokens activos (subcolección)${colors.reset}`);
       return false;
     }
 
@@ -682,7 +687,16 @@ async function sendPushNotification(userId, title, body, data = {}) {
       `${ok ? colors.green : colors.yellow}📱 Push a ${userId}: ${res.successCount}/${tokens.length} ok${colors.reset}`
     );
 
-    // ✅ NUEVO: deshabilitar automáticamente tokens inválidos
+    // Log detallado de errores (CLAVE para debug)
+    res.responses.forEach((r, idx) => {
+      if (!r.success) {
+        console.log(
+          `${colors.yellow}⚠️ FCM fail token[${idx}]: deviceId=${devices[idx]?.deviceId} code=${r.error?.code} msg=${r.error?.message}${colors.reset}`
+        );
+      }
+    });
+
+    // Deshabilitar tokens inválidos automáticamente
     const invalidDeviceIds = [];
     res.responses.forEach((r, idx) => {
       if (!r.success) {
@@ -691,7 +705,7 @@ async function sendPushNotification(userId, title, body, data = {}) {
           code === "messaging/registration-token-not-registered" ||
           code === "messaging/invalid-registration-token"
         ) {
-          invalidDeviceIds.push(devices[idx].deviceId);
+          if (devices[idx]?.deviceId) invalidDeviceIds.push(devices[idx].deviceId);
         }
       }
     });
@@ -703,132 +717,18 @@ async function sendPushNotification(userId, title, body, data = {}) {
 
     return ok;
   } catch (error) {
-    console.error(`${colors.red}❌ Error enviando notificación:${colors.reset}`, error);
+    console.error(`${colors.red}❌ Error enviando push:${colors.reset}`, error);
     return false;
   }
 }
 
-async function upsertFcmToken({ userId, deviceId, token, platform, deviceModel }) {
-  if (!userId || !deviceId || !token) return { success: false, error: "missing_fields" };
 
-  const ref = db.collection(COLLECTIONS.USERS).doc(userId)
-    .collection("fcmTokens").doc(deviceId);
-
-  await ref.set({
-    token,
-    platform: platform || "unknown",
-    deviceModel: deviceModel || "unknown",
-    enabled: true,
-    lastActiveAt: admin.firestore.FieldValue.serverTimestamp(),
-    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-    createdAt: admin.firestore.FieldValue.serverTimestamp(), // merge no lo pisa
-  }, { merge: true });
-
-  return { success: true };
+async function sendPushNotification(userId, title, body, data = {}) {
+  return sendToUserDevices(userId, title, body, data);
 }
 
-
-
-// ============================================================
-// 🚨 FUNCIÓN ESPECÍFICA PARA NOTIFICACIONES DE EMERGENCIA
-// ============================================================
 async function sendEmergencyNotification(userId, title, body, data = {}) {
-  let tokens = [];
-
-  try {
-    const userDoc = await db.collection(COLLECTIONS.USERS).doc(userId).get();
-    if (!userDoc.exists) {
-      console.log(`${colors.yellow}⚠️ Usuario ${userId} no encontrado (emergencia)${colors.reset}`);
-      return false;
-    }
-
-    const userData = userDoc.data() || {};
-
-    if (Array.isArray(userData.fcmTokens) && userData.fcmTokens.length > 0) {
-      tokens.push(...userData.fcmTokens.filter(t => typeof t === "string" && t.length > 0));
-    }
-
-    if (userData.fcmToken && typeof userData.fcmToken === "string" && userData.fcmToken.length > 0) {
-      tokens.push(userData.fcmToken);
-    }
-
-    if (userData.devices && typeof userData.devices === "object") {
-      const deviceEntries = Object.values(userData.devices);
-      for (const d of deviceEntries) {
-        if (d && typeof d.token === "string" && d.token.length > 0) {
-          tokens.push(d.token);
-        }
-      }
-    }
-
-    tokens = Array.from(new Set(tokens));
-
-    if (tokens.length === 0) {
-      console.log(`${colors.yellow}⚠️ Usuario ${userId} sin token FCM (emergencia)${colors.reset}`);
-      return false;
-    }
-
-    const merged = {
-      ...data,
-      title,
-      body,
-      timestamp: Date.now(),
-    };
-
-    const safeData = Object.fromEntries(
-      Object.entries(merged).map(([k, v]) => [k, v == null ? "" : String(v)])
-    );
-
-    const message = {
-      tokens,
-      android: {
-        priority: "high",
-      },
-      data: safeData,
-      apns: {
-        headers: {
-          "apns-priority": "10",
-        },
-        payload: {
-          aps: {
-            "content-available": 1,
-          },
-        },
-      },
-    };
-
-    const res = await messaging.sendEachForMulticast(message);
-    
-    const ok = res.successCount > 0;
-    console.log(
-      `${ok ? colors.green : colors.yellow}🚨 Push de emergencia a ${userId}: ${res.successCount}/${tokens.length} ok${colors.reset}`
-    );
-
-    // ⚠️ IMPORTANTE: NO ELIMINAMOS TOKENS EN EMERGENCIAS
-    const invalidTokens = [];
-    res.responses.forEach((r, idx) => {
-      if (!r.success) {
-        const code = r.error?.code || "";
-        if (code === "messaging/registration-token-not-registered") {
-          invalidTokens.push(tokens[idx]);
-        }
-      }
-    });
-
-    if (invalidTokens.length > 0) {
-      console.log(
-        `${colors.yellow}⚠️ Tokens inválidos detectados (emergencia) para ${userId}: ${invalidTokens.length}${colors.reset}`
-      );
-      // NO LOS ELIMINAMOS - DEJAMOS QUE EL CLIENTE LOS RENUEVE
-    }
-
-    return ok;
-  } catch (error) {
-    console.error(`${colors.red}❌ Error enviando notificación de emergencia:${colors.reset}`, error);
-    
-    // ⚠️ IMPORTANTE: NO ELIMINAMOS TOKENS EN CASO DE ERROR
-    return false;
-  }
+  return sendToUserDevices(userId, title, body, data);
 }
 
 // ============================================================
