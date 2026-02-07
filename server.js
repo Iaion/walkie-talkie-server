@@ -1797,76 +1797,62 @@ io.on("connection", (socket) => {
   // ============================================================
   // 🔑 EVENTO: REGISTRAR TOKEN FCM (MEJORADO)
   // ============================================================
-  socket.on("register_fcm_token", async (data = {}, callback) => {
-    try {
-      const { userId, fcmToken, deviceId, platform, deviceModel } = data;
+ socket.on("register_fcm_token", async (data = {}, callback) => {
+  try {
+    const { userId, fcmToken, deviceId, platform, deviceModel } = data;
 
-      if (!userId || !fcmToken) {
-        return callback?.({ success: false, message: "userId y fcmToken requeridos" });
-      }
-
-      // Generar un deviceId único si no viene
-      const uniqueDeviceId = deviceId || `device_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-      
-      const userRef = db.collection(COLLECTIONS.USERS).doc(userId);
-      const now = Date.now();
-
-      await db.runTransaction(async (transaction) => {
-        const userDoc = await transaction.get(userRef);
-        
-        let currentData = {};
-        if (userDoc.exists) {
-          currentData = userDoc.data();
-        }
-        
-        // Obtener tokens actuales
-        const currentTokens = Array.isArray(currentData.fcmTokens) ? currentData.fcmTokens : [];
-        const currentDevices = currentData.devices || {};
-        
-        // Evitar duplicados
-        let updatedTokens = [...currentTokens];
-        if (!updatedTokens.includes(fcmToken)) {
-          updatedTokens.push(fcmToken);
-        }
-        
-        // Actualizar dispositivo
-        const updatedDevices = {
-          ...currentDevices,
-          [uniqueDeviceId]: {
-            token: fcmToken,
-            platform: platform || "android",
-            deviceModel: deviceModel || null,
-            lastActive: now,
-            socketId: socket.id,
-            registeredAt: currentDevices[uniqueDeviceId]?.registeredAt || now
-          }
-        };
-        
-        // Actualizar campos
-        const updates = {
-          fcmTokens: updatedTokens,
-          fcmToken: fcmToken, // Último token usado
-          fcmTokensUpdatedAt: now,
-          devices: updatedDevices,
-          socketIds: admin.firestore.FieldValue.arrayUnion(socket.id)
-        };
-        
-        transaction.set(userRef, updates, { merge: true });
-      });
-
-      console.log(`${colors.green}✅ Token FCM registrado para ${userId} (dispositivo: ${uniqueDeviceId})${colors.reset}`);
-      
-      callback?.({ 
-        success: true, 
-        message: "Token registrado",
-        deviceId: uniqueDeviceId 
-      });
-      
-    } catch (error) {
-      console.error(`${colors.red}❌ Error registrando token:${colors.reset}`, error);
-      callback?.({ success: false, message: error.message });
+    if (!userId || !fcmToken) {
+      return callback?.({ success: false, message: "userId y fcmToken requeridos" });
     }
-  });
+
+    // ✅ Ideal: que venga siempre desde Android (DeviceIdProvider)
+    const uniqueDeviceId =
+      (typeof deviceId === "string" && deviceId.trim().length > 0)
+        ? deviceId.trim()
+        : `device_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+
+    const userRef = db.collection(COLLECTIONS.USERS).doc(userId);
+    const tokenRef = userRef.collection("fcmTokens").doc(uniqueDeviceId);
+
+    // ✅ Upsert en subcolección (fuente de verdad)
+    await tokenRef.set(
+      {
+        token: String(fcmToken),
+        platform: platform || "android",
+        deviceModel: deviceModel || null,
+        socketId: socket.id,
+        enabled: true,
+        lastActiveAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        // createdAt solo si no existía
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+
+    // ✅ Opcional: marcar actividad en el doc del usuario (liviano)
+    await userRef.set(
+      {
+        socketIds: admin.firestore.FieldValue.arrayUnion(socket.id),
+        lastTokenRefreshAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+
+    console.log(
+      `${colors.green}✅ Token FCM guardado en subcolección para ${userId} (deviceId=${uniqueDeviceId})${colors.reset}`
+    );
+
+    callback?.({
+      success: true,
+      message: "Token registrado",
+      deviceId: uniqueDeviceId,
+    });
+  } catch (error) {
+    console.error(`${colors.red}❌ Error registrando token:${colors.reset}`, error);
+    callback?.({ success: false, message: error.message });
+  }
+});
 
   // ============================================================
   // 👤 USUARIO CONECTADO AL CHAT
