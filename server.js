@@ -2791,6 +2791,263 @@ io.on("connection", (socket) => {
   });
 
   // ============================================================
+  // 📍 NUEVO: ACTUALIZACIÓN DE UBICACIÓN EN TIEMPO REAL (PARA COMPARTIR)
+  // ============================================================
+  socket.on("location_update", async (data = {}, ack) => {
+    try {
+      const { 
+        roomId,        // ID de la sala de emergencia
+        userId,        // ID del usuario que envía ubicación
+        lat,           // Latitud
+        lng,           // Longitud
+        timestamp,     // Timestamp
+        type,         // "victim" o "helper"
+        accuracy      // Precisión (opcional)
+      } = data;
+
+      if (!roomId || !userId || typeof lat !== "number" || typeof lng !== "number") {
+        return ack?.({ success: false, message: "Datos de ubicación inválidos" });
+      }
+
+      console.log(`${colors.cyan}📍 location_update:${colors.reset}`, {
+        userId,
+        type,
+        lat,
+        lng,
+        roomId
+      });
+
+      // ✅ ACTUALIZAR ÚLTIMA UBICACIÓN CONOCIDA EN MEMORIA
+      const entry = state.connectedUsers.get(userId);
+      if (entry) {
+        entry.userData.lastKnownLocation = { 
+          lat, 
+          lng, 
+          ts: timestamp || Date.now(),
+          roomId,
+          type 
+        };
+      }
+
+      // ✅ REENVIAR A TODOS EN LA SALA (MENOS AL REMITENTE)
+      socket.to(roomId).emit("location_update", {
+        roomId,
+        userId,
+        lat,
+        lng,
+        timestamp: timestamp || Date.now(),
+        type: type || "helper",
+        accuracy: accuracy || null
+      });
+
+      // ✅ SI ES LA VÍCTIMA, ACTUALIZAR EN EL ESTADO DE EMERGENCIA
+      if (type === "victim" && roomId.startsWith("emergencia_")) {
+        const emergencyUserId = roomId.replace("emergencia_", "");
+        const emergencyData = state.emergencyAlerts.get(emergencyUserId);
+        if (emergencyData) {
+          emergencyData.latitude = lat;
+          emergencyData.longitude = lng;
+          emergencyData.lastLocationUpdate = timestamp || Date.now();
+          state.emergencyAlerts.set(emergencyUserId, emergencyData);
+        }
+      }
+
+      // ✅ GUARDAR EN FIRESTORE PARA HISTÓRICO (OPCIONAL)
+      try {
+        if (roomId && roomId.startsWith("emergencia_")) {
+          const emergencyUserId = roomId.replace("emergencia_", "");
+          
+          await db.collection(COLLECTIONS.EMERGENCIES)
+            .doc(emergencyUserId)
+            .collection("locations")
+            .add({
+              userId,
+              lat,
+              lng,
+              timestamp: timestamp || Date.now(),
+              type: type || "helper",
+              roomId,
+              accuracy: accuracy || null
+            });
+        }
+      } catch (dbError) {
+        console.warn(`${colors.yellow}⚠️ No se pudo guardar ubicación en Firestore:${colors.reset}`, dbError.message);
+      }
+
+      ack?.({ success: true });
+
+    } catch (error) {
+      console.error(`${colors.red}❌ Error en location_update:${colors.reset}`, error);
+      ack?.({ success: false, message: error.message });
+    }
+  });
+
+  // ============================================================
+  // 🎯 NUEVO: SOLICITAR UBICACIÓN ACTUAL DE LA VÍCTIMA
+  // ============================================================
+  socket.on("request_victim_location", async (data = {}, ack) => {
+    try {
+      const { roomId, helperId, emergencyUserId } = data;
+
+      if (!roomId || !helperId || !emergencyUserId) {
+        return ack?.({ success: false, message: "Datos incompletos" });
+      }
+
+      console.log(`${colors.yellow}🎯 request_victim_location:${colors.reset}`, {
+        helperId,
+        emergencyUserId,
+        roomId
+      });
+
+      // ✅ BUSCAR LA ÚLTIMA UBICACIÓN DE LA VÍCTIMA
+      const victimEntry = state.connectedUsers.get(emergencyUserId);
+      
+      if (victimEntry?.userData?.lastKnownLocation) {
+        const location = victimEntry.userData.lastKnownLocation;
+        
+        // ENVIAR SOLO AL AYUDANTE QUE SOLICITÓ
+        io.to(helperId).emit("victim_location_response", {
+          userId: emergencyUserId,
+          lat: location.lat,
+          lng: location.lng,
+          timestamp: location.ts || Date.now(),
+          roomId,
+          type: "victim"
+        });
+        
+        console.log(`${colors.green}✅ Ubicación de víctima enviada a helper ${helperId}${colors.reset}`);
+      } else {
+        // BUSCAR EN FIRESTORE COMO BACKUP
+        try {
+          const locationsSnapshot = await db.collection(COLLECTIONS.EMERGENCIES)
+            .doc(emergencyUserId)
+            .collection("locations")
+            .orderBy("timestamp", "desc")
+            .limit(1)
+            .get();
+          
+          if (!locationsSnapshot.empty) {
+            const lastLoc = locationsSnapshot.docs[0].data();
+            
+            io.to(helperId).emit("victim_location_response", {
+              userId: emergencyUserId,
+              lat: lastLoc.lat,
+              lng: lastLoc.lng,
+              timestamp: lastLoc.timestamp,
+              roomId,
+              type: "victim",
+              fromFirestore: true
+            });
+            
+            console.log(`${colors.green}✅ Ubicación de víctima desde Firestore${colors.reset}`);
+          } else {
+            console.log(`${colors.yellow}⚠️ No hay ubicación guardada para la víctima${colors.reset}`);
+          }
+        } catch (dbError) {
+          console.warn(`${colors.yellow}⚠️ Error buscando ubicación en Firestore:${colors.reset}`, dbError.message);
+        }
+      }
+
+      ack?.({ success: true });
+
+    } catch (error) {
+      console.error(`${colors.red}❌ Error en request_victim_location:${colors.reset}`, error);
+      ack?.({ success: false, message: error.message });
+    }
+  });
+
+  // ============================================================
+  // 👥 NUEVO: SOLICITAR UBICACIONES DE TODOS LOS AYUDANTES
+  // ============================================================
+  socket.on("helpers_location_request", async (data = {}, ack) => {
+    try {
+      const { roomId, emergencyUserId } = data;
+
+      if (!roomId || !emergencyUserId) {
+        return ack?.({ success: false, message: "Datos incompletos" });
+      }
+
+      console.log(`${colors.blue}👥 helpers_location_request:${colors.reset} para ${roomId}`);
+
+      const helpers = state.emergencyHelpers.get(emergencyUserId) || new Set();
+      const helpersLocations = [];
+
+      // ✅ RECOPILAR UBICACIONES DE TODOS LOS AYUDANTES
+      for (const helperId of helpers) {
+        const helperEntry = state.connectedUsers.get(helperId);
+        if (helperEntry?.userData?.lastKnownLocation) {
+          const loc = helperEntry.userData.lastKnownLocation;
+          helpersLocations.push({
+            userId: helperId,
+            userName: helperEntry.userData.username || "Ayudante",
+            lat: loc.lat,
+            lng: loc.lng,
+            timestamp: loc.ts || Date.now(),
+            type: "helper"
+          });
+        }
+      }
+
+      // ✅ ENVIAR SOLO A LA VÍCTIMA
+      io.to(emergencyUserId).emit("helpers_locations_update", {
+        roomId,
+        helpers: helpersLocations,
+        timestamp: Date.now()
+      });
+
+      // ✅ TAMBIÉN ENVIAR AL SOLICITANTE
+      io.to(socket.id).emit("helpers_locations_update", {
+        roomId,
+        helpers: helpersLocations,
+        timestamp: Date.now()
+      });
+
+      ack?.({ 
+        success: true, 
+        count: helpersLocations.length 
+      });
+
+    } catch (error) {
+      console.error(`${colors.red}❌ Error en helpers_location_request:${colors.reset}`, error);
+      ack?.({ success: false, message: error.message });
+    }
+  });
+
+  // ============================================================
+  // 🚗 NUEVO: ACTUALIZAR ESTADO DE CONDUCCIÓN DEL AYUDANTE
+  // ============================================================
+  socket.on("helper_driving_status", (data = {}) => {
+    try {
+      const { roomId, helperId, isDriving, emergencyUserId } = data;
+      
+      if (!roomId || !helperId) return;
+      
+      console.log(`${colors.blue}🚗 helper_driving_status:${colors.reset}`, {
+        helperId,
+        isDriving: isDriving ? "CONDUCIENDO" : "DETENIDO"
+      });
+      
+      // ✅ NOTIFICAR A LA VÍCTIMA
+      if (emergencyUserId) {
+        io.to(emergencyUserId).emit("helper_driving_update", {
+          helperId,
+          isDriving,
+          timestamp: Date.now()
+        });
+      }
+      
+      // ✅ NOTIFICAR A TODA LA SALA
+      socket.to(roomId).emit("helper_driving_update", {
+        helperId,
+        isDriving,
+        timestamp: Date.now()
+      });
+    } catch (error) {
+      console.error(`${colors.red}❌ Error en helper_driving_status:${colors.reset}`, error);
+    }
+  });
+
+  // ============================================================
   // 🔴 DESCONEXIÓN
   // ============================================================
   socket.on("disconnect", async (reason) => {
@@ -2983,4 +3240,9 @@ server.listen(PORT, () => {
   console.log(`${colors.cyan}   POST /fcm/cleanup-tokens - Para limpiar tokens inválidos${colors.reset}`);
   console.log(`${colors.cyan}   GET /fcm/user-tokens/:userId - Para debug de tokens${colors.reset}`);
   console.log(`${colors.cyan}   POST /fcm/refresh-token - Para refrescar tokens${colors.reset}`);
+  console.log(`${colors.cyan}📍 NUEVOS EVENTOS DE UBICACIÓN:${colors.reset}`);
+  console.log(`${colors.cyan}   - location_update - Para compartir ubicación en tiempo real${colors.reset}`);
+  console.log(`${colors.cyan}   - request_victim_location - Ayudantes solicitan ubicación de víctima${colors.reset}`);
+  console.log(`${colors.cyan}   - helpers_location_request - Víctima solicita ubicaciones de ayudantes${colors.reset}`);
+  console.log(`${colors.cyan}   - helper_driving_status - Estado de conducción de ayudantes${colors.reset}`);
 });
