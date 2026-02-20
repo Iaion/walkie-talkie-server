@@ -634,8 +634,8 @@ async function disableInvalidDevices(userId, deviceIds = []) {
 
 
 
-/// ============================================================
-// 🚀 FUNCIÓN SEGURA PARA ENVIAR NOTIFICACIONES PUSH (CORREGIDA)
+// ============================================================
+// 🚀 FUNCIÓN SEGURA PARA ENVIAR NOTIFICACIONES PUSH (NO ELIMINA TOKENS)
 // ============================================================
 
 async function sendToUserDevices(userId, title, body, data = {}) {
@@ -648,174 +648,38 @@ async function sendToUserDevices(userId, title, body, data = {}) {
       return false;
     }
 
-    // 🔍 EXTRAER Y NORMALIZAR roomId DE TODAS LAS FUENTES POSIBLES
-    const roomId = data.emergencyRoomId 
-      || data.emergency_room_id 
-      || data.roomId 
-      || data.room_id 
-      || data.emergencyRoomId 
-      || "";
-
-    // 🔍 EXTRAER Y NORMALIZAR userId DE TODAS LAS FUENTES POSIBLES
-    const emergencyUserId = data.emergencyUserId 
-      || data.emergency_user_id 
-      || data.userId 
-      || data.user_id 
-      || userId 
-      || "";
-
-    // 🔍 EXTRAER Y NORMALIZAR userName DE TODAS LAS FUENTES POSIBLES
-    const emergencyUserName = data.emergencyUserName 
-      || data.emergency_user_name 
-      || data.userName 
-      || data.user_name 
-      || data.username 
-      || "";
-
-    console.log(`${colors.blue}📱 Preparando push para ${userId}:${colors.reset}`, {
-      roomId_detectado: roomId,
-      titulo: title,
-      datos_recibidos: Object.keys(data)
-    });
-
-    // 📦 CONSTRUIR OBJETO CON TODOS LOS POSIBLES NOMBRES DE CAMPOS
     const merged = {
-      // Datos originales (prioridad)
       ...data,
-      
-      // Metadatos de la notificación
       title,
       body,
-      timestamp: Date.now().toString(),
-      
-      // 🏠 ROOMID - EN TODOS LOS FORMATOS POSIBLES (¡CRÍTICO!)
-      roomId: roomId,
-      room_id: roomId,
-      emergencyRoomId: roomId,
-      emergency_room_id: roomId,
-      
-      // 👤 USERID - EN TODOS LOS FORMATOS POSIBLES
-      userId: emergencyUserId,
-      user_id: emergencyUserId,
-      emergencyUserId: emergencyUserId,
-      emergency_user_id: emergencyUserId,
-      
-      // 👤 USERNAME - EN TODOS LOS FORMATOS POSIBLES
-      userName: emergencyUserName,
-      user_name: emergencyUserName,
-      emergencyUserName: emergencyUserName,
-      emergency_user_name: emergencyUserName,
-      username: emergencyUserName,
-      
-      // 📍 UBICACIÓN - EN TODOS LOS FORMATOS POSIBLES
-      latitude: data.latitude || data.lat || "",
-      longitude: data.longitude || data.lng || "",
-      emergency_latitude: data.emergency_latitude || data.latitude || data.lat || "",
-      emergency_longitude: data.emergency_longitude || data.longitude || data.lng || "",
-      
-      // 🖼️ AVATAR - EN TODOS LOS FORMATOS POSIBLES
-      avatarUrl: data.avatarUrl || data.avatar_url || data.avatarUri || "",
-      emergency_avatar_url: data.emergency_avatar_url || data.avatarUrl || data.avatar_url || "",
-      
-      // 🚗 VEHÍCULO - EN TODOS LOS FORMATOS POSIBLES
-      vehicle_foto: data.vehicle_foto || data.fotoVehiculoUri || data.vehiclePhoto || "",
-      vehicle_marca: data.vehicle_marca || data.marca || data.vehicleBrand || "",
-      vehicle_modelo: data.vehicle_modelo || data.modelo || data.vehicleModel || "",
-      vehicle_patente: data.vehicle_patente || data.patente || data.licensePlate || "",
-      vehicle_color: data.vehicle_color || data.color || "",
-      
-      // 🏷️ TIPO Y METADATOS
-      type: data.type || "emergency",
-      notification_type: data.type || "emergency",
-      open_emergency_screen: data.open_emergency_screen || "true",
-      is_helper: data.is_helper || "true",
-      
-      // 📦 CAMPOS ADICIONALES DE EMERGENCIA
-      emergencyType: data.emergencyType || data.emergency_type || "general",
-      emergency_type: data.emergencyType || data.emergency_type || "general",
-      
-      // ✅ FLAG DE VERSIÓN PARA DEPURACIÓN
-      push_format_version: "2.0-corregido",
-      timestamp_push: Date.now().toString()
+      timestamp: Date.now(),
+      emergency_user_id: data.emergency_user_id ?? data.userId ?? "",
+      emergency_user_name: data.emergency_user_name ?? data.userName ?? "",
+      emergency_latitude: data.emergency_latitude ?? data.latitude ?? "",
+      emergency_longitude: data.emergency_longitude ?? data.longitude ?? "",
+      emergency_avatar_url: data.emergency_avatar_url ?? data.avatarUrl ?? "",
+      emergency_room_id: data.emergency_room_id ?? data.roomId ?? "",
+      vehicle_foto: data.vehicle_foto ?? data.fotoVehiculoUri ?? "",
+      vehicle_marca: data.vehicle_marca ?? data.marca ?? "",
+      vehicle_modelo: data.vehicle_modelo ?? data.modelo ?? "",
+      vehicle_patente: data.vehicle_patente ?? data.patente ?? "",
+      vehicle_color: data.vehicle_color ?? data.color ?? "",
     };
 
-    // 🧹 LIMPIAR VALORES NULL Y CONVERTIR TODO A STRING
     const safeData = Object.fromEntries(
-      Object.entries(merged).map(([k, v]) => {
-        // Si es undefined o null, convertir a string vacío
-        if (v == null) return [k, ""];
-        // Si ya es string, mantenerlo
-        if (typeof v === "string") return [k, v];
-        // Si es número, convertir a string
-        if (typeof v === "number") return [k, v.toString()];
-        // Si es booleano, convertir a string
-        if (typeof v === "boolean") return [k, v ? "true" : "false"];
-        // Para cualquier otro tipo, stringify o vacío
-        try {
-          return [k, JSON.stringify(v)];
-        } catch {
-          return [k, ""];
-        }
-      })
+      Object.entries(merged).map(([k, v]) => [k, v == null ? "" : String(v)])
     );
 
-    // 📝 LOG PARA VERIFICAR QUE roomId ESTÁ PRESENTE
-    console.log(`${colors.green}✅ Datos push preparados:${colors.reset}`, {
-      userId: emergencyUserId,
-      roomId_enviado: safeData.roomId || safeData.emergency_room_id,
-      campos_disponibles: Object.keys(safeData).slice(0, 10).join(", ") + "...",
-      total_campos: Object.keys(safeData).length
-    });
-
-    // 📱 CONSTRUIR MENSAJE PARA FCM
     const message = {
       tokens,
-      android: { 
-        priority: "high",
-        // En Android, los datos van en data para que la app los procese
-        data: safeData,
-        // Configuración de notificación para mostrar automáticamente
-        notification: {
-          title: title,
-          body: body,
-          sound: "default",
-          priority: "high",
-          channelId: "emergency_channel",
-          clickAction: "OPEN_EMERGENCY_ACTIVITY",
-          color: "#FF0000"
-        }
-      },
-      data: safeData,  // Para iOS/Web
+      android: { priority: "high" },
+      data: safeData,
       apns: {
         headers: { "apns-priority": "10" },
-        payload: { 
-          aps: { 
-            "content-available": 1,
-            sound: "default",
-            alert: {
-              title: title,
-              body: body
-            }
-          },
-          data: safeData  // Datos personalizados para iOS
-        },
+        payload: { aps: { "content-available": 1 } },
       },
-      // Configuración para web (si aplica)
-      webpush: {
-        headers: {
-          Urgency: "high"
-        },
-        notification: {
-          title: title,
-          body: body,
-          icon: "/icons/emergency.png",
-          clickAction: "/emergency"
-        },
-        data: safeData
-      }
     };
 
-    // 📨 ENVIAR NOTIFICACIONES MULTICAST
     const res = await messaging.sendEachForMulticast(message);
 
     const ok = res.successCount > 0;
@@ -823,7 +687,7 @@ async function sendToUserDevices(userId, title, body, data = {}) {
       `${ok ? colors.green : colors.yellow}📱 Push a ${userId}: ${res.successCount}/${tokens.length} ok${colors.reset}`
     );
 
-    // 🔍 LOG DETALLADO DE ERRORES
+    // Log detallado de errores (CLAVE para debug)
     res.responses.forEach((r, idx) => {
       if (!r.success) {
         console.log(
@@ -832,7 +696,7 @@ async function sendToUserDevices(userId, title, body, data = {}) {
       }
     });
 
-    // 🧹 DESHABILITAR TOKENS INVÁLIDOS AUTOMÁTICAMENTE
+    // Deshabilitar tokens inválidos automáticamente
     const invalidDeviceIds = [];
     res.responses.forEach((r, idx) => {
       if (!r.success) {
@@ -851,29 +715,13 @@ async function sendToUserDevices(userId, title, body, data = {}) {
       await disableInvalidDevices(userId, invalidDeviceIds);
     }
 
-    // ✅ DEVOLVER INFORMACIÓN DETALLADA DEL ENVÍO
-    return {
-      success: ok,
-      successCount: res.successCount,
-      failureCount: res.failureCount,
-      tokensTotal: tokens.length,
-      roomId: roomId,
-      userId: emergencyUserId
-    };
-
+    return ok;
   } catch (error) {
     console.error(`${colors.red}❌ Error enviando push:${colors.reset}`, error);
-    return { 
-      success: false, 
-      error: error.message,
-      roomId: data.emergencyRoomId || data.roomId || null
-    };
+    return false;
   }
 }
 
-// ============================================================
-// 📱 FUNCIONES DE ALIAS (SIN CAMBIOS)
-// ============================================================
 
 async function sendPushNotification(userId, title, body, data = {}) {
   return sendToUserDevices(userId, title, body, data);
@@ -882,6 +730,7 @@ async function sendPushNotification(userId, title, body, data = {}) {
 async function sendEmergencyNotification(userId, title, body, data = {}) {
   return sendToUserDevices(userId, title, body, data);
 }
+
 // ============================================================
 // 🗑️ FUNCIÓN PARA ELIMINAR HISTORIAL DE CHAT
 // ============================================================
