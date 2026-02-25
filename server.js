@@ -1757,111 +1757,147 @@ io.on("connection", (socket) => {
 });
 
   // ============================================================
-  // 👤 USUARIO CONECTADO AL CHAT
-  // ============================================================
-  socket.on("user-connected", async (user, ack) => {
-    console.log(`${colors.blue}📥 Evento → user-connected:${colors.reset}`, user);
+// 👤 USUARIO CONECTADO AL CHAT (CORREGIDO)
+// - No falla si falta username (usa fallback)
+// - No explota si users/{uid} no existe (set merge)
+// - No pisa username con null
+// ============================================================
+socket.on("user-connected", async (user = {}, ack) => {
+  console.log(`${colors.blue}📥 Evento → user-connected:${colors.reset}`, user);
 
-    if (!user || !user.id || !user.username) {
-      const msg = "⚠️ Datos de usuario inválidos";
-      console.warn(`${colors.yellow}${msg}${colors.reset}`);
-      ack?.({ success: false, message: msg });
-      return;
-    }
+  // ✅ Validación mínima
+  if (!user || !user.id) {
+    const msg = "⚠️ Datos de usuario inválidos (id requerido)";
+    console.warn(`${colors.yellow}${msg}${colors.reset}`);
+    ack?.({ success: false, message: msg });
+    return;
+  }
 
-    const userId = user.id;
-    const username = user.username;
+  const userId = String(user.id).trim();
+  if (!userId) {
+    const msg = "⚠️ userId vacío";
+    console.warn(`${colors.yellow}${msg}${colors.reset}`);
+    ack?.({ success: false, message: msg });
+    return;
+  }
 
-    socket.userId = userId;
-    socket.username = username;
+  // ✅ Username robusto (fallbacks)
+  const safeUsername =
+    (typeof user.username === "string" && user.username.trim()) ||
+    (typeof user.fullName === "string" && user.fullName.trim()) ||
+    (typeof user.email === "string" && user.email.split("@")[0].trim()) ||
+    "Usuario";
 
-    const defaultRoom = "general";
-    socket.join(defaultRoom);
-    socket.currentRoom = defaultRoom;
+  socket.userId = userId;
+  socket.username = safeUsername;
 
-    const generalRoom = state.chatRooms.get(defaultRoom);
-    if (generalRoom) {
-      generalRoom.users.add(userId);
-    }
+  const defaultRoom = "general";
+  socket.join(defaultRoom);
+  socket.currentRoom = defaultRoom;
 
-    const now = Date.now();
-    const incomingLoc = (typeof user.lat === "number" && typeof user.lng === "number")
+  const generalRoom = state.chatRooms.get(defaultRoom);
+  if (generalRoom) generalRoom.users.add(userId);
+
+  const now = Date.now();
+  const incomingLoc =
+    (typeof user.lat === "number" && typeof user.lng === "number")
       ? { lat: user.lat, lng: user.lng, ts: now }
       : undefined;
 
-    const existing = state.connectedUsers.get(userId);
-    if (existing) {
-      existing.sockets.add(socket.id);
-      existing.userData = {
-        ...existing.userData,
+  const existing = state.connectedUsers.get(userId);
+  if (existing) {
+    existing.sockets.add(socket.id);
+    existing.userData = {
+      ...existing.userData,
+      ...user,
+      id: userId,
+      username: safeUsername,          // ✅ normalizado
+      isOnline: true,
+      currentRoom: defaultRoom,
+      lastKnownLocation: incomingLoc || existing.userData.lastKnownLocation,
+    };
+  } else {
+    state.connectedUsers.set(userId, {
+      userData: {
         ...user,
+        id: userId,
+        username: safeUsername,        // ✅ normalizado
         isOnline: true,
         currentRoom: defaultRoom,
-        lastKnownLocation: incomingLoc || existing.userData.lastKnownLocation
-      };
-    } else {
-      state.connectedUsers.set(userId, {
-        userData: {
-          ...user,
-          isOnline: true,
-          currentRoom: defaultRoom,
-          lastKnownLocation: incomingLoc
-        },
-        sockets: new Set([socket.id])
-      });
+        lastKnownLocation: incomingLoc,
+      },
+      sockets: new Set([socket.id]),
+    });
+  }
+
+  try {
+    // ✅ FIX: set merge (no NOT_FOUND), y NO pisar username con null
+    const userRef = db.collection(COLLECTIONS.USERS).doc(userId);
+
+    const patch = {
+      uid: userId,
+      isOnline: true,
+      lastLogin: now,
+      currentRoom: defaultRoom,
+      socketIds: admin.firestore.FieldValue.arrayUnion(socket.id),
+      lastSeen: now,
+      lastActive: now,
+    };
+
+    // Solo guardamos username si es string válido
+    if (typeof safeUsername === "string" && safeUsername.trim()) {
+      patch.username = safeUsername.trim();
     }
 
-    try {
-      // Usar update() en lugar de set() para mayor seguridad
-      await db.collection(COLLECTIONS.USERS).doc(userId).update({
-        isOnline: true,
-        lastLogin: Date.now(),
-        currentRoom: defaultRoom,
-        socketIds: admin.firestore.FieldValue.arrayUnion(socket.id),
-        lastSeen: Date.now()
-      });
-      console.log(`${colors.green}🔑 Usuario sincronizado con Firebase: ${username}${colors.reset}`);
-    } catch (error) {
-      console.error(`${colors.red}❌ Error al registrar usuario:${colors.reset}`, error);
-    }
+    // Si querés también guardar email/fullName sin pisar con null:
+    if (typeof user.email === "string" && user.email.trim()) patch.email = user.email.trim();
+    if (typeof user.fullName === "string" && user.fullName.trim()) patch.fullName = user.fullName.trim();
 
-    io.emit(
-      "connected_users",
-      Array.from(state.connectedUsers.values()).map((u) => ({ 
-        ...u.userData, 
-        socketCount: u.sockets.size 
-      }))
-    );
+    await userRef.set(patch, { merge: true });
 
-    socket.emit("available_rooms", 
-      Array.from(state.chatRooms.values()).map(room => ({
-        id: room.id,
-        name: room.name,
-        type: room.type,
-        description: room.description,
-        userCount: room.users.size,
-        messageCount: room.messageCount
-      }))
-    );
+    console.log(`${colors.green}🔑 Usuario sincronizado con Firebase: ${safeUsername}${colors.reset}`);
+  } catch (error) {
+    console.error(`${colors.red}❌ Error al registrar usuario:${colors.reset}`, error);
+  }
 
-    socket.emit("join_success", { 
-      room: "general", 
-      message: `Bienvenido al chat general, ${username}!` 
-    });
+  io.emit(
+    "connected_users",
+    Array.from(state.connectedUsers.values()).map((u) => ({
+      ...u.userData,
+      socketCount: u.sockets.size,
+    }))
+  );
 
-    socket.to(defaultRoom).emit("user_joined_room", {
-      userId: userId,
-      username: username,
-      roomId: defaultRoom,
-      message: `${username} se unió a la sala`,
-      timestamp: Date.now()
-    });
+  socket.emit(
+    "available_rooms",
+    Array.from(state.chatRooms.values()).map((room) => ({
+      id: room.id,
+      name: room.name,
+      type: room.type,
+      description: room.description,
+      userCount: room.users.size,
+      messageCount: room.messageCount,
+    }))
+  );
 
-    utils.updateRoomUserList(defaultRoom);
-
-    ack?.({ success: true });
-    console.log(`${colors.green}✅ ${username} conectado al chat general${colors.reset}`);
+  socket.emit("join_success", {
+    room: defaultRoom,
+    message: `Bienvenido al chat general, ${safeUsername}!`,
   });
+
+  socket.to(defaultRoom).emit("user_joined_room", {
+    userId,
+    username: safeUsername,
+    roomId: defaultRoom,
+    message: `${safeUsername} se unió a la sala`,
+    timestamp: now,
+  });
+
+  utils.updateRoomUserList(defaultRoom);
+
+  ack?.({ success: true, userId, username: safeUsername });
+  console.log(`${colors.green}✅ ${safeUsername} conectado al chat general${colors.reset}`);
+});
 
   // ============================================================
   // 📍 ACTUALIZAR UBICACIÓN GENERAL
