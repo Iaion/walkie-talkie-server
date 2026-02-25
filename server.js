@@ -2318,154 +2318,179 @@ io.on("connection", (socket) => {
   // ============================================================
   // 🚪 MANEJO DE SALAS
   // ============================================================
-  socket.on("join_room", async (data = {}, ack) => {
-    try {
-      const { roomId, userId } = data;
-      
-      console.log(`${colors.blue}🚪 Evento → join_room:${colors.reset}`, {
-        roomId,
-        userId,
-        socketId: socket.id,
-      });
+  // ============================================================
+// 🚪 MANEJO DE SALAS (CORREGIDO: fallback userId + Firestore upsert)
+// ============================================================
 
-      if (!roomId || !userId) {
-        ack?.({ success: false, message: "roomId y userId son requeridos" });
-        return;
+socket.on("join_room", async (data = {}, ack) => {
+  try {
+    const { roomId } = data;
+    const userId = data.userId || socket.userId; // ✅ fallback seguro
+
+    console.log(`${colors.blue}🚪 Evento → join_room:${colors.reset}`, {
+      roomId,
+      userId,
+      socketId: socket.id,
+    });
+
+    if (!roomId || !userId) {
+      ack?.({ success: false, message: "roomId y userId son requeridos" });
+      return;
+    }
+
+    const targetRoom = state.chatRooms.get(roomId);
+    if (!targetRoom) {
+      ack?.({ success: false, message: `Sala ${roomId} no encontrada` });
+      return;
+    }
+
+    // Si estaba en otra sala, salir prolijo
+    if (socket.currentRoom && socket.currentRoom !== roomId) {
+      const previousRoomId = socket.currentRoom;
+      const previousRoom = state.chatRooms.get(previousRoomId);
+
+      if (previousRoom) {
+        previousRoom.users.delete(userId);
       }
 
-      const targetRoom = state.chatRooms.get(roomId);
-      if (!targetRoom) {
-        ack?.({ success: false, message: `Sala ${roomId} no encontrada` });
-        return;
-      }
+      socket.leave(previousRoomId);
 
-      if (socket.currentRoom && socket.currentRoom !== roomId) {
-        const previousRoom = state.chatRooms.get(socket.currentRoom);
-        if (previousRoom) {
-          previousRoom.users.delete(userId);
-        }
-
-        socket.leave(socket.currentRoom);
-
-        socket.to(socket.currentRoom).emit("user_left_room", {
-          userId,
-          username: socket.username,
-          roomId: socket.currentRoom,
-          message: `${socket.username} salió de la sala`,
-          timestamp: Date.now()
-        });
-
-        utils.updateRoomUserList(socket.currentRoom);
-      }
-
-      socket.join(roomId);
-      socket.currentRoom = roomId;
-      targetRoom.users.add(userId);
-      
-      const entry = state.connectedUsers.get(userId);
-      if (entry) {
-        entry.userData.currentRoom = roomId;
-      }
-
-      await db.collection(COLLECTIONS.USERS).doc(userId).update({
-        currentRoom: roomId,
-        lastActive: Date.now()
-      });
-
-      try {
-        const messagesSnapshot = await db.collection(COLLECTIONS.MESSAGES)
-          .where("roomId", "==", roomId)
-          .orderBy("timestamp", "desc")
-          .limit(50)
-          .get();
-
-        const messages = messagesSnapshot.docs.map(doc => ({
-          id: doc.id,
-          ...doc.data(),
-        })).reverse();
-
-        socket.emit("room_messages", {
-          roomId,
-          messages,
-        });
-      } catch (dbError) {
-        console.warn(`${colors.yellow}⚠️ No se pudo cargar historial de mensajes:${colors.reset}`, dbError.message);
-      }
-
-      socket.to(roomId).emit("user_joined_room", {
+      socket.to(previousRoomId).emit("user_left_room", {
         userId,
         username: socket.username,
-        roomId,
-        message: `${socket.username} se unió a la sala`,
+        roomId: previousRoomId,
+        message: `${socket.username} salió de la sala`,
         timestamp: Date.now(),
       });
 
-      utils.updateRoomUserList(roomId);
-
-      ack?.({
-        success: true,
-        roomId,
-        message: `Unido a sala ${roomId}`,
-      });
-
-      console.log(`${colors.green}✅ ${socket.username} se unió a ${roomId}${colors.reset}`);
-
-    } catch (err) {
-      console.error("❌ Error en join_room:", err);
-      ack?.({ success: false, message: "Error interno en join_room" });
+      utils.updateRoomUserList(previousRoomId);
     }
-  });
 
-  socket.on("leave_room", async (data = {}, ack) => {
+    // Entrar a la nueva sala
+    socket.join(roomId);
+    socket.currentRoom = roomId;
+    targetRoom.users.add(userId);
+
+    const entry = state.connectedUsers.get(userId);
+    if (entry) {
+      entry.userData.currentRoom = roomId;
+    }
+
+    // ✅ FIX: NO usar update() (revienta si el doc no existe)
+    await db.collection(COLLECTIONS.USERS).doc(userId).set(
+      {
+        currentRoom: roomId,
+        lastActive: Date.now(),
+        uid: userId,
+        username: socket.username || null,
+      },
+      { merge: true }
+    );
+
+    // Enviar historial (si existe)
     try {
-      const { roomId, userId } = data;
-      
-      if (!roomId) {
-        return ack?.({ success: false, message: "❌ Sala no especificada" });
-      }
+      const messagesSnapshot = await db
+        .collection(COLLECTIONS.MESSAGES)
+        .where("roomId", "==", roomId)
+        .orderBy("timestamp", "desc")
+        .limit(50)
+        .get();
 
-      console.log(`${colors.blue}🚪 Evento → leave_room:${colors.reset} ${socket.username} → ${roomId}`);
+      const messages = messagesSnapshot.docs
+        .map((doc) => ({
+          id: doc.id,
+          ...doc.data(),
+        }))
+        .reverse();
 
-      const room = state.chatRooms.get(roomId);
-      if (!room) {
-        return ack?.({ success: false, message: "Sala no encontrada" });
-      }
-
-      socket.leave(roomId);
-      room.users.delete(userId || socket.userId);
-      
-      if (socket.currentRoom === roomId) {
-        socket.currentRoom = null;
-      }
-
-      const entry = state.connectedUsers.get(userId || socket.userId);
-      if (entry) {
-        entry.userData.currentRoom = null;
-      }
-
-      await db.collection(COLLECTIONS.USERS).doc(userId || socket.userId).update({
-        currentRoom: null,
-        lastActive: Date.now()
+      socket.emit("room_messages", {
+        roomId,
+        messages,
       });
-
-      socket.to(roomId).emit("user_left_room", {
-        userId: userId || socket.userId,
-        username: socket.username,
-        roomId: roomId,
-        message: `${socket.username} salió de la sala`,
-        timestamp: Date.now()
-      });
-
-      utils.updateRoomUserList(roomId);
-
-      ack?.({ success: true, message: `Salido de ${roomId}` });
-      console.log(`${colors.yellow}↩️ ${socket.username} salió de: ${roomId}${colors.reset}`);
-
-    } catch (error) {
-      console.error(`${colors.red}❌ Error saliendo de sala:${colors.reset}`, error);
-      ack?.({ success: false, message: "Error al salir de la sala" });
+    } catch (dbError) {
+      console.warn(
+        `${colors.yellow}⚠️ No se pudo cargar historial de mensajes:${colors.reset}`,
+        dbError.message
+      );
     }
-  });
+
+    socket.to(roomId).emit("user_joined_room", {
+      userId,
+      username: socket.username,
+      roomId,
+      message: `${socket.username} se unió a la sala`,
+      timestamp: Date.now(),
+    });
+
+    utils.updateRoomUserList(roomId);
+
+    ack?.({
+      success: true,
+      roomId,
+      message: `Unido a sala ${roomId}`,
+    });
+
+    console.log(`${colors.green}✅ ${socket.username} se unió a ${roomId}${colors.reset}`);
+  } catch (err) {
+    console.error("❌ Error en join_room:", err);
+    ack?.({ success: false, message: "Error interno en join_room" });
+  }
+});
+
+socket.on("leave_room", async (data = {}, ack) => {
+  try {
+    const { roomId } = data;
+    const userId = data.userId || socket.userId; // ✅ fallback
+
+    if (!roomId) {
+      return ack?.({ success: false, message: "❌ Sala no especificada" });
+    }
+
+    console.log(
+      `${colors.blue}🚪 Evento → leave_room:${colors.reset} ${socket.username} → ${roomId}`
+    );
+
+    const room = state.chatRooms.get(roomId);
+    if (!room) {
+      return ack?.({ success: false, message: "Sala no encontrada" });
+    }
+
+    socket.leave(roomId);
+    room.users.delete(userId);
+
+    if (socket.currentRoom === roomId) socket.currentRoom = null;
+
+    const entry = state.connectedUsers.get(userId);
+    if (entry) entry.userData.currentRoom = null;
+
+    // ✅ FIX: set merge (no explota si doc no existe)
+    await db.collection(COLLECTIONS.USERS).doc(userId).set(
+      {
+        currentRoom: null,
+        lastActive: Date.now(),
+        uid: userId,
+        username: socket.username || null,
+      },
+      { merge: true }
+    );
+
+    socket.to(roomId).emit("user_left_room", {
+      userId,
+      username: socket.username,
+      roomId,
+      message: `${socket.username} salió de la sala`,
+      timestamp: Date.now(),
+    });
+
+    utils.updateRoomUserList(roomId);
+
+    ack?.({ success: true, message: `Salido de ${roomId}` });
+    console.log(`${colors.yellow}↩️ ${socket.username} salió de: ${roomId}${colors.reset}`);
+  } catch (error) {
+    console.error(`${colors.red}❌ Error saliendo de sala:${colors.reset}`, error);
+    ack?.({ success: false, message: "Error al salir de la sala" });
+  }
+});
 
   // ============================================================
   // 💬 MENSAJES DE TEXTO (CORREGIDO)
