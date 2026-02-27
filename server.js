@@ -2357,17 +2357,19 @@ socket.on("user-connected", async (user = {}, ack) => {
   // 🚪 MANEJO DE SALAS
   // ============================================================
   // ============================================================
-// 🚪 MANEJO DE SALAS (CORREGIDO: fallback userId + Firestore upsert)
+// 🚪 MANEJO DE SALAS - VERSIÓN CORREGIDA CON USERNAME
 // ============================================================
 
 socket.on("join_room", async (data = {}, ack) => {
   try {
     const { roomId } = data;
     const userId = data.userId || socket.userId; // ✅ fallback seguro
+    const username = data.username || socket.username || "Usuario"; // ✅ ¡NUEVO! Usar username de los datos
 
     console.log(`${colors.blue}🚪 Evento → join_room:${colors.reset}`, {
       roomId,
       userId,
+      username, // ✅ Ahora mostramos el username correctamente
       socketId: socket.id,
     });
 
@@ -2380,6 +2382,12 @@ socket.on("join_room", async (data = {}, ack) => {
     if (!targetRoom) {
       ack?.({ success: false, message: `Sala ${roomId} no encontrada` });
       return;
+    }
+
+    // Actualizar socket.username si tenemos uno mejor de los datos
+    if (data.username && data.username !== socket.username) {
+      socket.username = data.username;
+      console.log(`${colors.green}✅ Username actualizado: ${socket.username}${colors.reset}`);
     }
 
     // Si estaba en otra sala, salir prolijo
@@ -2395,7 +2403,7 @@ socket.on("join_room", async (data = {}, ack) => {
 
       socket.to(previousRoomId).emit("user_left_room", {
         userId,
-        username: socket.username,
+        username: socket.username, // ✅ Usar socket.username actualizado
         roomId: previousRoomId,
         message: `${socket.username} salió de la sala`,
         timestamp: Date.now(),
@@ -2412,18 +2420,29 @@ socket.on("join_room", async (data = {}, ack) => {
     const entry = state.connectedUsers.get(userId);
     if (entry) {
       entry.userData.currentRoom = roomId;
+      entry.userData.username = socket.username; // ✅ Sincronizar username
     }
 
-    // ✅ FIX: NO usar update() (revienta si el doc no existe)
-    await db.collection(COLLECTIONS.USERS).doc(userId).set(
-      {
-        currentRoom: roomId,
-        lastActive: Date.now(),
-        uid: userId,
-        username: socket.username || null,
-      },
-      { merge: true }
-    );
+    // ✅ GUARDAR EN FIRESTORE CON EL USERNAME CORRECTO
+    try {
+      await db.collection(COLLECTIONS.USERS).doc(userId).set(
+        {
+          currentRoom: roomId,
+          lastActive: Date.now(),
+          uid: userId,
+          username: socket.username, // ✅ Guardar el username real
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
+      
+      console.log(`${colors.green}✅ Usuario ${socket.username} actualizado en Firestore${colors.reset}`);
+    } catch (dbError) {
+      console.warn(
+        `${colors.yellow}⚠️ Error guardando en Firestore:${colors.reset}`,
+        dbError.message
+      );
+    }
 
     // Enviar historial (si existe)
     try {
@@ -2445,6 +2464,8 @@ socket.on("join_room", async (data = {}, ack) => {
         roomId,
         messages,
       });
+      
+      console.log(`${colors.green}✅ Historial enviado: ${messages.length} mensajes${colors.reset}`);
     } catch (dbError) {
       console.warn(
         `${colors.yellow}⚠️ No se pudo cargar historial de mensajes:${colors.reset}`,
@@ -2452,45 +2473,59 @@ socket.on("join_room", async (data = {}, ack) => {
       );
     }
 
+    // ✅ NOTIFICAR A OTROS USUARIOS CON EL USERNAME CORRECTO
     socket.to(roomId).emit("user_joined_room", {
       userId,
-      username: socket.username,
+      username: socket.username, // ✅ Usar el username correcto
       roomId,
       message: `${socket.username} se unió a la sala`,
       timestamp: Date.now(),
     });
 
+    // ✅ ACTUALIZAR LISTA DE USUARIOS EN LA SALA
     utils.updateRoomUserList(roomId);
 
+    // ✅ ENVIAR ACK CON EL USERNAME
     ack?.({
       success: true,
       roomId,
+      username: socket.username, // ✅ Devolver el username para confirmación
       message: `Unido a sala ${roomId}`,
     });
 
     console.log(`${colors.green}✅ ${socket.username} se unió a ${roomId}${colors.reset}`);
+    
   } catch (err) {
-    console.error("❌ Error en join_room:", err);
+    console.error(`${colors.red}❌ Error en join_room:${colors.reset}`, err);
     ack?.({ success: false, message: "Error interno en join_room" });
   }
 });
 
+// ============================================================
+// 🚪 SALIR DE SALA - VERSIÓN CORREGIDA
+// ============================================================
 socket.on("leave_room", async (data = {}, ack) => {
   try {
     const { roomId } = data;
     const userId = data.userId || socket.userId; // ✅ fallback
+    const username = data.username || socket.username || "Usuario"; // ✅ Usar username de los datos
 
     if (!roomId) {
       return ack?.({ success: false, message: "❌ Sala no especificada" });
     }
 
     console.log(
-      `${colors.blue}🚪 Evento → leave_room:${colors.reset} ${socket.username} → ${roomId}`
+      `${colors.blue}🚪 Evento → leave_room:${colors.reset} ${username} → ${roomId}`
     );
 
     const room = state.chatRooms.get(roomId);
     if (!room) {
       return ack?.({ success: false, message: "Sala no encontrada" });
+    }
+
+    // Actualizar socket.username si tenemos uno mejor de los datos
+    if (data.username && data.username !== socket.username) {
+      socket.username = data.username;
     }
 
     socket.leave(roomId);
@@ -2499,22 +2534,34 @@ socket.on("leave_room", async (data = {}, ack) => {
     if (socket.currentRoom === roomId) socket.currentRoom = null;
 
     const entry = state.connectedUsers.get(userId);
-    if (entry) entry.userData.currentRoom = null;
+    if (entry) {
+      entry.userData.currentRoom = null;
+      entry.userData.username = socket.username; // ✅ Sincronizar
+    }
 
-    // ✅ FIX: set merge (no explota si doc no existe)
-    await db.collection(COLLECTIONS.USERS).doc(userId).set(
-      {
-        currentRoom: null,
-        lastActive: Date.now(),
-        uid: userId,
-        username: socket.username || null,
-      },
-      { merge: true }
-    );
+    // ✅ GUARDAR EN FIRESTORE
+    try {
+      await db.collection(COLLECTIONS.USERS).doc(userId).set(
+        {
+          currentRoom: null,
+          lastActive: Date.now(),
+          uid: userId,
+          username: socket.username, // ✅ Guardar el username
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
+    } catch (dbError) {
+      console.warn(
+        `${colors.yellow}⚠️ Error guardando en Firestore:${colors.reset}`,
+        dbError.message
+      );
+    }
 
+    // ✅ NOTIFICAR CON EL USERNAME CORRECTO
     socket.to(roomId).emit("user_left_room", {
       userId,
-      username: socket.username,
+      username: socket.username, // ✅ Usar el username correcto
       roomId,
       message: `${socket.username} salió de la sala`,
       timestamp: Date.now(),
@@ -2523,13 +2570,14 @@ socket.on("leave_room", async (data = {}, ack) => {
     utils.updateRoomUserList(roomId);
 
     ack?.({ success: true, message: `Salido de ${roomId}` });
+    
     console.log(`${colors.yellow}↩️ ${socket.username} salió de: ${roomId}${colors.reset}`);
+    
   } catch (error) {
     console.error(`${colors.red}❌ Error saliendo de sala:${colors.reset}`, error);
     ack?.({ success: false, message: "Error al salir de la sala" });
   }
 });
-
   // ============================================================
   // 💬 MENSAJES DE TEXTO (CORREGIDO)
   // ============================================================
