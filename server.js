@@ -587,15 +587,11 @@ const utils = {
   }
 };
 
-// ============================================================
-// 🚀 FUNCIÓN SEGURA PARA ENVIAR NOTIFICACIONES PUSH (CORREGIDA)
-// ============================================================
-
 async function getActiveFcmTokens(userId) {
   const snap = await db
     .collection(COLLECTIONS.USERS).doc(userId)
     .collection("fcmTokens")
-    .where("enabled", "==", true)  // ✅ CORREGIDO: Solo filtro enabled, NO online/active
+    .where("enabled", "==", true)
     .get();
 
   const devices = [];
@@ -619,6 +615,7 @@ async function getActiveFcmTokens(userId) {
   return uniq;
 }
 
+
 async function disableInvalidDevices(userId, deviceIds = []) {
   if (!deviceIds.length) return;
 
@@ -640,7 +637,7 @@ async function disableInvalidDevices(userId, deviceIds = []) {
 
 
 // ============================================================
-// 🚀 FUNCIÓN PRINCIPAL PARA ENVIAR NOTIFICACIONES PUSH
+// 🚀 FUNCIÓN SEGURA PARA ENVIAR NOTIFICACIONES PUSH (NO ELIMINA TOKENS)
 // ============================================================
 
 async function sendToUserDevices(userId, title, body, data = {}) {
@@ -648,11 +645,8 @@ async function sendToUserDevices(userId, title, body, data = {}) {
     const devices = await getActiveFcmTokens(userId);
     const tokens = devices.map(d => d.token);
 
-    // 🔍 LOG DE DIAGNÓSTICO - Ver cuántos tokens hay
-    console.log(`${colors.blue}🔎 FCM para ${userId}: ${tokens.length} tokens habilitados${colors.reset}`);
-
     if (!tokens.length) {
-      console.log(`${colors.yellow}⚠️ Usuario ${userId} sin tokens habilitados (enabled=false)${colors.reset}`);
+      console.log(`${colors.yellow}⚠️ Usuario ${userId} sin tokens activos (subcolección)${colors.reset}`);
       return false;
     }
 
@@ -695,7 +689,7 @@ async function sendToUserDevices(userId, title, body, data = {}) {
       `${ok ? colors.green : colors.yellow}📱 Push a ${userId}: ${res.successCount}/${tokens.length} ok${colors.reset}`
     );
 
-    // Log detallado de errores
+    // Log detallado de errores (CLAVE para debug)
     res.responses.forEach((r, idx) => {
       if (!r.success) {
         console.log(
@@ -730,6 +724,7 @@ async function sendToUserDevices(userId, title, body, data = {}) {
   }
 }
 
+
 async function sendPushNotification(userId, title, body, data = {}) {
   return sendToUserDevices(userId, title, body, data);
 }
@@ -737,6 +732,7 @@ async function sendPushNotification(userId, title, body, data = {}) {
 async function sendEmergencyNotification(userId, title, body, data = {}) {
   return sendToUserDevices(userId, title, body, data);
 }
+
 // ============================================================
 // 🗑️ FUNCIÓN PARA ELIMINAR HISTORIAL DE CHAT
 // ============================================================
