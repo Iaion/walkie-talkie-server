@@ -2719,119 +2719,164 @@ socket.on("leave_room", async (data = {}, ack) => {
   });
 
   // ============================================================
-  // 👤 GESTIÓN DE PERFILES
-  // ============================================================
-  socket.on("get_profile", async (data = {}, callback) => {
-    try {
-      const userId = data.userId;
-      console.log(`${colors.cyan}📥 Evento → get_profile${colors.reset}`, data);
+// 👤 GESTIÓN DE PERFILES - CORREGIDO
+// ============================================================
 
-      if (!userId) {
-        return callback?.({ success: false, message: "userId requerido" });
-      }
+socket.on("get_profile", async (data = {}, callback) => {
+  try {
+    const userId = data.userId;
+    console.log(`${colors.cyan}📥 Evento → get_profile${colors.reset}`, data);
 
-      const snap = await db.collection(COLLECTIONS.USERS).doc(userId).get();
-      if (!snap.exists) {
-        return callback?.({ success: false, message: "Perfil no encontrado" });
-      }
-
-      const user = snap.data() || {};
-      callback?.({
-        success: true,
-        ...user,
-      });
-    } catch (e) {
-      console.error(`${colors.red}❌ Error get_profile:${colors.reset}`, e);
-      callback?.({ success: false, message: e.message });
-    }
-  });
-
-  socket.on("update_profile", async (data = {}, callback) => {
-    try {
-      console.log(`${colors.cyan}📥 Evento → update_profile${colors.reset}`, data);
-      const {
-        userId,
-        fullName = "",
-        username = "",
-        email = "",
-        phone = "",
-        avatarUri = "",
-      } = data;
-
-      if (!userId) {
-        return callback?.({ success: false, message: "userId requerido" });
-      }
-
-      const prevSnap = await db.collection(COLLECTIONS.USERS).doc(userId).get();
-      const prevData = prevSnap.exists ? prevSnap.data() : {};
-      let finalAvatar = prevData?.avatarUri || "";
-
-      if (typeof avatarUri === "string" && avatarUri.trim() !== "") {
-        if (utils.isDataUrl(avatarUri)) {
-          finalAvatar = await storageService.uploadAvatarFromDataUrl(userId, avatarUri);
-        } else if (utils.isHttpUrl(avatarUri)) {
-          finalAvatar = avatarUri;
-        } else {
-          console.log(`${colors.gray}⚠️ URI local ignorada (${avatarUri})${colors.reset}`);
-        }
-      } else {
-        console.log(`${colors.yellow}🟡 No llegó avatar nuevo, se mantiene el anterior${colors.reset}`);
-      }
-
-      const updatedUser = {
-        id: userId,
-        fullName,
-        username,
-        email,
-        phone,
-        avatarUri: finalAvatar,
-        status: "Online",
-        presence: "Available",
-        updatedAt: Date.now(),
-      };
-
-      await db.collection(COLLECTIONS.USERS).doc(userId).update(updatedUser);
-
-      const entry = state.connectedUsers.get(userId);
-      if (entry) {
-        entry.userData = { ...entry.userData, ...updatedUser };
-      }
-
-      console.log(`${colors.green}✅ Perfil actualizado para ${username}${colors.reset}`);
-      io.emit("user_updated", updatedUser);
-
-      callback?.({
-        success: true,
-        message: "Perfil actualizado correctamente",
-        user: updatedUser,
-      });
-
-    } catch (error) {
-      console.error(`${colors.red}❌ Error en update_profile:${colors.reset}`, error);
-      callback?.({ success: false, message: error.message });
-    }
-  });
-
-  socket.on("get_users", (data = {}, ack) => {
-    const { roomId } = data;
-    const room = state.chatRooms.get(roomId);
-    if (!room) {
-      ack?.({ success: false, message: "Sala no encontrada" });
-      return;
+    if (!userId) {
+      return callback?.({ success: false, message: "userId requerido" });
     }
 
-    const usersInRoom = Array.from(room.users).map(userId => {
-      const userInfo = state.connectedUsers.get(userId);
-      return userInfo ? userInfo.userData : null;
-    }).filter(Boolean);
+    const snap = await db.collection(COLLECTIONS.USERS).doc(userId).get();
+    if (!snap.exists) {
+      return callback?.({ success: false, message: "Perfil no encontrado" });
+    }
 
-    ack?.({
+    const user = snap.data() || {};
+    
+    // 🔥 CORRECCIÓN: Asegurar que username nunca sea null o "null"
+    let finalUsername = user.username;
+    if (!finalUsername || finalUsername === "null" || finalUsername.trim() === "") {
+      // Usar fullName como fallback
+      if (user.fullName && user.fullName.trim() !== "") {
+        finalUsername = user.fullName.trim();
+      } 
+      // Usar email como segundo fallback
+      else if (user.email && user.email.trim() !== "") {
+        finalUsername = user.email.split('@')[0].trim();
+      }
+      // Último recurso
+      else {
+        finalUsername = "Usuario";
+      }
+      
+      console.log(`${colors.yellow}⚠️ get_profile: username reparado para ${userId}: "${finalUsername}"${colors.reset}`);
+    }
+
+    // Devolver el usuario con username corregido
+    callback?.({
       success: true,
-      roomId,
-      users: usersInRoom,
+      ...user,
+      username: finalUsername, // Sobrescribir con el valor corregido
     });
-  });
+    
+  } catch (e) {
+    console.error(`${colors.red}❌ Error get_profile:${colors.reset}`, e);
+    callback?.({ success: false, message: e.message });
+  }
+});
 
+socket.on("update_profile", async (data = {}, callback) => {
+  try {
+    console.log(`${colors.cyan}📥 Evento → update_profile${colors.reset}`, data);
+    const {
+      userId,
+      fullName = "",
+      username = "",
+      email = "",
+      phone = "",
+      avatarUri = "",
+    } = data;
+
+    if (!userId) {
+      return callback?.({ success: false, message: "userId requerido" });
+    }
+
+    const prevSnap = await db.collection(COLLECTIONS.USERS).doc(userId).get();
+    const prevData = prevSnap.exists ? prevSnap.data() : {};
+    
+    // 🔥 CORRECCIÓN CRÍTICA: Proteger username contra vacíos
+    let finalUsername = username;
+    
+    // Si el username recibido está vacío o es "null", mantener el anterior
+    if (!finalUsername || finalUsername.trim() === "" || finalUsername === "null") {
+      finalUsername = prevData?.username;
+      
+      // Si aún así no hay username anterior, usar fullName o email como fallback
+      if (!finalUsername || finalUsername.trim() === "" || finalUsername === "null") {
+        if (fullName && fullName.trim() !== "") {
+          finalUsername = fullName.trim();
+        } else if (email && email.trim() !== "") {
+          finalUsername = email.split('@')[0].trim();
+        } else {
+          finalUsername = "Usuario";
+        }
+      }
+      
+      console.log(`${colors.yellow}⚠️ update_profile: username vacío protegido, se mantiene/restaura: "${finalUsername}"${colors.reset}`);
+    }
+
+    let finalAvatar = prevData?.avatarUri || "";
+
+    if (typeof avatarUri === "string" && avatarUri.trim() !== "") {
+      if (utils.isDataUrl(avatarUri)) {
+        finalAvatar = await storageService.uploadAvatarFromDataUrl(userId, avatarUri);
+      } else if (utils.isHttpUrl(avatarUri)) {
+        finalAvatar = avatarUri;
+      } else {
+        console.log(`${colors.gray}⚠️ URI local ignorada (${avatarUri})${colors.reset}`);
+      }
+    } else {
+      console.log(`${colors.yellow}🟡 No llegó avatar nuevo, se mantiene el anterior${colors.reset}`);
+    }
+
+    const updatedUser = {
+      id: userId,
+      fullName: fullName.trim() || prevData?.fullName || "",
+      username: finalUsername, // 🔥 Usar el username protegido
+      email: email.trim() || prevData?.email || "",
+      phone: phone.trim() || prevData?.phone || "",
+      avatarUri: finalAvatar,
+      status: "Online",
+      presence: "Available",
+      updatedAt: Date.now(),
+    };
+
+    await db.collection(COLLECTIONS.USERS).doc(userId).update(updatedUser);
+
+    const entry = state.connectedUsers.get(userId);
+    if (entry) {
+      entry.userData = { ...entry.userData, ...updatedUser };
+    }
+
+    console.log(`${colors.green}✅ Perfil actualizado para ${finalUsername} (userId: ${userId})${colors.reset}`);
+    io.emit("user_updated", updatedUser);
+
+    callback?.({
+      success: true,
+      message: "Perfil actualizado correctamente",
+      user: updatedUser,
+    });
+
+  } catch (error) {
+    console.error(`${colors.red}❌ Error en update_profile:${colors.reset}`, error);
+    callback?.({ success: false, message: error.message });
+  }
+});
+
+socket.on("get_users", (data = {}, ack) => {
+  const { roomId } = data;
+  const room = state.chatRooms.get(roomId);
+  if (!room) {
+    ack?.({ success: false, message: "Sala no encontrada" });
+    return;
+  }
+
+  const usersInRoom = Array.from(room.users).map(userId => {
+    const userInfo = state.connectedUsers.get(userId);
+    return userInfo ? userInfo.userData : null;
+  }).filter(Boolean);
+
+  ack?.({
+    success: true,
+    roomId,
+    users: usersInRoom,
+  });
+});
   // ============================================================
   // 🚨 SISTEMA DE EMERGENCIA (CORREGIDO - USA LOCK_REF)
   // ============================================================
