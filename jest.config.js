@@ -1,14 +1,12 @@
 /**
  * jest.config.js
  * Configuración de los tests de caracterización (Fase 0.5).
- * - globalSetup levanta el monolito apuntado a los emuladores; globalTeardown lo apaga.
- * - Los tests corren en serie (--runInBand desde el script) porque comparten un único
- *   server + estado del emulador.
+ * - Cada archivo de test levanta su propio server (beforeAll/afterAll via test/setup/server.js)
+ *   para tener estado EN MEMORIA limpio por suite.
+ * - Corren en serie (--runInBand desde el script): comparten el puerto 8080 y el emulador.
  */
 module.exports = {
   testEnvironment: 'node',
-  globalSetup: '<rootDir>/test/setup/global-setup.js',
-  globalTeardown: '<rootDir>/test/setup/global-teardown.js',
   testMatch: ['<rootDir>/test/**/*.test.js'],
-  testTimeout: 20000,
+  testTimeout: 30000,
 };

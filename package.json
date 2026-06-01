@@ -6,8 +6,8 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node server.js",
-    "test": "jest --runInBand",
-    "test:ci": "firebase emulators:exec --project alrescate-dev \"jest --runInBand\""
+    "test": "jest --runInBand --forceExit",
+    "test:ci": "firebase emulators:exec --project alrescate-dev \"jest --runInBand --forceExit\""
   },
   "dependencies": {
     "cors": "^2.8.5",

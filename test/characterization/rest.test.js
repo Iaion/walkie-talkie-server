@@ -6,10 +6,14 @@
  */
 const request = require('supertest');
 const { clearFirestore, setDoc } = require('../setup/emulator');
+const { startServer, stopServer } = require('../setup/server');
 
 const api = () => request('http://127.0.0.1:8080');
 
 describe('Caracterización REST — monolito actual', () => {
+  beforeAll(startServer);
+  afterAll(stopServer);
+
   beforeEach(async () => {
     await clearFirestore();
   });

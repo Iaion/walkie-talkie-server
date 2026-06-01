@@ -1,11 +1,11 @@
 /**
- * test/setup/global-setup.js
- * Levanta el monolito (server.js) como proceso hijo, apuntado a los emuladores Firebase,
- * y espera a que /health responda antes de dejar correr los tests.
- * La referencia al proceso se guarda (globalThis + archivo pid) para que el teardown lo apague.
+ * test/setup/server.js
+ * Arranca/para el monolito (server.js) como proceso hijo, apuntado a los emuladores.
+ * Se usa con beforeAll/afterAll EN CADA archivo de test, para que cada suite tenga un
+ * server con estado EN MEMORIA limpio (el monolito guarda emergencias/usuarios/locks en
+ * memoria, y clearFirestore no los toca). Aislamiento real entre archivos.
  *
- * Asume que los emuladores YA están corriendo (los levanta `firebase emulators:exec`,
- * o se corren a mano con `firebase emulators:start`).
+ * Asume que los emuladores ya están corriendo (los levanta `firebase emulators:exec`).
  */
 const { spawn } = require('child_process');
 const fs = require('fs');
@@ -13,8 +13,9 @@ const path = require('path');
 
 const ROOT = path.resolve(__dirname, '..', '..');
 const PORT = 8080;
+let child = null;
 
-module.exports = async () => {
+async function startServer() {
   const keyPath = path.join(ROOT, 'secrets', 'serviceAccountKey.dev.json');
   if (!fs.existsSync(keyPath)) {
     throw new Error(`Falta la service account key en ${keyPath}. Ver project_progress / ARQUITECTURA.md.`);
@@ -31,28 +32,32 @@ module.exports = async () => {
     PORT: String(PORT),
   };
 
-  const child = spawn('node', [path.join(ROOT, 'server.js')], { env, stdio: 'pipe' });
+  child = spawn('node', [path.join(ROOT, 'server.js')], { env, stdio: 'pipe' });
   let logs = '';
   child.stdout.on('data', (d) => { logs += d.toString(); });
   child.stderr.on('data', (d) => { logs += d.toString(); });
 
-  // Esperar a que /health responda
   const deadline = Date.now() + 15000;
-  let healthy = false;
   while (Date.now() < deadline) {
     try {
       const res = await fetch(`http://127.0.0.1:${PORT}/health`);
-      if (res.ok) { healthy = true; break; }
+      if (res.ok) return;
     } catch (_) { /* todavía no levantó */ }
-    await new Promise((r) => setTimeout(r, 300));
+    await new Promise((r) => setTimeout(r, 200));
   }
+  child.kill();
+  throw new Error('El server no levantó a tiempo.\n--- logs del server ---\n' + logs);
+}
 
-  if (!healthy) {
-    child.kill();
-    throw new Error('El server no levantó a tiempo.\n--- logs del server ---\n' + logs);
-  }
+async function stopServer() {
+  if (!child) return;
+  const c = child;
+  child = null;
+  await new Promise((resolve) => {
+    c.once('exit', resolve);
+    c.kill();
+    setTimeout(resolve, 2000); // fallback por si no emite 'exit'
+  });
+}
 
-  globalThis.__SERVER_CHILD__ = child;
-  fs.writeFileSync(path.join(__dirname, '.server.pid'), String(child.pid));
-  console.log(`\n[global-setup] Server de test corriendo (pid ${child.pid}) contra el emulador.`);
-};
+module.exports = { startServer, stopServer, PORT };
