@@ -15,9 +15,10 @@ import { AuthGuard } from './common/auth.guard';
 import { VehiclesModule } from './vehicles/vehicles.module';
 import { FcmModule } from './fcm/fcm.module';
 import { RealtimeModule } from './realtime/realtime.module';
+import { VerificationModule } from './verification/verification.module';
 
 @Module({
-  imports: [ConfigModule.forRoot({ isGlobal: true }), FirebaseModule, VehiclesModule, FcmModule, RealtimeModule],
+  imports: [ConfigModule.forRoot({ isGlobal: true }), FirebaseModule, VehiclesModule, FcmModule, RealtimeModule, VerificationModule],
   controllers: [HealthController],
   providers: [{ provide: APP_GUARD, useClass: AuthGuard }],
 })
