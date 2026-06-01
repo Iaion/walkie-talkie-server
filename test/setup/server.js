@@ -32,7 +32,9 @@ async function startServer() {
     PORT: String(PORT),
   };
 
-  child = spawn('node', [path.join(ROOT, 'server.js')], { env, stdio: 'pipe' });
+  // SERVER_ENTRY permite correr el harness contra NestJS (dist/main.js) o el monolito (server.js, default).
+  const entry = process.env.SERVER_ENTRY || 'server.js';
+  child = spawn('node', [path.join(ROOT, entry)], { env, stdio: 'pipe' });
   let logs = '';
   child.stdout.on('data', (d) => { logs += d.toString(); });
   child.stderr.on('data', (d) => { logs += d.toString(); });
