@@ -13,9 +13,10 @@ import { FirebaseModule } from './firebase/firebase.module';
 import { HealthController } from './health/health.controller';
 import { AuthGuard } from './common/auth.guard';
 import { VehiclesModule } from './vehicles/vehicles.module';
+import { FcmModule } from './fcm/fcm.module';
 
 @Module({
-  imports: [ConfigModule.forRoot({ isGlobal: true }), FirebaseModule, VehiclesModule],
+  imports: [ConfigModule.forRoot({ isGlobal: true }), FirebaseModule, VehiclesModule, FcmModule],
   controllers: [HealthController],
   providers: [{ provide: APP_GUARD, useClass: AuthGuard }],
 })
