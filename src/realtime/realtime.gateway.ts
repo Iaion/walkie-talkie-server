@@ -16,7 +16,9 @@ import {
 } from '@nestjs/websockets';
 import { Server, Socket } from 'socket.io';
 import * as admin from 'firebase-admin';
+import { v4 as uuidv4 } from 'uuid';
 import { FirebaseService } from '../firebase/firebase.service';
+import { NotificationsService } from '../notifications/notifications.service';
 import { StateStore } from './state.store';
 
 @WebSocketGateway({
@@ -31,6 +33,7 @@ export class RealtimeGateway implements OnGatewayInit {
   constructor(
     private readonly state: StateStore,
     private readonly firebase: FirebaseService,
+    private readonly notifications: NotificationsService,
   ) {}
 
   afterInit(server: Server): void {
@@ -59,6 +62,18 @@ export class RealtimeGateway implements OnGatewayInit {
       users: usersInRoom,
       userCount: usersInRoom.length,
     });
+  }
+
+  /** ¿Alguno de los sockets del usuario está en la sala? (equivalente a utils.isUserPresentInRoom). */
+  private isUserPresentInRoom(userId: string, roomId: string): boolean {
+    const entry = this.state.connectedUsers.get(userId);
+    if (!entry) return false;
+    const room = this.server.sockets.adapter.rooms.get(roomId);
+    if (!room) return false;
+    for (const sid of entry.sockets) {
+      if (room.has(sid)) return true;
+    }
+    return false;
   }
 
   @SubscribeMessage('user-connected')
@@ -164,5 +179,147 @@ export class RealtimeGateway implements OnGatewayInit {
     this.updateRoomUserList(defaultRoom);
 
     return { success: true, userId, username: safeUsername };
+  }
+
+  @SubscribeMessage('join_room')
+  async joinRoom(@ConnectedSocket() socket: Socket, @MessageBody() data: Record<string, any> = {}) {
+    try {
+      const { roomId } = data;
+      const userId = data.userId || (socket as any).userId;
+      if (!roomId || !userId) return { success: false, message: 'roomId y userId son requeridos' };
+
+      const targetRoom = this.state.chatRooms.get(roomId);
+      if (!targetRoom) return { success: false, message: `Sala ${roomId} no encontrada` };
+
+      const currentRoom = (socket as any).currentRoom;
+      if (currentRoom && currentRoom !== roomId) {
+        const previousRoom = this.state.chatRooms.get(currentRoom);
+        if (previousRoom) previousRoom.users.delete(userId);
+        socket.leave(currentRoom);
+        socket.to(currentRoom).emit('user_left_room', {
+          userId, username: (socket as any).username, roomId: currentRoom,
+          message: `${(socket as any).username} salió de la sala`, timestamp: Date.now(),
+        });
+        this.updateRoomUserList(currentRoom);
+      }
+
+      socket.join(roomId);
+      (socket as any).currentRoom = roomId;
+      targetRoom.users.add(userId);
+      const entry = this.state.connectedUsers.get(userId);
+      if (entry) entry.userData.currentRoom = roomId;
+
+      await this.firebase.firestore.collection('users').doc(userId).set(
+        { currentRoom: roomId, lastActive: Date.now(), uid: userId, username: (socket as any).username || null },
+        { merge: true },
+      );
+
+      try {
+        const snap = await this.firebase.firestore
+          .collection('messages').where('roomId', '==', roomId)
+          .orderBy('timestamp', 'desc').limit(50).get();
+        const messages = snap.docs.map((d) => ({ id: d.id, ...d.data() })).reverse();
+        socket.emit('room_messages', { roomId, messages });
+      } catch {
+        // historial best-effort
+      }
+
+      socket.to(roomId).emit('user_joined_room', {
+        userId, username: (socket as any).username, roomId,
+        message: `${(socket as any).username} se unió a la sala`, timestamp: Date.now(),
+      });
+      this.updateRoomUserList(roomId);
+
+      return { success: true, roomId, message: `Unido a sala ${roomId}` };
+    } catch {
+      return { success: false, message: 'Error interno en join_room' };
+    }
+  }
+
+  @SubscribeMessage('leave_room')
+  async leaveRoom(@ConnectedSocket() socket: Socket, @MessageBody() data: Record<string, any> = {}) {
+    try {
+      const { roomId } = data;
+      const userId = data.userId || (socket as any).userId;
+      if (!roomId) return { success: false, message: '❌ Sala no especificada' };
+
+      const room = this.state.chatRooms.get(roomId);
+      if (!room) return { success: false, message: 'Sala no encontrada' };
+
+      socket.leave(roomId);
+      room.users.delete(userId);
+      if ((socket as any).currentRoom === roomId) (socket as any).currentRoom = null;
+      const entry = this.state.connectedUsers.get(userId);
+      if (entry) entry.userData.currentRoom = null;
+
+      await this.firebase.firestore.collection('users').doc(userId).set(
+        { currentRoom: null, lastActive: Date.now(), uid: userId, username: (socket as any).username || null },
+        { merge: true },
+      );
+
+      socket.to(roomId).emit('user_left_room', {
+        userId, username: (socket as any).username, roomId,
+        message: `${(socket as any).username} salió de la sala`, timestamp: Date.now(),
+      });
+      this.updateRoomUserList(roomId);
+
+      return { success: true, message: `Salido de ${roomId}` };
+    } catch {
+      return { success: false, message: 'Error al salir de la sala' };
+    }
+  }
+
+  @SubscribeMessage('send_message')
+  async sendMessage(@ConnectedSocket() socket: Socket, @MessageBody() data: Record<string, any> = {}) {
+    const { userId, username, text } = data;
+    const roomId = data.roomId || (socket as any).currentRoom || 'general';
+
+    if (!userId || !username || !text) return { success: false, message: '❌ Datos de mensaje inválidos' };
+    if (!(socket as any).currentRoom || !this.state.chatRooms.has(roomId)) {
+      return { success: false, message: '❌ No estás en una sala válida' };
+    }
+
+    const message = { id: uuidv4(), userId, username, roomId, text, type: 'text', timestamp: Date.now() };
+
+    try {
+      await this.firebase.firestore.collection('messages').add(message);
+      const room = this.state.chatRooms.get(roomId);
+      if (room) room.messageCount++;
+
+      this.server.to(roomId).emit('new_message', message);
+      socket.emit('message_sent', message);
+
+      let usersToNotify: string[] = [];
+      if (roomId === 'general') {
+        const offline = await this.firebase.firestore.collection('users').where('isOnline', '==', false).get();
+        usersToNotify = offline.docs.map((d) => d.id);
+      } else {
+        usersToNotify = room ? Array.from(room.users) : [];
+      }
+
+      for (const targetUserId of usersToNotify) {
+        if (targetUserId === userId) continue;
+        if (!this.isUserPresentInRoom(targetUserId, roomId)) {
+          await this.notifications.sendPushNotification(targetUserId, '💬 Nuevo mensaje', `${username}: ${text}`, {
+            type: 'chat_message', roomId, userId, username, text, timestamp: Date.now().toString(),
+          });
+        }
+      }
+
+      return { success: true, id: message.id };
+    } catch {
+      return { success: false, message: 'Error guardando mensaje' };
+    }
+  }
+
+  @SubscribeMessage('get_users')
+  getUsers(@MessageBody() data: Record<string, any> = {}) {
+    const { roomId } = data;
+    const room = this.state.chatRooms.get(roomId);
+    if (!room) return { success: false, message: 'Sala no encontrada' };
+    const usersInRoom = Array.from(room.users)
+      .map((uid) => this.state.connectedUsers.get(uid)?.userData)
+      .filter(Boolean);
+    return { success: true, roomId, users: usersInRoom };
   }
 }
