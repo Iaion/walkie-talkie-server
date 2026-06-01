@@ -11,15 +11,22 @@
 const { io } = require('socket.io-client');
 const { clearFirestore } = require('../setup/emulator');
 const { startServer, stopServer } = require('../setup/server');
-const { getIdToken } = require('../setup/auth');
+const { getIdTokenForUid } = require('../setup/auth');
 
 const URL = 'http://127.0.0.1:8080';
 const COORDS = { latitude: -34.6037, longitude: -58.3816 }; // Buenos Aires
-let TOKEN;
 
-function connect() {
+// Con autorización por-usuario, el socket debe conectarse con un token cuyo uid sea el userId
+// que emitirá (p.ej. 'U1'). Cacheamos un token por uid.
+const tokenCache = {};
+async function tokenFor(uid) {
+  if (!tokenCache[uid]) tokenCache[uid] = await getIdTokenForUid(uid);
+  return tokenCache[uid];
+}
+async function connect(uid) {
+  const token = await tokenFor(uid);
   return new Promise((resolve, reject) => {
-    const socket = io(URL, { transports: ['websocket'], forceNew: true, auth: { token: TOKEN } });
+    const socket = io(URL, { transports: ['websocket'], forceNew: true, auth: { token } });
     socket.on('connect', () => resolve(socket));
     socket.on('connect_error', reject);
   });
@@ -28,7 +35,7 @@ function connect() {
 describe('Caracterización Socket.IO — eventos críticos del monolito', () => {
   let sockets = [];
 
-  beforeAll(async () => { await startServer(); TOKEN = await getIdToken(); });
+  beforeAll(async () => { await startServer(); });
   afterAll(stopServer);
 
   beforeEach(async () => {
@@ -40,8 +47,9 @@ describe('Caracterización Socket.IO — eventos críticos del monolito', () => 
     sockets = [];
   });
 
-  async function newSocket() {
-    const s = await connect();
+  // uid: el id propio que el socket va a emitir (default 'U0' para los tests que fallan por datos faltantes).
+  async function newSocket(uid = 'U0') {
+    const s = await connect(uid);
     sockets.push(s);
     return s;
   }
@@ -57,13 +65,13 @@ describe('Caracterización Socket.IO — eventos críticos del monolito', () => 
     });
 
     test('con id → ack success con userId y username', async () => {
-      const s = await newSocket();
+      const s = await newSocket('U1');
       const res = await s.emitWithAck('user-connected', { id: 'U1', username: 'Juan' });
       expect(res).toMatchObject({ success: true, userId: 'U1', username: 'Juan' });
     });
 
     test('username cae a fallbacks (fullName) si no viene username', async () => {
-      const s = await newSocket();
+      const s = await newSocket('U2');
       const res = await s.emitWithAck('user-connected', { id: 'U2', fullName: 'Ana Pérez' });
       expect(res).toMatchObject({ success: true, userId: 'U2', username: 'Ana Pérez' });
     });
@@ -77,33 +85,33 @@ describe('Caracterización Socket.IO — eventos críticos del monolito', () => 
     });
 
     test('coordenadas no numéricas → INVALID_LOCATION', async () => {
-      const s = await newSocket();
+      const s = await newSocket('U1');
       const res = await s.emitWithAck('emergency_alert', { userId: 'U1', userName: 'Juan' });
       expect(res).toMatchObject({ success: false, code: 'INVALID_LOCATION' });
     });
 
     test('válida → success con emergencyRoomId = "emergencia_<userId>"', async () => {
-      const s = await newSocket();
+      const s = await newSocket('U1');
       const res = await s.emitWithAck('emergency_alert', { userId: 'U1', userName: 'Juan', ...COORDS });
       expect(res).toMatchObject({ success: true, emergencyRoomId: 'emergencia_U1' });
     });
 
     test('segunda emergencia concurrente (otro usuario) → EMERGENCY_ALREADY_ACTIVE (lock global)', async () => {
-      const s1 = await newSocket();
+      const s1 = await newSocket('U1');
       const r1 = await s1.emitWithAck('emergency_alert', { userId: 'U1', userName: 'Juan', ...COORDS });
       expect(r1).toMatchObject({ success: true });
 
-      const s2 = await newSocket();
+      const s2 = await newSocket('U2');
       const r2 = await s2.emitWithAck('emergency_alert', { userId: 'U2', userName: 'Ana', ...COORDS });
       expect(r2).toMatchObject({ success: false, code: 'EMERGENCY_ALREADY_ACTIVE' });
     });
 
     test('tras resolver la emergencia, se puede levantar otra', async () => {
-      const s1 = await newSocket();
+      const s1 = await newSocket('U1');
       await s1.emitWithAck('emergency_alert', { userId: 'U1', userName: 'Juan', ...COORDS });
       await s1.emitWithAck('emergency_resolve', { userId: 'U1' });
 
-      const s2 = await newSocket();
+      const s2 = await newSocket('U2');
       const r2 = await s2.emitWithAck('emergency_alert', { userId: 'U2', userName: 'Ana', ...COORDS });
       expect(r2).toMatchObject({ success: true });
     });
@@ -117,7 +125,7 @@ describe('Caracterización Socket.IO — eventos críticos del monolito', () => 
     });
 
     test('help_confirm con datos → {success:true}', async () => {
-      const s = await newSocket();
+      const s = await newSocket('H1');
       const res = await s.emitWithAck('help_confirm', {
         emergencyUserId: 'U1', helperId: 'H1', helperName: 'Pedro',
       });
@@ -131,7 +139,7 @@ describe('Caracterización Socket.IO — eventos críticos del monolito', () => 
     });
 
     test('help_reject con datos → {success:true}', async () => {
-      const s = await newSocket();
+      const s = await newSocket('H1');
       const res = await s.emitWithAck('help_reject', { emergencyUserId: 'U1', helperId: 'H1' });
       expect(res).toEqual({ success: true });
     });
@@ -142,6 +150,29 @@ describe('Caracterización Socket.IO — eventos críticos del monolito', () => 
       const s = await newSocket();
       const res = await s.emitWithAck('emergency_resolve', {});
       expect(res).toMatchObject({ success: false, message: 'userId requerido' });
+    });
+  });
+
+  // Capa NUEVA: un socket no puede hacerse pasar por OTRO uid (spoofing de identidad).
+  describe('Autorización por-usuario (anti-spoofing)', () => {
+    test('emergency_alert con userId ajeno → FORBIDDEN', async () => {
+      const s = await newSocket('U1'); // el token tiene uid = U1
+      const res = await s.emitWithAck('emergency_alert', { userId: 'VICTIMA-AJENA', userName: 'X', ...COORDS });
+      expect(res).toMatchObject({ success: false, code: 'FORBIDDEN' });
+    });
+
+    test('user-connected con id ajeno → No autorizado', async () => {
+      const s = await newSocket('U1');
+      const res = await s.emitWithAck('user-connected', { id: 'OTRO-UID', username: 'X' });
+      expect(res.success).toBe(false);
+      expect(res.message).toMatch(/No autorizado/);
+    });
+
+    test('help_confirm declarando helperId ajeno → No autorizado', async () => {
+      const s = await newSocket('H1');
+      const res = await s.emitWithAck('help_confirm', { emergencyUserId: 'U1', helperId: 'OTRO-HELPER' });
+      expect(res.success).toBe(false);
+      expect(res.message).toMatch(/No autorizado/);
     });
   });
 });

@@ -7,19 +7,26 @@ const request = require('supertest');
 const { io } = require('socket.io-client');
 const { clearFirestore } = require('../setup/emulator');
 const { startServer, stopServer } = require('../setup/server');
-const { getIdToken } = require('../setup/auth');
+const { getIdToken, getIdTokenForUid } = require('../setup/auth');
 
 const URL = 'http://127.0.0.1:8080';
-let TOKEN;
+let TOKEN; // para el api() REST (/rooms no es por-usuario, cualquier token válido sirve)
 const api = () => {
   const r = request(URL);
   const auth = (req) => req.set('Authorization', `Bearer ${TOKEN}`);
   return { get: (p) => auth(r.get(p)), post: (p) => auth(r.post(p)), delete: (p) => auth(r.delete(p)) };
 };
 
-function connect() {
+// Sockets: token cuyo uid es el id que emitirá (autorización por-usuario).
+const tokenCache = {};
+async function tokenFor(uid) {
+  if (!tokenCache[uid]) tokenCache[uid] = await getIdTokenForUid(uid);
+  return tokenCache[uid];
+}
+async function connect(uid) {
+  const token = await tokenFor(uid);
   return new Promise((resolve, reject) => {
-    const socket = io(URL, { transports: ['websocket'], forceNew: true, auth: { token: TOKEN } });
+    const socket = io(URL, { transports: ['websocket'], forceNew: true, auth: { token } });
     socket.on('connect', () => resolve(socket));
     socket.on('connect_error', reject);
   });
@@ -33,8 +40,8 @@ describe('Caracterización — salas y chat', () => {
   beforeEach(async () => { await clearFirestore(); });
   afterEach(() => { sockets.forEach((s) => s.close()); sockets = []; });
 
-  async function newSocket() {
-    const s = await connect();
+  async function newSocket(uid = 'U0') {
+    const s = await connect(uid);
     sockets.push(s);
     return s;
   }
@@ -71,13 +78,13 @@ describe('Caracterización — salas y chat', () => {
     });
 
     test('sala inexistente → "Sala X no encontrada"', async () => {
-      const s = await newSocket();
+      const s = await newSocket('U1');
       const res = await s.emitWithAck('join_room', { roomId: 'no-existe', userId: 'U1' });
       expect(res).toEqual({ success: false, message: 'Sala no-existe no encontrada' });
     });
 
     test('sala válida → success', async () => {
-      const s = await newSocket();
+      const s = await newSocket('U1');
       const res = await s.emitWithAck('join_room', { roomId: 'ayuda', userId: 'U1' });
       expect(res).toMatchObject({ success: true, roomId: 'ayuda', message: 'Unido a sala ayuda' });
     });
@@ -91,13 +98,13 @@ describe('Caracterización — salas y chat', () => {
     });
 
     test('sala inexistente → "Sala no encontrada"', async () => {
-      const s = await newSocket();
+      const s = await newSocket('U1');
       const res = await s.emitWithAck('leave_room', { roomId: 'no-existe', userId: 'U1' });
       expect(res).toEqual({ success: false, message: 'Sala no encontrada' });
     });
 
     test('sala válida → success', async () => {
-      const s = await newSocket();
+      const s = await newSocket('U1');
       await s.emitWithAck('user-connected', { id: 'U1', username: 'Juan' });
       const res = await s.emitWithAck('leave_room', { roomId: 'general', userId: 'U1' });
       expect(res).toMatchObject({ success: true, message: 'Salido de general' });
@@ -106,19 +113,19 @@ describe('Caracterización — salas y chat', () => {
 
   describe('send_message', () => {
     test('datos inválidos → "Datos de mensaje inválidos"', async () => {
-      const s = await newSocket();
+      const s = await newSocket('U1');
       const res = await s.emitWithAck('send_message', { userId: 'U1', username: 'Juan' });
       expect(res).toEqual({ success: false, message: '❌ Datos de mensaje inválidos' });
     });
 
     test('socket sin sala → "No estás en una sala válida"', async () => {
-      const s = await newSocket();
+      const s = await newSocket('U1');
       const res = await s.emitWithAck('send_message', { userId: 'U1', username: 'Juan', text: 'hola' });
       expect(res).toEqual({ success: false, message: '❌ No estás en una sala válida' });
     });
 
     test('en sala válida (tras conectarse) → success con id', async () => {
-      const s = await newSocket();
+      const s = await newSocket('U1');
       await s.emitWithAck('user-connected', { id: 'U1', username: 'Juan' });
       const res = await s.emitWithAck('send_message', { userId: 'U1', username: 'Juan', text: 'hola', roomId: 'general' });
       expect(res.success).toBe(true);
@@ -134,7 +141,7 @@ describe('Caracterización — salas y chat', () => {
     });
 
     test('sala válida → success con lista de usuarios', async () => {
-      const s = await newSocket();
+      const s = await newSocket('U1');
       await s.emitWithAck('user-connected', { id: 'U1', username: 'Juan' });
       const res = await s.emitWithAck('get_users', { roomId: 'general' });
       expect(res.success).toBe(true);

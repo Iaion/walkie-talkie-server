@@ -140,19 +140,19 @@ describe('Caracterización — cierre de cobertura Fase 0.5', () => {
 
     test('sala inválida → "No estás en una sala válida"', async () => {
       const s = await newSocket();
-      const res = await s.emitWithAck('audio_message', { userId: 'U1', username: 'Juan', roomId: 'no-existe', audioUrl: 'https://x.com/a.mp3' });
+      const res = await s.emitWithAck('audio_message', { userId: UID, username: 'Juan', roomId: 'no-existe', audioUrl: 'https://x.com/a.mp3' });
       expect(res).toEqual({ success: false, message: '❌ No estás en una sala válida' });
     });
 
     test('sin audio → "No se pudo obtener URL de audio"', async () => {
       const s = await newSocket();
-      const res = await s.emitWithAck('audio_message', { userId: 'U1', username: 'Juan', roomId: 'general' });
+      const res = await s.emitWithAck('audio_message', { userId: UID, username: 'Juan', roomId: 'general' });
       expect(res).toEqual({ success: false, message: '❌ No se pudo obtener URL de audio' });
     });
 
     test('con audioUrl directo → success', async () => {
       const s = await newSocket();
-      const res = await s.emitWithAck('audio_message', { userId: 'U1', username: 'Juan', roomId: 'general', audioUrl: 'https://x.com/a.mp3' });
+      const res = await s.emitWithAck('audio_message', { userId: UID, username: 'Juan', roomId: 'general', audioUrl: 'https://x.com/a.mp3' });
       expect(res.success).toBe(true);
       expect(res.id).toBeTruthy();
       expect(res.audioUrl).toBe('https://x.com/a.mp3');
@@ -169,11 +169,11 @@ describe('Caracterización — cierre de cobertura Fase 0.5', () => {
     test('válido → success y guarda el token en la subcolección', async () => {
       const s = await newSocket();
       const res = await s.emitWithAck('register_fcm_token', {
-        userId: 'U1', fcmToken: 'tok-1', deviceId: 'dev-1', platform: 'android',
+        userId: UID, fcmToken: 'tok-1', deviceId: 'dev-1', platform: 'android',
       });
       expect(res).toMatchObject({ success: true, message: 'Token registrado', deviceId: 'dev-1' });
 
-      const tokenDoc = await getDoc('users/U1/fcmTokens', 'dev-1');
+      const tokenDoc = await getDoc(`users/${UID}/fcmTokens`, 'dev-1');
       expect(tokenDoc.token).toBe('tok-1');
       expect(tokenDoc.enabled).toBe(true);
     });
@@ -182,17 +182,17 @@ describe('Caracterización — cierre de cobertura Fase 0.5', () => {
   describe('disconnect', () => {
     test('al desconectar la última conexión, el usuario queda offline en Firestore', async () => {
       const s = await newSocket();
-      await s.emitWithAck('user-connected', { id: 'U1', username: 'Juan' });
+      await s.emitWithAck('user-connected', { id: UID, username: 'Juan' });
 
       // Tras user-connected el doc existe y está online
-      const online = await getDoc('users', 'U1');
+      const online = await getDoc('users', UID);
       expect(online.isOnline).toBe(true);
 
       s.close();
 
       // disconnect es asíncrono → poll hasta isOnline=false
       const offline = await pollUntil(async () => {
-        const doc = await getDoc('users', 'U1');
+        const doc = await getDoc('users', UID);
         return doc && doc.isOnline === false ? doc : null;
       });
       expect(offline.isOnline).toBe(false);

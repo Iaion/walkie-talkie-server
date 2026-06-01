@@ -58,4 +58,19 @@ async function getAdminIdToken() {
   return refreshIdToken(refreshToken);
 }
 
-module.exports = { getIdToken, getIdTokenWithUid, getAdminIdToken };
+/**
+ * Mintea un ID token con un uid ESPECÍFICO (para tests de autorización por-usuario en sockets:
+ * el evento manda userId='U1' y el socket debe conectarse con un token cuyo uid sea 'U1').
+ * Vía custom token (firmado con la service account) → signInWithCustomToken en el emulador.
+ */
+async function getIdTokenForUid(uid, claims) {
+  const customToken = await firebaseAdmin().auth().createCustomToken(uid, claims || {});
+  const res = await fetch(
+    `${AUTH_HOST}/identitytoolkit.googleapis.com/v1/accounts:signInWithCustomToken?key=fake-api-key`,
+    { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token: customToken, returnSecureToken: true }) },
+  );
+  if (!res.ok) throw new Error(`signInWithCustomToken falló: ${res.status} ${await res.text()}`);
+  return (await res.json()).idToken;
+}
+
+module.exports = { getIdToken, getIdTokenWithUid, getIdTokenForUid, getAdminIdToken };

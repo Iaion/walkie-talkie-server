@@ -57,6 +57,21 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayDisconnect {
     });
   }
 
+  /**
+   * Autorización por-usuario en sockets: el id "propio" del evento (id/userId/helperId) debe
+   * coincidir con el uid del token del handshake. Cierra el spoofing de identidad heredado del
+   * prototipo (el server confiaba en el userId del payload). El admin queda exento.
+   * Se invoca SOLO después de validar que el campo está presente (para preservar los acks de
+   * "datos inválidos" cuando el id falta).
+   */
+  private notSelf(socket: Socket, claimedId: string | undefined): boolean {
+    const uid = (socket as any).user?.uid;
+    const isAdmin = (socket as any).user?.role === 'admin';
+    if (isAdmin) return false;
+    return !claimedId || claimedId !== uid;
+  }
+  private readonly FORBIDDEN_ACK = { success: false, message: 'No autorizado: el identificador no coincide con tu sesión' };
+
   /** Emite la lista de usuarios de una sala (equivalente a utils.updateRoomUserList). */
   private updateRoomUserList(roomId: string): void {
     const room = this.state.chatRooms.get(roomId);
@@ -90,6 +105,7 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayDisconnect {
     }
     const userId = String(user.id).trim();
     if (!userId) return { success: false, message: '⚠️ userId vacío' };
+    if (this.notSelf(socket, userId)) return this.FORBIDDEN_ACK;
 
     const safeUsername =
       (typeof user.username === 'string' && user.username.trim()) ||
@@ -194,6 +210,7 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayDisconnect {
       const { roomId } = data;
       const userId = data.userId || (socket as any).userId;
       if (!roomId || !userId) return { success: false, message: 'roomId y userId son requeridos' };
+      if (data.userId && this.notSelf(socket, data.userId)) return this.FORBIDDEN_ACK;
 
       const targetRoom = this.state.chatRooms.get(roomId);
       if (!targetRoom) return { success: false, message: `Sala ${roomId} no encontrada` };
@@ -249,6 +266,7 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayDisconnect {
       const { roomId } = data;
       const userId = data.userId || (socket as any).userId;
       if (!roomId) return { success: false, message: '❌ Sala no especificada' };
+      if (data.userId && this.notSelf(socket, data.userId)) return this.FORBIDDEN_ACK;
 
       const room = this.state.chatRooms.get(roomId);
       if (!room) return { success: false, message: 'Sala no encontrada' };
@@ -282,6 +300,7 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayDisconnect {
     const roomId = data.roomId || (socket as any).currentRoom || 'general';
 
     if (!userId || !username || !text) return { success: false, message: '❌ Datos de mensaje inválidos' };
+    if (this.notSelf(socket, userId)) return this.FORBIDDEN_ACK;
     if (!(socket as any).currentRoom || !this.state.chatRooms.has(roomId)) {
       return { success: false, message: '❌ No estás en una sala válida' };
     }
@@ -335,12 +354,13 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayDisconnect {
   // ============================================================
 
   @SubscribeMessage('update_location')
-  async updateLocation(@MessageBody() data: Record<string, any> = {}) {
+  async updateLocation(@ConnectedSocket() socket: Socket, @MessageBody() data: Record<string, any> = {}) {
     try {
       const { userId, lat, lng, timestamp } = data;
       if (!userId || typeof lat !== 'number' || typeof lng !== 'number') {
         return { success: false, message: 'Datos inválidos' };
       }
+      if (this.notSelf(socket, userId)) return this.FORBIDDEN_ACK;
       const entry = this.state.connectedUsers.get(userId);
       if (!entry) return { success: false, message: 'Usuario no conectado' };
       const loc = { lat, lng, ts: typeof timestamp === 'number' ? timestamp : Date.now() };
@@ -361,6 +381,7 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayDisconnect {
       if (!roomId || !userId || typeof lat !== 'number' || typeof lng !== 'number') {
         return { success: false, message: 'Datos de ubicación inválidos' };
       }
+      if (this.notSelf(socket, userId)) return this.FORBIDDEN_ACK;
       if (userId !== String(roomId).replace('emergencia_', '')) {
         return { success: false, message: 'Solo la víctima puede actualizar ubicación de emergencia' };
       }
@@ -396,6 +417,7 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayDisconnect {
       if (!roomId || !helperId || typeof lat !== 'number' || typeof lng !== 'number') {
         return { success: false, message: 'Datos de ubicación inválidos' };
       }
+      if (this.notSelf(socket, helperId)) return this.FORBIDDEN_ACK;
       if (!String(roomId).startsWith('emergencia_')) {
         return { success: false, message: 'Solo para salas de emergencia' };
       }
@@ -496,6 +518,7 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayDisconnect {
     try {
       const { roomId, helperId, isDriving, emergencyUserId } = data;
       if (!roomId || !helperId) return;
+      if (this.notSelf(socket, helperId)) return;
       if (emergencyUserId) {
         this.server.to(emergencyUserId).emit('helper_driving_update', { helperId, isDriving, timestamp: Date.now() });
       }
@@ -519,6 +542,7 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayDisconnect {
       reqUserId = userId || null;
 
       if (!userId || !userName) return { success: false, code: 'INVALID_DATA', message: 'Datos de usuario inválidos' };
+      if (this.notSelf(socket, userId)) return { success: false, code: 'FORBIDDEN', message: 'No autorizado: solo podés disparar tu propia emergencia' };
       if (typeof latitude !== 'number' || typeof longitude !== 'number') {
         return { success: false, code: 'INVALID_LOCATION', message: 'Ubicación inválida' };
       }
@@ -638,10 +662,11 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayDisconnect {
   }
 
   @SubscribeMessage('help_confirm')
-  helpConfirm(@MessageBody() data: Record<string, any> = {}) {
+  helpConfirm(@ConnectedSocket() socket: Socket, @MessageBody() data: Record<string, any> = {}) {
     try {
       const { emergencyUserId, helperId, helperName, latitude, longitude, timestamp } = data;
       if (!emergencyUserId || !helperId) return { success: false, message: 'Datos incompletos' };
+      if (this.notSelf(socket, helperId)) return this.FORBIDDEN_ACK;
       const helpers = this.state.emergencyHelpers.get(emergencyUserId);
       if (helpers) helpers.add(helperId);
       this.server.to(emergencyUserId).emit('help_confirmed', {
@@ -655,10 +680,11 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayDisconnect {
   }
 
   @SubscribeMessage('help_reject')
-  helpReject(@MessageBody() data: Record<string, any> = {}) {
+  helpReject(@ConnectedSocket() socket: Socket, @MessageBody() data: Record<string, any> = {}) {
     try {
       const { emergencyUserId, helperId } = data;
       if (!emergencyUserId || !helperId) return { success: false, message: 'Datos incompletos' };
+      if (this.notSelf(socket, helperId)) return this.FORBIDDEN_ACK;
       const helpers = this.state.emergencyHelpers.get(emergencyUserId);
       if (helpers) helpers.delete(helperId);
       this.server.to(helperId).emit('help_rejected', { emergencyUserId, helperId, timestamp: Date.now() });
@@ -673,6 +699,7 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayDisconnect {
     try {
       const { userId, reason = 'resolved_by_user' } = data;
       if (!userId) return { success: false, message: 'userId requerido' };
+      if (this.notSelf(socket, userId)) return this.FORBIDDEN_ACK;
       if (this.resolveInProgress.has(userId)) return { success: true, message: 'Resolución ya en progreso' };
       this.resolveInProgress.add(userId);
 
@@ -762,10 +789,11 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayDisconnect {
   }
 
   @SubscribeMessage('update_profile')
-  async updateProfile(@MessageBody() data: Record<string, any> = {}) {
+  async updateProfile(@ConnectedSocket() socket: Socket, @MessageBody() data: Record<string, any> = {}) {
     try {
       const { userId, fullName = '', username = '', email = '', phone = '', avatarUri = '' } = data;
       if (!userId) return { success: false, message: 'userId requerido' };
+      if (this.notSelf(socket, userId)) return this.FORBIDDEN_ACK;
 
       const prevSnap = await this.firebase.firestore.collection('users').doc(userId).get();
       const prevData = prevSnap.exists ? (prevSnap.data() || {}) : {};
@@ -823,6 +851,7 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayDisconnect {
     try {
       const { userId, fcmToken, deviceId, platform, deviceModel } = data;
       if (!userId || !fcmToken) return { success: false, message: 'userId y fcmToken requeridos' };
+      if (this.notSelf(socket, userId)) return this.FORBIDDEN_ACK;
 
       const uniqueDeviceId = (typeof deviceId === 'string' && deviceId.trim().length > 0)
         ? deviceId.trim()
@@ -853,6 +882,7 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayDisconnect {
       const { userId, username } = data;
       const roomId = data.roomId || (socket as any).currentRoom || 'general';
       if (!userId || !username) return { success: false, message: '❌ userId/username inválidos' };
+      if (this.notSelf(socket, userId)) return this.FORBIDDEN_ACK;
       if (!this.state.chatRooms.has(roomId)) return { success: false, message: '❌ No estás en una sala válida' };
 
       let finalAudioUrl: string | null = data.audioUrl || null;
