@@ -70,4 +70,13 @@ async function getDoc(collection, id) {
   return fromFirestoreFields(doc.fields || {});
 }
 
-module.exports = { clearFirestore, setDoc, getDoc };
+/** Lista los documentos de una colección (vía owner). Devuelve un array de objetos JS planos. */
+async function listDocs(collection) {
+  const res = await fetch(`${DOCS}/${collection}`, { headers: OWNER });
+  if (res.status === 404) return [];
+  if (!res.ok) throw new Error(`listDocs(${collection}) falló: ${res.status} ${await res.text()}`);
+  const data = await res.json();
+  return (data.documents || []).map((d) => fromFirestoreFields(d.fields || {}));
+}
+
+module.exports = { clearFirestore, setDoc, getDoc, listDocs };

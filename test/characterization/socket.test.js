@@ -9,7 +9,7 @@
  * en beforeEach lo resetea, garantizando aislamiento entre tests.
  */
 const { io } = require('socket.io-client');
-const { clearFirestore } = require('../setup/emulator');
+const { clearFirestore, listDocs } = require('../setup/emulator');
 const { startServer, stopServer } = require('../setup/server');
 const { getIdTokenForUid } = require('../setup/auth');
 
@@ -150,6 +150,20 @@ describe('Caracterización Socket.IO — eventos críticos del monolito', () => 
       const s = await newSocket();
       const res = await s.emitWithAck('emergency_resolve', {});
       expect(res).toMatchObject({ success: false, message: 'userId requerido' });
+    });
+  });
+
+  describe('emergency_resolve — limpieza de historial', () => {
+    // uid propio (U9) para no colisionar con el resolveInProgress (cooldown 2s) de otros tests.
+    test('borra los mensajes de la sala de emergencia al resolver', async () => {
+      const s = await newSocket('U9');
+      await s.emitWithAck('emergency_alert', { userId: 'U9', userName: 'Juan', ...COORDS });
+      const msg = await s.emitWithAck('send_message', { userId: 'U9', username: 'Juan', text: 'auxilio', roomId: 'emergencia_U9' });
+      expect(msg.success).toBe(true);
+      expect((await listDocs('messages')).length).toBeGreaterThanOrEqual(1);
+
+      await s.emitWithAck('emergency_resolve', { userId: 'U9' });
+      expect((await listDocs('messages')).length).toBe(0);
     });
   });
 

@@ -1,9 +1,11 @@
 rules_version = '2';
 
 // Reglas de seguridad de Firestore — VERSIONADAS en git (parte del plan).
-// Punto de partida (Fase 0): acceso de CLIENTES denegado por completo.
-// Todo el acceso legítimo pasa por el backend (Admin SDK), que ignora estas reglas.
-// Se afinan en Fase 1 (cerrar el agujero del cliente directo) y Fase 3 (modelo de estados/roles).
+// Acceso de CLIENTES denegado por completo. Todo el acceso legítimo pasa por el backend
+// (Admin SDK), que ignora estas reglas — incluida la autorización por-usuario (assertSelf/notSelf).
+// 2ª pasada (Fase 3, 2026-06): CONFIRMADO que el deny-all `/{document=**}` ya cubre las
+// colecciones nuevas (verifications, titular_assignments, audit_logs, users). No hace falta
+// abrir nada: el cliente nunca lee/escribe Firestore directo en el diseño server-mediated.
 service cloud.firestore {
   match /databases/{database}/documents {
     match /{document=**} {

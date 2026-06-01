@@ -19,6 +19,11 @@ export class AdminController {
     return this.service.listVerifications(status || 'pending_review');
   }
 
+  @Get('verifications/:uid/photos')
+  photos(@Param('uid') uid: string) {
+    return this.service.getVerificationPhotos(uid);
+  }
+
   @Post('verifications/:uid/approve')
   @HttpCode(200)
   approve(@Req() req: any, @Param('uid') uid: string) {

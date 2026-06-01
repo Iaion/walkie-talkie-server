@@ -4,22 +4,25 @@
  * env vars que el monolito, para que el mismo harness de tests pueda correr esta app.
  * Conecta a los emuladores cuando FIRESTORE_EMULATOR_HOST/FIREBASE_AUTH_EMULATOR_HOST están seteadas.
  *
- * Nota/deuda: el monolito guarda el JSON de la service account DENTRO de
- * GOOGLE_APPLICATION_CREDENTIALS (que estándarmente es un PATH). Se replica esa convención
- * para reusar el harness; conviene migrar a un nombre propio (ej. FIREBASE_SERVICE_ACCOUNT) más adelante.
+ * Credenciales: usa FIREBASE_SERVICE_ACCOUNT (preferido) y cae a GOOGLE_APPLICATION_CREDENTIALS
+ * por compatibilidad con el harness/monolito. El valor puede ser el JSON inline o un PATH a un
+ * archivo .json — se detecta automáticamente (el path estándar es un archivo, no el JSON crudo).
  */
 import { Injectable, OnModuleInit } from '@nestjs/common';
 import * as admin from 'firebase-admin';
+import * as fs from 'fs';
 
 @Injectable()
 export class FirebaseService implements OnModuleInit {
   onModuleInit(): void {
     if (admin.apps.length) return;
 
-    const raw = process.env.GOOGLE_APPLICATION_CREDENTIALS;
-    if (!raw) throw new Error('Falta GOOGLE_APPLICATION_CREDENTIALS (JSON de la service account)');
+    const raw = process.env.FIREBASE_SERVICE_ACCOUNT || process.env.GOOGLE_APPLICATION_CREDENTIALS;
+    if (!raw) throw new Error('Falta FIREBASE_SERVICE_ACCOUNT (o GOOGLE_APPLICATION_CREDENTIALS): JSON o path de la service account');
 
-    const serviceAccount = JSON.parse(raw);
+    // JSON inline (empieza con '{') o path a un archivo .json
+    const trimmed = raw.trim();
+    const serviceAccount = trimmed.startsWith('{') ? JSON.parse(trimmed) : JSON.parse(fs.readFileSync(trimmed, 'utf8'));
     admin.initializeApp({
       credential: admin.credential.cert(serviceAccount),
       storageBucket: process.env.FIREBASE_STORAGE_BUCKET,

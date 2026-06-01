@@ -750,6 +750,10 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayDisconnect {
         });
       } catch { /* best-effort */ }
 
+      // Borrar el historial de chat de la sala de emergencia (portado del monolito; el ack
+      // declaraba chatHistoryDeleted:true pero la limpieza no estaba migrada).
+      try { await this.deleteRoomMessages(emergencyRoomId); } catch { /* best-effort */ }
+
       this.server.to(userId).emit('emergency_fully_cleaned', { userId, roomId: emergencyRoomId, reason, timestamp: Date.now() });
       this.server.emit('user_status_changed', { userId, username, hasActiveEmergency: false, emergencyCleared: true, timestamp: Date.now() });
       this.server.emit('connected_users', Array.from(this.state.connectedUsers.values()).map((u) => ({
@@ -839,6 +843,12 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayDisconnect {
     const base64 = getBase64FromDataUrl(dataUrl);
     if (!base64) throw new Error('Data URL inválida (sin base64)');
     const buffer = Buffer.from(base64, 'base64');
+    // Cleanup de avatares anteriores (portado del monolito): borrar los del usuario antes de subir
+    // el nuevo, para no acumular basura en Storage. Best-effort (no romper el update si falla).
+    try {
+      const [oldFiles] = await this.firebase.storage.bucket().getFiles({ prefix: `avatars/${userId}/` });
+      await Promise.all(oldFiles.map((f) => f.delete().catch(() => undefined)));
+    } catch { /* best-effort */ }
     const filePath = `avatars/${userId}/${Date.now()}_${uuidv4()}.${ext}`;
     const file = this.firebase.storage.bucket().file(filePath);
     await file.save(buffer, { contentType: mime, resumable: false, metadata: { cacheControl: 'public, max-age=31536000', metadata: { userId } } });
@@ -920,6 +930,15 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayDisconnect {
     } catch {
       return { success: false, message: 'Error guardando mensaje de audio' };
     }
+  }
+
+  /** Borra todos los mensajes de una sala (limpieza de historial al resolver una emergencia). */
+  private async deleteRoomMessages(roomId: string): Promise<void> {
+    const snap = await this.firebase.firestore.collection('messages').where('roomId', '==', roomId).get();
+    if (snap.empty) return;
+    const batch = this.firebase.firestore.batch();
+    snap.docs.forEach((d) => batch.delete(d.ref));
+    await batch.commit();
   }
 
   private async saveAudio(audioDataUrl: string, userId: string, roomId: string, ext?: string): Promise<string> {

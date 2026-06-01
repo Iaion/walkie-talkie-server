@@ -82,4 +82,26 @@ describe('Admin — review de verificaciones (Fase 3)', () => {
     const res = await api('post', '/admin/verifications/NOEXISTE/approve');
     expect(res.status).toBe(404);
   });
+
+  test('admin obtiene URLs de las fotos (http pasa directo, path se firma/cae al path)', async () => {
+    await setDoc('users', 'U1', { uid: 'U1', state: 'pending_review', role: 'delivery', accountType: 'owner' });
+    await setDoc('verifications', 'U1', {
+      uid: 'U1', accountType: 'owner', status: 'pending_review', submittedAt: 1,
+      selfieUrl: 'https://cdn.example.com/selfie.jpg', // ya es URL → pasa directo
+      documentUrl: 'verifications/U1/document_123.png', // path privado → firmar o caer al path
+    });
+    const api = bearer(await getAdminIdToken());
+    const res = await api('get', '/admin/verifications/U1/photos');
+    expect(res.status).toBe(200);
+    expect(res.body.success).toBe(true);
+    expect(res.body.photos.selfieUrl).toBe('https://cdn.example.com/selfie.jpg');
+    expect(typeof res.body.photos.documentUrl).toBe('string');
+    expect(res.body.photos.documentUrl.length).toBeGreaterThan(0);
+  });
+
+  test('fotos de una verificación inexistente → 404', async () => {
+    const api = bearer(await getAdminIdToken());
+    const res = await api('get', '/admin/verifications/NOEXISTE/photos');
+    expect(res.status).toBe(404);
+  });
 });
