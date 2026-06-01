@@ -119,3 +119,21 @@ src/
 
 - Se trabaja en la rama `development`. A `master` solo llega lo sólido.
 - Migración por estrangulamiento: el monolito sigue vivo hasta que cada módulo está migrado y verificado.
+
+---
+
+## 11. Migración a NestJS (Fase 2) — convenciones y gotchas
+
+Cada módulo migrado debe **replicar EXACTAMENTE** el comportamiento del monolito (lo verifica la caracterización). Gotchas confirmados:
+
+- **POST devuelve 201 por defecto en NestJS**; el monolito devuelve 200 (`res.json()`). Usar **`@HttpCode(200)`** en los handlers POST para igualar el contrato.
+- **Errores con shape `{ success:false, message }`**: lanzar las HttpException con un OBJETO, no string → `throw new NotFoundException({ success:false, message:'...' })`. Pasar un objeto hace que el body sea EXACTAMENTE ese objeto (un string lo envuelve en `{statusCode,error,message}`).
+- **`ignoreUndefinedProperties: true`** se setea en `FirebaseService` (igual que el monolito) → escribir undefined no rompe.
+- **Estructura del módulo:** controller (recibe/delega) → service (lógica) → repository (Firestore). El service no toca `db.collection()` directo.
+
+**Cómo correr la caracterización contra NestJS (no contra el monolito):**
+1. `npm run build` (compila a `dist/`).
+2. En PowerShell: `$env:SERVER_ENTRY = "dist/main.js"` + prependear `node_modules\.bin` al PATH.
+3. `firebase emulators:exec --project alrescate-dev "jest --runInBand --forceExit -t /<filtro>"` (ej. `-t /vehicles` corre solo los tests de ese módulo).
+   - El harness (`test/setup/server.js`) respeta `SERVER_ENTRY`; sin él corre el monolito (`server.js`).
+   - Jest 30: el filtro por archivo es posicional (`jest <patrón>`), NO `--testPathPattern`.
