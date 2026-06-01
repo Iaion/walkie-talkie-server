@@ -6,7 +6,7 @@
 const request = require('supertest');
 const { io } = require('socket.io-client');
 const { startServer, stopServer } = require('../setup/server');
-const { getIdToken } = require('../setup/auth');
+const { getIdToken, getIdTokenWithUid } = require('../setup/auth');
 
 const URL = 'http://127.0.0.1:8080';
 
@@ -31,9 +31,9 @@ describe('Seguridad (Fase 1) — autenticación', () => {
       expect(res.status).toBe(401);
     });
 
-    test('endpoint protegido con token válido → pasa (200)', async () => {
-      const token = await getIdToken();
-      const res = await request(URL).get('/vehicles/U1').set('Authorization', `Bearer ${token}`);
+    test('endpoint protegido con token válido (sobre datos propios) → pasa (200)', async () => {
+      const { token, uid } = await getIdTokenWithUid();
+      const res = await request(URL).get(`/vehicles/${uid}`).set('Authorization', `Bearer ${token}`);
       expect(res.status).toBe(200);
     });
   });

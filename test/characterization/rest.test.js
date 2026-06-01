@@ -7,9 +7,10 @@
 const request = require('supertest');
 const { clearFirestore, setDoc } = require('../setup/emulator');
 const { startServer, stopServer } = require('../setup/server');
-const { getIdToken } = require('../setup/auth');
+const { getIdTokenWithUid } = require('../setup/auth');
 
 let TOKEN;
+let UID; // uid del token: con autorización por-usuario, el userId de la ruta debe ser el propio
 const api = () => {
   const r = request('http://127.0.0.1:8080');
   const auth = (req) => req.set('Authorization', `Bearer ${TOKEN}`);
@@ -17,7 +18,7 @@ const api = () => {
 };
 
 describe('Caracterización REST — monolito actual', () => {
-  beforeAll(async () => { await startServer(); TOKEN = await getIdToken(); });
+  beforeAll(async () => { await startServer(); const t = await getIdTokenWithUid(); TOKEN = t.token; UID = t.uid; });
   afterAll(stopServer);
 
   beforeEach(async () => {
@@ -50,29 +51,29 @@ describe('Caracterización REST — monolito actual', () => {
 
   describe('GET /vehicles/:userId (lee de Firestore vía emulador)', () => {
     test('sin vehículos → {success:true, vehicles:[], count:0}', async () => {
-      const res = await api().get('/vehicles/NOEXISTE');
+      const res = await api().get(`/vehicles/${UID}`);
       expect(res.status).toBe(200);
       expect(res.body).toEqual({ success: true, vehicles: [], count: 0 });
     });
 
     test('devuelve solo los vehículos activos del usuario, mapeados', async () => {
       await setDoc('vehicles', 'veh-activo', {
-        userId: 'U1', isActive: true, isPrimary: true, type: 'CAR', name: 'Auto Test', brand: 'Toyota',
+        userId: UID, isActive: true, isPrimary: true, type: 'CAR', name: 'Auto Test', brand: 'Toyota',
       });
       await setDoc('vehicles', 'veh-inactivo', {
-        userId: 'U1', isActive: false, type: 'CAR', name: 'Viejo',
+        userId: UID, isActive: false, type: 'CAR', name: 'Viejo',
       });
       await setDoc('vehicles', 'veh-otro-user', {
         userId: 'U2', isActive: true, type: 'MOTORCYCLE', name: 'De otro',
       });
 
-      const res = await api().get('/vehicles/U1');
+      const res = await api().get(`/vehicles/${UID}`);
       expect(res.status).toBe(200);
       expect(res.body.success).toBe(true);
       expect(res.body.count).toBe(1);
       expect(res.body.vehicles[0]).toMatchObject({
         id: 'veh-activo',
-        userId: 'U1',
+        userId: UID,
         name: 'Auto Test',
         brand: 'Toyota',
         type: 'CAR',

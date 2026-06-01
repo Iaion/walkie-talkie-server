@@ -8,10 +8,11 @@ const request = require('supertest');
 const { io } = require('socket.io-client');
 const { clearFirestore, setDoc, getDoc } = require('../setup/emulator');
 const { startServer, stopServer } = require('../setup/server');
-const { getIdToken } = require('../setup/auth');
+const { getIdTokenWithUid } = require('../setup/auth');
 
 const URL = 'http://127.0.0.1:8080';
 let TOKEN;
+let UID; // con autorización por-usuario, el userId de las rutas REST de vehículos debe ser el del token
 const api = () => {
   const r = request(URL);
   const auth = (req) => req.set('Authorization', `Bearer ${TOKEN}`);
@@ -42,7 +43,7 @@ async function pollUntil(fn, { timeoutMs = 5000, intervalMs = 150 } = {}) {
 
 describe('Caracterización — cierre de cobertura Fase 0.5', () => {
   let sockets = [];
-  beforeAll(async () => { await startServer(); TOKEN = await getIdToken(); });
+  beforeAll(async () => { await startServer(); const t = await getIdTokenWithUid(); TOKEN = t.token; UID = t.uid; });
   afterAll(stopServer);
   beforeEach(async () => { await clearFirestore(); });
   afterEach(() => { sockets.forEach((s) => s.close()); sockets = []; });
@@ -55,44 +56,46 @@ describe('Caracterización — cierre de cobertura Fase 0.5', () => {
 
   describe('GET /vehicles/:userId/:vehicleId', () => {
     test('inexistente → 404', async () => {
-      const res = await api().get('/vehicles/U1/no-existe');
+      const res = await api().get(`/vehicles/${UID}/no-existe`);
       expect(res.status).toBe(404);
       expect(res.body).toEqual({ success: false, message: 'Vehículo no encontrado' });
     });
 
+    // Path = uid propio (pasa authz), pero el vehículo es de OTRO → check interno del handler.
     test('de otro usuario → 403', async () => {
-      await setDoc('vehicles', 'veh-1', { userId: 'U1', type: 'CAR', isActive: true });
-      const res = await api().get('/vehicles/OTRO/veh-1');
+      await setDoc('vehicles', 'veh-1', { userId: 'OTHER', type: 'CAR', isActive: true });
+      const res = await api().get(`/vehicles/${UID}/veh-1`);
       expect(res.status).toBe(403);
       expect(res.body).toEqual({ success: false, message: 'No tienes permisos para acceder a este vehículo' });
     });
 
     test('propio → success con el vehículo', async () => {
-      await setDoc('vehicles', 'veh-1', { userId: 'U1', type: 'CAR', name: 'Auto', isActive: true });
-      const res = await api().get('/vehicles/U1/veh-1');
+      await setDoc('vehicles', 'veh-1', { userId: UID, type: 'CAR', name: 'Auto', isActive: true });
+      const res = await api().get(`/vehicles/${UID}/veh-1`);
       expect(res.status).toBe(200);
       expect(res.body.success).toBe(true);
-      expect(res.body.vehicle).toMatchObject({ id: 'veh-1', userId: 'U1', name: 'Auto', type: 'CAR' });
+      expect(res.body.vehicle).toMatchObject({ id: 'veh-1', userId: UID, name: 'Auto', type: 'CAR' });
     });
   });
 
   describe('POST /vehicles (modo actualización con id)', () => {
     test('id inexistente → 404', async () => {
-      const res = await api().post('/vehicles').send({ id: 'no-existe', userId: 'U1', type: 'CAR' });
+      const res = await api().post('/vehicles').send({ id: 'no-existe', userId: UID, type: 'CAR' });
       expect(res.status).toBe(404);
       expect(res.body).toEqual({ success: false, message: 'Vehículo no encontrado' });
     });
 
+    // Body.userId = uid propio (pasa authz), pero el vehículo es de OTRO → check interno del handler.
     test('de otro usuario → 403', async () => {
-      await setDoc('vehicles', 'veh-1', { userId: 'U1', type: 'CAR', isActive: true });
-      const res = await api().post('/vehicles').send({ id: 'veh-1', userId: 'OTRO', type: 'CAR' });
+      await setDoc('vehicles', 'veh-1', { userId: 'OTHER', type: 'CAR', isActive: true });
+      const res = await api().post('/vehicles').send({ id: 'veh-1', userId: UID, type: 'CAR' });
       expect(res.status).toBe(403);
       expect(res.body).toEqual({ success: false, message: 'No tienes permisos para editar este vehículo' });
     });
 
     test('propio → actualiza', async () => {
-      await setDoc('vehicles', 'veh-1', { userId: 'U1', type: 'CAR', name: 'viejo', isActive: true });
-      const res = await api().post('/vehicles').send({ id: 'veh-1', userId: 'U1', type: 'CAR', name: 'nuevo' });
+      await setDoc('vehicles', 'veh-1', { userId: UID, type: 'CAR', name: 'viejo', isActive: true });
+      const res = await api().post('/vehicles').send({ id: 'veh-1', userId: UID, type: 'CAR', name: 'nuevo' });
       expect(res.status).toBe(200);
       expect(res.body.success).toBe(true);
       expect(res.body.message).toBe('Vehículo actualizado');
@@ -102,25 +105,26 @@ describe('Caracterización — cierre de cobertura Fase 0.5', () => {
 
   describe('POST /vehicles/photo (Storage emulador)', () => {
     test('datos inválidos → 400', async () => {
-      const res = await api().post('/vehicles/photo').send({ userId: 'U1', vehicleId: 'veh-1', imageData: 'no-es-dataurl' });
+      const res = await api().post('/vehicles/photo').send({ userId: UID, vehicleId: 'veh-1', imageData: 'no-es-dataurl' });
       expect(res.status).toBe(400);
       expect(res.body).toEqual({ success: false, message: 'Datos inválidos: userId, vehicleId e imageData son requeridos' });
     });
 
     test('vehículo inexistente → 404', async () => {
-      const res = await api().post('/vehicles/photo').send({ userId: 'U1', vehicleId: 'no-existe', imageData: PNG_DATA_URL });
+      const res = await api().post('/vehicles/photo').send({ userId: UID, vehicleId: 'no-existe', imageData: PNG_DATA_URL });
       expect(res.status).toBe(404);
     });
 
+    // Body.userId = uid propio (pasa authz), pero el vehículo es de OTRO → check interno del handler.
     test('de otro usuario → 403', async () => {
-      await setDoc('vehicles', 'veh-1', { userId: 'U1', type: 'CAR', isActive: true });
-      const res = await api().post('/vehicles/photo').send({ userId: 'OTRO', vehicleId: 'veh-1', imageData: PNG_DATA_URL });
+      await setDoc('vehicles', 'veh-1', { userId: 'OTHER', type: 'CAR', isActive: true });
+      const res = await api().post('/vehicles/photo').send({ userId: UID, vehicleId: 'veh-1', imageData: PNG_DATA_URL });
       expect(res.status).toBe(403);
     });
 
     test('válido → sube a Storage y devuelve url', async () => {
-      await setDoc('vehicles', 'veh-1', { userId: 'U1', type: 'CAR', isActive: true });
-      const res = await api().post('/vehicles/photo').send({ userId: 'U1', vehicleId: 'veh-1', imageData: PNG_DATA_URL });
+      await setDoc('vehicles', 'veh-1', { userId: UID, type: 'CAR', isActive: true });
+      const res = await api().post('/vehicles/photo').send({ userId: UID, vehicleId: 'veh-1', imageData: PNG_DATA_URL });
       expect(res.status).toBe(200);
       expect(res.body.success).toBe(true);
       expect(typeof res.body.url).toBe('string');
