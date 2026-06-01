@@ -6,7 +6,8 @@
 const request = require('supertest');
 const { clearFirestore, setDoc } = require('../setup/emulator');
 const { startServer, stopServer } = require('../setup/server');
-const { getIdToken } = require('../setup/auth');
+const { getIdToken, getIdTokenWithUid } = require('../setup/auth');
+const { getDoc } = require('../setup/emulator');
 
 const URL = 'http://127.0.0.1:8080';
 
@@ -86,5 +87,43 @@ describe('Verificación (Fase 3)', () => {
     const api = await authed();
     const res = await api('post', '/verification').send(renterBody());
     expect(res.body.flags.map((f) => f.code)).toContain('TITULAR_OVER_LIMIT');
+  });
+
+  describe('POST /verification/change-titular', () => {
+    test('sin datos → 400', async () => {
+      const api = await authed();
+      const res = await api('post', '/verification/change-titular').send({});
+      expect(res.status).toBe(400);
+    });
+
+    test('válido → pending_review y cierra la asignación activa anterior', async () => {
+      const { token, uid } = await getIdTokenWithUid();
+      await setDoc('titular_assignments', 'old1', { renterUid: uid, titularAccountId: 'OLD', status: 'active', startedAt: 1 });
+      const res = await request(URL).post('/verification/change-titular')
+        .set('Authorization', `Bearer ${token}`)
+        .send({ deliveryAppScreenshotUrl: 'https://x/new.jpg', titular: { name: 'Nuevo', document: '111', accountId: 'NEW' } });
+      expect(res.status).toBe(200);
+      expect(res.body).toMatchObject({ success: true, state: 'pending_review' });
+      const old = await getDoc('titular_assignments', 'old1');
+      expect(old.status).toBe('ended');
+    });
+  });
+
+  describe('POST /verification/photo', () => {
+    const PNG = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
+
+    test('tipo de foto inválido → 400', async () => {
+      const api = await authed();
+      const res = await api('post', '/verification/photo').send({ type: 'foo', imageData: PNG });
+      expect(res.status).toBe(400);
+    });
+
+    test('foto válida → sube (privada) y devuelve el path', async () => {
+      const api = await authed();
+      const res = await api('post', '/verification/photo').send({ type: 'document', imageData: PNG });
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+      expect(res.body.path).toMatch(/^verifications\/.+\/document_\d+\.png$/);
+    });
   });
 });

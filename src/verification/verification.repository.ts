@@ -118,4 +118,42 @@ export class VerificationRepository {
   async writeAuditLog(entry: Record<string, any>): Promise<void> {
     await this.auditLogs.add({ ...entry, timestamp: entry.timestamp || Date.now() });
   }
+
+  // ===== Cambio de titular =====
+
+  async getActiveAssignmentForRenter(renterUid: string): Promise<Record<string, any> | null> {
+    const snap = await this.assignments
+      .where('renterUid', '==', renterUid)
+      .where('status', '==', 'active')
+      .limit(1)
+      .get();
+    return snap.empty ? null : { id: snap.docs[0].id, ...(snap.docs[0].data() as Record<string, any>) };
+  }
+
+  /** Cuántas asignaciones declaró este alquilador desde `sinceMs` (señal de cambios frecuentes). */
+  async countAssignmentsSince(renterUid: string, sinceMs: number): Promise<number> {
+    const snap = await this.assignments
+      .where('renterUid', '==', renterUid)
+      .where('startedAt', '>=', sinceMs)
+      .get();
+    return snap.size;
+  }
+
+  /** Cierra la asignación activa, crea la nueva (pending) y vuelve al user a review. Atómico. */
+  async applyTitularChange(
+    uid: string,
+    oldAssignmentId: string | null,
+    newAssignment: Record<string, any>,
+    verificationPatch: Record<string, any>,
+    userPatch: Record<string, any>,
+  ): Promise<void> {
+    const batch = this.firebase.firestore.batch();
+    if (oldAssignmentId) {
+      batch.set(this.assignments.doc(oldAssignmentId), { status: 'ended', endedAt: Date.now() }, { merge: true });
+    }
+    batch.set(this.assignments.doc(newAssignment.id), newAssignment);
+    batch.set(this.verifications.doc(uid), verificationPatch, { merge: true });
+    batch.set(this.users.doc(uid), userPatch, { merge: true });
+    await batch.commit();
+  }
 }

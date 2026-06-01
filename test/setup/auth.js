@@ -24,6 +24,11 @@ async function getIdToken() {
   return (await signUp()).idToken;
 }
 
+async function getIdTokenWithUid() {
+  const { idToken, localId } = await signUp();
+  return { token: idToken, uid: localId };
+}
+
 async function refreshIdToken(refreshToken) {
   const res = await fetch(
     `${AUTH_HOST}/securetoken.googleapis.com/v1/token?key=fake-api-key`,
@@ -53,4 +58,4 @@ async function getAdminIdToken() {
   return refreshIdToken(refreshToken);
 }
 
-module.exports = { getIdToken, getAdminIdToken };
+module.exports = { getIdToken, getIdTokenWithUid, getAdminIdToken };

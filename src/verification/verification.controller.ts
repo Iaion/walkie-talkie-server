@@ -21,4 +21,16 @@ export class VerificationController {
   submit(@Req() req: any, @Body() body: VerificationSubmission) {
     return this.service.submit(req.user.uid, req.user.email, body);
   }
+
+  @Post('change-titular')
+  @HttpCode(200)
+  changeTitular(@Req() req: any, @Body() body: any) {
+    return this.service.changeTitular(req.user.uid, body);
+  }
+
+  @Post('photo')
+  @HttpCode(200)
+  uploadPhoto(@Req() req: any, @Body() body: { type: string; imageData: string }) {
+    return this.service.uploadPhoto(req.user.uid, body?.type, body?.imageData);
+  }
 }
