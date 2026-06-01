@@ -20,6 +20,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { FirebaseService } from '../firebase/firebase.service';
 import { NotificationsService } from '../notifications/notifications.service';
 import { StateStore } from './state.store';
+import { EmergencyService } from './emergency.service';
 
 @WebSocketGateway({
   cors: { origin: '*', methods: ['GET', 'POST'] },
@@ -30,10 +31,14 @@ import { StateStore } from './state.store';
 export class RealtimeGateway implements OnGatewayInit {
   @WebSocketServer() server: Server;
 
+  // Anti-loop de resoluciones (equivalente a global.resolveInProgress del monolito).
+  private readonly resolveInProgress = new Set<string>();
+
   constructor(
     private readonly state: StateStore,
     private readonly firebase: FirebaseService,
     private readonly notifications: NotificationsService,
+    private readonly emergency: EmergencyService,
   ) {}
 
   afterInit(server: Server): void {
@@ -495,6 +500,238 @@ export class RealtimeGateway implements OnGatewayInit {
       socket.to(roomId).emit('helper_driving_update', { helperId, isDriving, timestamp: Date.now() });
     } catch {
       // fire-and-forget
+    }
+  }
+
+  // ============================================================
+  // 🚨 NÚCLEO DE PÁNICO
+  // ============================================================
+
+  @SubscribeMessage('emergency_alert')
+  async emergencyAlert(@ConnectedSocket() socket: Socket, @MessageBody() data: Record<string, any> = {}) {
+    let lockAcquired = false;
+    let reqUserId: string | null = null;
+    let emergencyRoomId: string | null = null;
+    try {
+      const { userId, userName, latitude, longitude, timestamp, emergencyType = 'general' } = data;
+      reqUserId = userId || null;
+
+      if (!userId || !userName) return { success: false, code: 'INVALID_DATA', message: 'Datos de usuario inválidos' };
+      if (typeof latitude !== 'number' || typeof longitude !== 'number') {
+        return { success: false, code: 'INVALID_LOCATION', message: 'Ubicación inválida' };
+      }
+
+      emergencyRoomId = `emergencia_${userId}`;
+      const lockResult = await this.emergency.acquireLock(userId, emergencyRoomId, emergencyType);
+      if (!lockResult.allowed) {
+        return {
+          success: false,
+          code: 'EMERGENCY_ALREADY_ACTIVE',
+          message: '⚠️ Esta es una versión de prueba. Actualmente manejamos una emergencia a la vez, y ya hay una en curso. Volvé a intentarlo más tarde.',
+          activeEmergency: lockResult.activeEmergency,
+        };
+      }
+      lockAcquired = true;
+
+      socket.join(emergencyRoomId);
+      (socket as any).currentRoom = emergencyRoomId;
+
+      let avatarUrl: string | null = null;
+      try {
+        const userDoc = await this.firebase.firestore.collection('users').doc(userId).get();
+        if (userDoc.exists) { const ud = userDoc.data() || {}; avatarUrl = ud.avatarUrl || ud.avatarUri || null; }
+      } catch { /* best-effort */ }
+
+      let vehicleData: Record<string, any> | null = null;
+      try {
+        const vs = await this.firebase.firestore.collection('vehicles')
+          .where('userId', '==', userId).where('isPrimary', '==', true).where('isActive', '==', true).limit(1).get();
+        if (!vs.empty) {
+          const v = vs.docs[0].data() || {};
+          const t = v.type || v.tipo || null;
+          vehicleData = {
+            id: vs.docs[0].id, type: t,
+            name: v.name || v.nombre || null, brand: v.brand || v.marca || null, model: v.model || v.modelo || null,
+            year: v.year || null, color: v.color || null, licensePlate: v.licensePlate || v.patente || null,
+            photoUri: v.photoUri || v.fotoVehiculoUri || null,
+            ...(t === 'CAR' && { doors: v.doors }),
+            ...(t === 'MOTORCYCLE' && { cylinderCapacity: v.cylinderCapacity, mileage: v.mileage }),
+            ...(t === 'BICYCLE' && { frameSerialNumber: v.frameSerialNumber, hasElectricMotor: v.hasElectricMotor, frameSize: v.frameSize }),
+          };
+        }
+      } catch { /* best-effort */ }
+
+      const emergencyData: Record<string, any> = {
+        userId, userName, avatarUrl, latitude, longitude,
+        timestamp: typeof timestamp === 'number' ? timestamp : Date.now(),
+        socketId: socket.id, emergencyType, status: 'active', emergencyRoomId, roomId: emergencyRoomId, vehicleInfo: vehicleData,
+      };
+      this.state.emergencyAlerts.set(userId, emergencyData);
+      if (!this.state.emergencyHelpers.has(userId)) this.state.emergencyHelpers.set(userId, new Set());
+
+      try {
+        await this.firebase.firestore.collection('emergencies').doc(userId).set({ ...emergencyData, isActive: true, createdAt: Date.now() }, { merge: true });
+        await this.firebase.firestore.collection('users').doc(userId).update({ hasActiveEmergency: true, emergencyRoomId, lastEmergencyStarted: Date.now() });
+      } catch { /* best-effort */ }
+
+      const emergencyRoom = {
+        id: emergencyRoomId, name: `Emergencia ${userName}`, type: 'emergency',
+        description: `Sala de emergencia para ${userName}`, users: new Set<string>([userId]),
+        createdAt: Date.now(), messageCount: 0,
+      } as any;
+      this.state.chatRooms.set(emergencyRoomId, emergencyRoom);
+      this.state.emergencyUserRoom.set(userId, emergencyRoomId);
+
+      socket.emit('emergency_room_created', { emergencyUserId: userId, emergencyRoomId });
+      this.server.emit('new_room_created', {
+        id: emergencyRoom.id, name: emergencyRoom.name, type: emergencyRoom.type, description: emergencyRoom.description,
+        userCount: emergencyRoom.users.size, messageCount: emergencyRoom.messageCount, createdAt: emergencyRoom.createdAt,
+      });
+
+      // Broadcast a sockets conectados
+      let socketNotifications = 0;
+      const notifiedUsers = new Set<string>();
+      for (const [sid, s] of this.server.sockets.sockets) {
+        if (sid === socket.id) continue;
+        if ((s as any).userId && (s as any).userId === userId) continue;
+        this.server.to(sid).emit('emergency_alert', { ...emergencyData, emergencyRoomId });
+        socketNotifications++;
+        if ((s as any).userId) notifiedUsers.add((s as any).userId);
+      }
+
+      // Push a los no notificados por socket (best-effort)
+      let pushNotifications = 0;
+      try {
+        const usersSnap = await this.firebase.firestore.collection('users').get();
+        for (const doc of usersSnap.docs) {
+          const targetUserId = doc.id;
+          if (targetUserId === userId) continue;
+          if (notifiedUsers.has(targetUserId)) continue;
+          const ok = await this.notifications.sendPushNotification(targetUserId, '🚨 EMERGENCIA', `${userName} necesita ayuda`, {
+            emergency_user_id: userId, emergency_user_name: userName,
+            emergency_latitude: latitude, emergency_longitude: longitude,
+            emergency_avatar_url: avatarUrl || '', emergency_room_id: emergencyRoomId,
+          });
+          if (ok) pushNotifications++;
+        }
+      } catch { /* best-effort */ }
+
+      return {
+        success: true, message: 'Alerta de emergencia enviada correctamente',
+        vehicle: vehicleData, avatarUrl, socketNotifications, pushNotifications,
+        emergencyRoomId, staleReplaced: !!lockResult.staleReplaced,
+      };
+    } catch {
+      if (lockAcquired) {
+        try {
+          await this.emergency.releaseLock({
+            userId: reqUserId,
+            roomId: emergencyRoomId || (reqUserId ? `emergencia_${reqUserId}` : null),
+            reason: 'error_during_emergency',
+          });
+        } catch { /* rollback best-effort */ }
+      }
+      return { success: false, code: 'SERVER_ERROR', message: 'Error procesando alerta de emergencia' };
+    }
+  }
+
+  @SubscribeMessage('help_confirm')
+  helpConfirm(@MessageBody() data: Record<string, any> = {}) {
+    try {
+      const { emergencyUserId, helperId, helperName, latitude, longitude, timestamp } = data;
+      if (!emergencyUserId || !helperId) return { success: false, message: 'Datos incompletos' };
+      const helpers = this.state.emergencyHelpers.get(emergencyUserId);
+      if (helpers) helpers.add(helperId);
+      this.server.to(emergencyUserId).emit('help_confirmed', {
+        emergencyUserId, helperId, helperName: helperName || 'Ayudante', latitude, longitude, timestamp: timestamp || Date.now(),
+      });
+      this.server.to(helperId).emit('help_confirmed_notification', { emergencyUserId, helperId, helperName, timestamp: Date.now() });
+      return { success: true };
+    } catch (e: any) {
+      return { success: false, message: e.message };
+    }
+  }
+
+  @SubscribeMessage('help_reject')
+  helpReject(@MessageBody() data: Record<string, any> = {}) {
+    try {
+      const { emergencyUserId, helperId } = data;
+      if (!emergencyUserId || !helperId) return { success: false, message: 'Datos incompletos' };
+      const helpers = this.state.emergencyHelpers.get(emergencyUserId);
+      if (helpers) helpers.delete(helperId);
+      this.server.to(helperId).emit('help_rejected', { emergencyUserId, helperId, timestamp: Date.now() });
+      return { success: true };
+    } catch (e: any) {
+      return { success: false, message: e.message };
+    }
+  }
+
+  @SubscribeMessage('emergency_resolve')
+  async emergencyResolve(@ConnectedSocket() socket: Socket, @MessageBody() data: Record<string, any> = {}) {
+    try {
+      const { userId, reason = 'resolved_by_user' } = data;
+      if (!userId) return { success: false, message: 'userId requerido' };
+      if (this.resolveInProgress.has(userId)) return { success: true, message: 'Resolución ya en progreso' };
+      this.resolveInProgress.add(userId);
+
+      const emergencyRoomId = this.state.emergencyUserRoom.get(userId) || `emergencia_${userId}`;
+      const emergencyData = this.state.emergencyAlerts.get(userId);
+      const username = emergencyData?.userName || (socket as any).username || 'Usuario';
+
+      // Sacar los sockets del usuario de la sala
+      const userEntry = this.state.connectedUsers.get(userId);
+      if (userEntry) {
+        userEntry.sockets.forEach((sid) => {
+          const s = this.server.sockets.sockets.get(sid);
+          if (s) {
+            if (s.rooms?.has(emergencyRoomId)) s.leave(emergencyRoomId);
+            if ((s as any).currentRoom === emergencyRoomId) (s as any).currentRoom = 'general';
+          }
+        });
+      }
+
+      try {
+        await this.emergency.releaseLock({ userId, roomId: emergencyRoomId, reason, force: true });
+      } catch { /* best-effort */ }
+
+      this.server.emit('emergency_cancelled', { userId, userName: username, username, roomId: emergencyRoomId, reason, timestamp: Date.now(), isActive: false });
+      this.server.to(emergencyRoomId).emit('emergency_resolved', { roomId: emergencyRoomId, userId, message: 'Emergencia resuelta', reason, timestamp: Date.now() });
+
+      const socketsInRoom = this.server.sockets.adapter.rooms.get(emergencyRoomId);
+      if (socketsInRoom) {
+        for (const sid of Array.from(socketsInRoom)) {
+          const s = this.server.sockets.sockets.get(sid);
+          if (s) { s.leave(emergencyRoomId); if ((s as any).userId === userId) (s as any).currentRoom = 'general'; }
+        }
+      }
+
+      this.state.chatRooms.delete(emergencyRoomId);
+      this.state.emergencyUserRoom.delete(userId);
+      this.state.emergencyAlerts.delete(userId);
+      this.state.emergencyHelpers.delete(userId);
+
+      try {
+        await this.firebase.firestore.collection('emergencies').doc(userId).update({
+          status: 'resolved', isActive: false, resolvedAt: Date.now(), endedAt: Date.now(), roomId: emergencyRoomId, endReason: reason,
+        });
+      } catch { /* best-effort */ }
+      try {
+        await this.firebase.firestore.collection('users').doc(userId).update({
+          hasActiveEmergency: false, emergencyRoomId: null, lastEmergencyEnded: Date.now(),
+        });
+      } catch { /* best-effort */ }
+
+      this.server.to(userId).emit('emergency_fully_cleaned', { userId, roomId: emergencyRoomId, reason, timestamp: Date.now() });
+      this.server.emit('user_status_changed', { userId, username, hasActiveEmergency: false, emergencyCleared: true, timestamp: Date.now() });
+      this.server.emit('connected_users', Array.from(this.state.connectedUsers.values()).map((u) => ({
+        ...u.userData, socketCount: u.sockets.size, currentRoom: u.userData.currentRoom || 'general',
+      })));
+
+      setTimeout(() => this.resolveInProgress.delete(userId), 2000);
+      return { success: true, message: 'Emergencia resuelta correctamente', emergencyRoomId, chatHistoryDeleted: true };
+    } catch (e: any) {
+      if (data?.userId) setTimeout(() => this.resolveInProgress.delete(data.userId), 2000);
+      return { success: false, message: e.message };
     }
   }
 }
