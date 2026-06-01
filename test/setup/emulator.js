@@ -42,4 +42,32 @@ async function setDoc(collection, id, data) {
   if (!res.ok) throw new Error(`setDoc(${collection}/${id}) falló: ${res.status} ${await res.text()}`);
 }
 
-module.exports = { clearFirestore, setDoc };
+/** Convierte un valor del formato REST de Firestore a JS plano. */
+function fromFirestoreValue(v) {
+  if ('stringValue' in v) return v.stringValue;
+  if ('booleanValue' in v) return v.booleanValue;
+  if ('integerValue' in v) return Number(v.integerValue);
+  if ('doubleValue' in v) return v.doubleValue;
+  if ('nullValue' in v) return null;
+  if ('timestampValue' in v) return v.timestampValue;
+  if ('arrayValue' in v) return (v.arrayValue.values || []).map(fromFirestoreValue);
+  if ('mapValue' in v) return fromFirestoreFields(v.mapValue.fields || {});
+  return v;
+}
+
+function fromFirestoreFields(fields) {
+  const out = {};
+  for (const [k, v] of Object.entries(fields)) out[k] = fromFirestoreValue(v);
+  return out;
+}
+
+/** Lee un documento del emulador (vía owner). Devuelve objeto JS plano o null si no existe. */
+async function getDoc(collection, id) {
+  const res = await fetch(`${DOCS}/${collection}/${encodeURIComponent(id)}`, { headers: OWNER });
+  if (res.status === 404) return null;
+  if (!res.ok) throw new Error(`getDoc(${collection}/${id}) falló: ${res.status} ${await res.text()}`);
+  const doc = await res.json();
+  return fromFirestoreFields(doc.fields || {});
+}
+
+module.exports = { clearFirestore, setDoc, getDoc };
