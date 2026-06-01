@@ -4,14 +4,11 @@
   "description": "Servidor AlRescate — en migración de monolito (server.js) a NestJS (src/)",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
-    "dev": "node server.js",
     "build": "nest build",
-    "start:nest": "node dist/main.js",
-    "start:nest:dev": "nest start --watch",
+    "start": "node dist/main.js",
+    "dev": "nest start --watch",
     "test": "jest --runInBand --forceExit",
-    "test:ci": "firebase emulators:exec --project alrescate-dev \"jest --runInBand --forceExit\"",
-    "test:nest": "firebase emulators:exec --project alrescate-dev \"cross-env SERVER_ENTRY=dist/main.js jest --runInBand --forceExit\""
+    "test:ci": "nest build && firebase emulators:exec --project alrescate-dev \"jest --runInBand --forceExit\""
   },
   "dependencies": {
     "@nestjs/common": "^11.0.0",

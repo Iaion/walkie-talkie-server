@@ -32,8 +32,8 @@ async function startServer() {
     PORT: String(PORT),
   };
 
-  // SERVER_ENTRY permite correr el harness contra NestJS (dist/main.js) o el monolito (server.js, default).
-  const entry = process.env.SERVER_ENTRY || 'server.js';
+  // El server activo es NestJS (dist/main.js). SERVER_ENTRY permite override (ej. para comparar con el viejo monolito).
+  const entry = process.env.SERVER_ENTRY || 'dist/main.js';
   child = spawn('node', [path.join(ROOT, entry)], { env, stdio: 'pipe' });
   let logs = '';
   child.stdout.on('data', (d) => { logs += d.toString(); });
