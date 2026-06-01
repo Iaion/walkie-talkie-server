@@ -9,8 +9,10 @@ build/
 .env
 .env.*
 !.env.example
-*-serviceAccount*.json
-serviceAccountKey.json
+secrets/
+*serviceAccount*.json
+serviceAccountKey*.json
+*firebase-adminsdk*.json
 
 # Logs
 *.log
@@ -24,6 +26,10 @@ yarn-error.log*
 coverage/
 .nyc_output/
 *.tsbuildinfo
+
+# Firebase emulator
+.firebase/
+firebase-export-*/
 
 # Editor / OS
 .idea/
