@@ -72,4 +72,50 @@ export class VerificationRepository {
     if (assignment) batch.set(this.assignments.doc(assignment.id), assignment);
     await batch.commit();
   }
+
+  // ===== Admin =====
+
+  async getVerification(uid: string): Promise<Record<string, any> | null> {
+    const d = await this.verifications.doc(uid).get();
+    return d.exists ? { uid: d.id, ...(d.data() as Record<string, any>) } : null;
+  }
+
+  /** Cola de verificaciones por estado (default: las que esperan review). */
+  async listByStatus(status: string): Promise<Record<string, any>[]> {
+    const snap = await this.verifications.where('status', '==', status).get();
+    return snap.docs.map((d) => ({ uid: d.id, ...(d.data() as Record<string, any>) }));
+  }
+
+  /** Aprobar/rechazar: actualiza estado del user y de la verification de forma atómica. */
+  async setReviewed(
+    uid: string,
+    review: { status: UserState; reviewedBy: string; rejectionReason?: string },
+  ): Promise<void> {
+    const now = Date.now();
+    const batch = this.firebase.firestore.batch();
+    batch.set(this.users.doc(uid), {
+      state: review.status, reviewedBy: review.reviewedBy, reviewedAt: now,
+      rejectionReason: review.rejectionReason || null, updatedAt: now,
+    }, { merge: true });
+    batch.set(this.verifications.doc(uid), {
+      status: review.status, reviewedBy: review.reviewedBy, reviewedAt: now,
+      rejectionReason: review.rejectionReason || null,
+    }, { merge: true });
+    await batch.commit();
+  }
+
+  /** Al aprobar un renter, su titular_assignment pendiente pasa a activa. */
+  async activateTitularAssignment(renterUid: string): Promise<void> {
+    const snap = await this.assignments
+      .where('renterUid', '==', renterUid)
+      .where('status', '==', 'pending')
+      .get();
+    const batch = this.firebase.firestore.batch();
+    snap.docs.forEach((d) => batch.set(d.ref, { status: 'active', activatedAt: Date.now() }, { merge: true }));
+    await batch.commit();
+  }
+
+  async writeAuditLog(entry: Record<string, any>): Promise<void> {
+    await this.auditLogs.add({ ...entry, timestamp: entry.timestamp || Date.now() });
+  }
 }
