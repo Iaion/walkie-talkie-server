@@ -7,8 +7,12 @@
 import { Module } from '@nestjs/common';
 import { StateStore } from './state.store';
 import { RealtimeGateway } from './realtime.gateway';
+import { UsersController } from './users.controller';
+import { RoomsController } from './rooms.controller';
+import { EmergenciesController } from './emergencies.controller';
 
 @Module({
+  controllers: [UsersController, RoomsController, EmergenciesController],
   providers: [StateStore, RealtimeGateway],
   exports: [StateStore],
 })
