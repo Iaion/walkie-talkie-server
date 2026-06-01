@@ -322,4 +322,179 @@ export class RealtimeGateway implements OnGatewayInit {
       .filter(Boolean);
     return { success: true, roomId, users: usersInRoom };
   }
+
+  // ============================================================
+  // 📍 UBICACIÓN EN TIEMPO REAL
+  // ============================================================
+
+  @SubscribeMessage('update_location')
+  async updateLocation(@MessageBody() data: Record<string, any> = {}) {
+    try {
+      const { userId, lat, lng, timestamp } = data;
+      if (!userId || typeof lat !== 'number' || typeof lng !== 'number') {
+        return { success: false, message: 'Datos inválidos' };
+      }
+      const entry = this.state.connectedUsers.get(userId);
+      if (!entry) return { success: false, message: 'Usuario no conectado' };
+      const loc = { lat, lng, ts: typeof timestamp === 'number' ? timestamp : Date.now() };
+      entry.userData.lastKnownLocation = loc;
+      await this.firebase.firestore.collection('users').doc(userId).update({
+        lastKnownLocation: loc, lastLocationUpdatedAt: Date.now(),
+      });
+      return { success: true };
+    } catch (e: any) {
+      return { success: false, message: e.message };
+    }
+  }
+
+  @SubscribeMessage('update_emergency_location')
+  async updateEmergencyLocation(@ConnectedSocket() socket: Socket, @MessageBody() data: Record<string, any> = {}) {
+    try {
+      const { roomId, userId, lat, lng, timestamp, accuracy } = data;
+      if (!roomId || !userId || typeof lat !== 'number' || typeof lng !== 'number') {
+        return { success: false, message: 'Datos de ubicación inválidos' };
+      }
+      if (userId !== String(roomId).replace('emergencia_', '')) {
+        return { success: false, message: 'Solo la víctima puede actualizar ubicación de emergencia' };
+      }
+      const entry = this.state.connectedUsers.get(userId);
+      if (entry) entry.userData.lastKnownLocation = { lat, lng, ts: timestamp || Date.now(), roomId, type: 'victim' };
+      const emergencyData = this.state.emergencyAlerts.get(userId);
+      if (emergencyData) {
+        emergencyData.latitude = lat; emergencyData.longitude = lng; emergencyData.lastLocationUpdate = timestamp || Date.now();
+      }
+      socket.to(roomId).emit('emergency_location_updated', {
+        roomId, userId, lat, lng, timestamp: timestamp || Date.now(), type: 'victim', accuracy: accuracy || null,
+      });
+      try {
+        await this.firebase.firestore.collection('emergencies').doc(userId).collection('locations').add({
+          userId, lat, lng, timestamp: timestamp || Date.now(), type: 'victim', roomId, accuracy: accuracy || null,
+        });
+        await this.firebase.firestore.collection('emergencies').doc(userId).update({
+          latitude: lat, longitude: lng, lastLocationUpdate: timestamp || Date.now(),
+        });
+      } catch {
+        // persistencia best-effort
+      }
+      return { success: true };
+    } catch (e: any) {
+      return { success: false, message: e.message };
+    }
+  }
+
+  @SubscribeMessage('update_helper_location')
+  async updateHelperLocation(@ConnectedSocket() socket: Socket, @MessageBody() data: Record<string, any> = {}) {
+    try {
+      const { roomId, helperId, emergencyUserId, lat, lng, timestamp, accuracy } = data;
+      if (!roomId || !helperId || typeof lat !== 'number' || typeof lng !== 'number') {
+        return { success: false, message: 'Datos de ubicación inválidos' };
+      }
+      if (!String(roomId).startsWith('emergencia_')) {
+        return { success: false, message: 'Solo para salas de emergencia' };
+      }
+      const victimId = emergencyUserId || String(roomId).replace('emergencia_', '');
+      const entry = this.state.connectedUsers.get(helperId);
+      if (entry) entry.userData.lastKnownLocation = { lat, lng, ts: timestamp || Date.now(), roomId, type: 'helper', helpingVictimId: victimId };
+      const helpers = this.state.emergencyHelpers.get(victimId);
+      if (helpers && !helpers.has(helperId)) helpers.add(helperId);
+
+      const payload = { roomId, helperId, victimId, lat, lng, timestamp: timestamp || Date.now(), type: 'helper', accuracy: accuracy || null };
+      socket.to(roomId).emit('helper_location_updated', payload);
+      this.server.to(victimId).emit('helper_location_updated', payload);
+
+      try {
+        await this.firebase.firestore.collection('emergencies').doc(victimId).collection('helper_locations').add({
+          helperId, lat, lng, timestamp: timestamp || Date.now(), roomId, accuracy: accuracy || null,
+        });
+        await this.firebase.firestore.collection('emergencies').doc(victimId).collection('active_helpers').doc(helperId).set({
+          helperId, lastLocation: { lat, lng }, lastLocationUpdate: timestamp || Date.now(), isActive: true,
+        }, { merge: true });
+      } catch {
+        // best-effort
+      }
+      return { success: true };
+    } catch (e: any) {
+      return { success: false, message: e.message };
+    }
+  }
+
+  @SubscribeMessage('request_victim_location')
+  async requestVictimLocation(@MessageBody() data: Record<string, any> = {}) {
+    try {
+      const { roomId, helperId, emergencyUserId } = data;
+      if (!roomId || !helperId || !emergencyUserId) return { success: false, message: 'Datos incompletos' };
+
+      const victimEntry = this.state.connectedUsers.get(emergencyUserId);
+      const emergencyData = this.state.emergencyAlerts.get(emergencyUserId);
+
+      if (victimEntry?.userData?.lastKnownLocation) {
+        const l = victimEntry.userData.lastKnownLocation;
+        this.server.to(helperId).emit('victim_location_response', { userId: emergencyUserId, lat: l.lat, lng: l.lng, timestamp: l.ts || Date.now(), roomId, type: 'victim' });
+      } else if (emergencyData?.latitude && emergencyData?.longitude) {
+        this.server.to(helperId).emit('victim_location_response', { userId: emergencyUserId, lat: emergencyData.latitude, lng: emergencyData.longitude, timestamp: emergencyData.lastLocationUpdate || emergencyData.timestamp || Date.now(), roomId, type: 'victim', fromEmergencyData: true });
+      } else {
+        try {
+          const snap = await this.firebase.firestore.collection('emergencies').doc(emergencyUserId).collection('locations').orderBy('timestamp', 'desc').limit(1).get();
+          if (!snap.empty) {
+            const lastLoc = snap.docs[0].data();
+            this.server.to(helperId).emit('victim_location_response', { userId: emergencyUserId, lat: lastLoc.lat, lng: lastLoc.lng, timestamp: lastLoc.timestamp, roomId, type: 'victim', fromFirestore: true });
+          } else {
+            this.server.to(helperId).emit('victim_location_response', { userId: emergencyUserId, error: 'No hay ubicación disponible', timestamp: Date.now() });
+          }
+        } catch {
+          // best-effort
+        }
+      }
+      return { success: true };
+    } catch (e: any) {
+      return { success: false, message: e.message };
+    }
+  }
+
+  @SubscribeMessage('helpers_location_request')
+  async helpersLocationRequest(@ConnectedSocket() socket: Socket, @MessageBody() data: Record<string, any> = {}) {
+    try {
+      const { roomId, emergencyUserId } = data;
+      if (!roomId || !emergencyUserId) return { success: false, message: 'Datos incompletos' };
+
+      const helpers = this.state.emergencyHelpers.get(emergencyUserId) || new Set<string>();
+      const helpersLocations: any[] = [];
+      for (const helperId of helpers) {
+        const helperEntry = this.state.connectedUsers.get(helperId);
+        if (helperEntry?.userData?.lastKnownLocation) {
+          const loc = helperEntry.userData.lastKnownLocation;
+          helpersLocations.push({ userId: helperId, userName: helperEntry.userData.username || 'Ayudante', lat: loc.lat, lng: loc.lng, timestamp: loc.ts || Date.now(), type: 'helper' });
+        } else {
+          try {
+            const snap = await this.firebase.firestore.collection('emergencies').doc(emergencyUserId).collection('helper_locations').where('helperId', '==', helperId).orderBy('timestamp', 'desc').limit(1).get();
+            if (!snap.empty) {
+              const loc = snap.docs[0].data();
+              helpersLocations.push({ userId: helperId, userName: 'Ayudante', lat: loc.lat, lng: loc.lng, timestamp: loc.timestamp, type: 'helper', fromFirestore: true });
+            }
+          } catch {
+            // best-effort
+          }
+        }
+      }
+      this.server.to(emergencyUserId).emit('helpers_locations_update', { roomId, helpers: helpersLocations, timestamp: Date.now() });
+      this.server.to(socket.id).emit('helpers_locations_update', { roomId, helpers: helpersLocations, timestamp: Date.now() });
+      return { success: true, count: helpersLocations.length };
+    } catch (e: any) {
+      return { success: false, message: e.message };
+    }
+  }
+
+  @SubscribeMessage('helper_driving_status')
+  helperDrivingStatus(@ConnectedSocket() socket: Socket, @MessageBody() data: Record<string, any> = {}): void {
+    try {
+      const { roomId, helperId, isDriving, emergencyUserId } = data;
+      if (!roomId || !helperId) return;
+      if (emergencyUserId) {
+        this.server.to(emergencyUserId).emit('helper_driving_update', { helperId, isDriving, timestamp: Date.now() });
+      }
+      socket.to(roomId).emit('helper_driving_update', { helperId, isDriving, timestamp: Date.now() });
+    } catch {
+      // fire-and-forget
+    }
+  }
 }
