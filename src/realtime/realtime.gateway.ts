@@ -9,6 +9,7 @@ import { Injectable } from '@nestjs/common';
 import {
   ConnectedSocket,
   MessageBody,
+  OnGatewayDisconnect,
   OnGatewayInit,
   SubscribeMessage,
   WebSocketGateway,
@@ -21,6 +22,7 @@ import { FirebaseService } from '../firebase/firebase.service';
 import { NotificationsService } from '../notifications/notifications.service';
 import { StateStore } from './state.store';
 import { EmergencyService } from './emergency.service';
+import { isDataUrl, isHttpUrl, getMimeFromDataUrl, getBase64FromDataUrl } from '../common/image-utils';
 
 @WebSocketGateway({
   cors: { origin: '*', methods: ['GET', 'POST'] },
@@ -28,7 +30,7 @@ import { EmergencyService } from './emergency.service';
   allowEIO3: true,
 })
 @Injectable()
-export class RealtimeGateway implements OnGatewayInit {
+export class RealtimeGateway implements OnGatewayInit, OnGatewayDisconnect {
   @WebSocketServer() server: Server;
 
   // Anti-loop de resoluciones (equivalente a global.resolveInProgress del monolito).
@@ -732,6 +734,212 @@ export class RealtimeGateway implements OnGatewayInit {
     } catch (e: any) {
       if (data?.userId) setTimeout(() => this.resolveInProgress.delete(data.userId), 2000);
       return { success: false, message: e.message };
+    }
+  }
+
+  // ============================================================
+  // 👤 PERFIL · 🔑 FCM TOKEN · 🎧 AUDIO · 🔌 DESCONEXIÓN
+  // ============================================================
+
+  @SubscribeMessage('get_profile')
+  async getProfile(@MessageBody() data: Record<string, any> = {}) {
+    try {
+      const userId = data.userId;
+      if (!userId) return { success: false, message: 'userId requerido' };
+      const snap = await this.firebase.firestore.collection('users').doc(userId).get();
+      if (!snap.exists) return { success: false, message: 'Perfil no encontrado' };
+      const user = snap.data() || {};
+      let finalUsername = user.username;
+      if (!finalUsername || finalUsername === 'null' || String(finalUsername).trim() === '') {
+        if (user.fullName && user.fullName.trim() !== '') finalUsername = user.fullName.trim();
+        else if (user.email && user.email.trim() !== '') finalUsername = user.email.split('@')[0].trim();
+        else finalUsername = 'Usuario';
+      }
+      return { success: true, ...user, username: finalUsername };
+    } catch (e: any) {
+      return { success: false, message: e.message };
+    }
+  }
+
+  @SubscribeMessage('update_profile')
+  async updateProfile(@MessageBody() data: Record<string, any> = {}) {
+    try {
+      const { userId, fullName = '', username = '', email = '', phone = '', avatarUri = '' } = data;
+      if (!userId) return { success: false, message: 'userId requerido' };
+
+      const prevSnap = await this.firebase.firestore.collection('users').doc(userId).get();
+      const prevData = prevSnap.exists ? (prevSnap.data() || {}) : {};
+
+      let finalUsername = username;
+      if (!finalUsername || finalUsername.trim() === '' || finalUsername === 'null') {
+        finalUsername = prevData?.username;
+        if (!finalUsername || String(finalUsername).trim() === '' || finalUsername === 'null') {
+          if (fullName && fullName.trim() !== '') finalUsername = fullName.trim();
+          else if (email && email.trim() !== '') finalUsername = email.split('@')[0].trim();
+          else finalUsername = 'Usuario';
+        }
+      }
+
+      let finalAvatar = prevData?.avatarUri || '';
+      if (typeof avatarUri === 'string' && avatarUri.trim() !== '') {
+        if (isDataUrl(avatarUri)) finalAvatar = await this.uploadAvatar(userId, avatarUri);
+        else if (isHttpUrl(avatarUri)) finalAvatar = avatarUri;
+      }
+
+      const updatedUser = {
+        id: userId,
+        fullName: fullName.trim() || prevData?.fullName || '',
+        username: finalUsername,
+        email: email.trim() || prevData?.email || '',
+        phone: phone.trim() || prevData?.phone || '',
+        avatarUri: finalAvatar,
+        status: 'Online', presence: 'Available', updatedAt: Date.now(),
+      };
+      await this.firebase.firestore.collection('users').doc(userId).update(updatedUser);
+      const entry = this.state.connectedUsers.get(userId);
+      if (entry) entry.userData = { ...entry.userData, ...updatedUser };
+      this.server.emit('user_updated', updatedUser);
+      return { success: true, message: 'Perfil actualizado correctamente', user: updatedUser };
+    } catch (e: any) {
+      return { success: false, message: e.message };
+    }
+  }
+
+  private async uploadAvatar(userId: string, dataUrl: string): Promise<string> {
+    const mime = getMimeFromDataUrl(dataUrl);
+    const ext = mime.split('/')[1] || 'jpg';
+    const base64 = getBase64FromDataUrl(dataUrl);
+    if (!base64) throw new Error('Data URL inválida (sin base64)');
+    const buffer = Buffer.from(base64, 'base64');
+    const filePath = `avatars/${userId}/${Date.now()}_${uuidv4()}.${ext}`;
+    const file = this.firebase.storage.bucket().file(filePath);
+    await file.save(buffer, { contentType: mime, resumable: false, metadata: { cacheControl: 'public, max-age=31536000', metadata: { userId } } });
+    await file.makePublic();
+    return file.publicUrl();
+  }
+
+  @SubscribeMessage('register_fcm_token')
+  async registerFcmToken(@ConnectedSocket() socket: Socket, @MessageBody() data: Record<string, any> = {}) {
+    try {
+      const { userId, fcmToken, deviceId, platform, deviceModel } = data;
+      if (!userId || !fcmToken) return { success: false, message: 'userId y fcmToken requeridos' };
+
+      const uniqueDeviceId = (typeof deviceId === 'string' && deviceId.trim().length > 0)
+        ? deviceId.trim()
+        : `device_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+
+      const userRef = this.firebase.firestore.collection('users').doc(userId);
+      await userRef.collection('fcmTokens').doc(uniqueDeviceId).set({
+        token: String(fcmToken), platform: platform || 'android', deviceModel: deviceModel || null, socketId: socket.id,
+        enabled: true,
+        lastActiveAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      }, { merge: true });
+      await userRef.set({
+        socketIds: admin.firestore.FieldValue.arrayUnion(socket.id),
+        lastTokenRefreshAt: admin.firestore.FieldValue.serverTimestamp(),
+      }, { merge: true });
+
+      return { success: true, message: 'Token registrado', deviceId: uniqueDeviceId };
+    } catch (e: any) {
+      return { success: false, message: e.message };
+    }
+  }
+
+  @SubscribeMessage('audio_message')
+  async audioMessage(@ConnectedSocket() socket: Socket, @MessageBody() data: Record<string, any> = {}) {
+    try {
+      const { userId, username } = data;
+      const roomId = data.roomId || (socket as any).currentRoom || 'general';
+      if (!userId || !username) return { success: false, message: '❌ userId/username inválidos' };
+      if (!this.state.chatRooms.has(roomId)) return { success: false, message: '❌ No estás en una sala válida' };
+
+      let finalAudioUrl: string | null = data.audioUrl || null;
+      if (finalAudioUrl && /^https?:\/\//i.test(finalAudioUrl)) {
+        // audioUrl directo (PTT robusto)
+      } else if (typeof data.audioDataUrl === 'string' && data.audioDataUrl.startsWith('data:audio/')) {
+        finalAudioUrl = await this.saveAudio(data.audioDataUrl, userId, roomId, data.ext);
+      } else if (typeof data.audioData === 'string' && data.audioData.length > 0) {
+        const mime = (typeof data.mime === 'string' && data.mime.startsWith('audio/')) ? data.mime : 'audio/mpeg';
+        finalAudioUrl = await this.saveAudio(`data:${mime};base64,${data.audioData}`, userId, roomId, data.ext);
+      }
+      if (!finalAudioUrl) return { success: false, message: '❌ No se pudo obtener URL de audio' };
+
+      const message: Record<string, any> = {
+        id: uuidv4(), userId, username, roomId, type: 'audio', audioUrl: finalAudioUrl, content: '[Audio]',
+        durationMs: typeof data.durationMs === 'number' ? data.durationMs : undefined, timestamp: Date.now(),
+      };
+      await this.firebase.firestore.collection('messages').add(message);
+      const room = this.state.chatRooms.get(roomId);
+      if (room) room.messageCount++;
+
+      this.server.to(roomId).emit('audio_message', message);
+      socket.emit('message_sent', { id: message.id, ...message });
+
+      const roomUsers = room ? Array.from(room.users) : [];
+      for (const targetUserId of roomUsers) {
+        if (targetUserId === userId) continue;
+        if (!this.isUserPresentInRoom(targetUserId, roomId)) {
+          await this.notifications.sendPushNotification(targetUserId, '🎧 Mensaje de audio', `${username} envió un audio`, {
+            type: 'audio_message', roomId, userId, username, timestamp: Date.now().toString(),
+          });
+        }
+      }
+      return { success: true, id: message.id, audioUrl: finalAudioUrl };
+    } catch {
+      return { success: false, message: 'Error guardando mensaje de audio' };
+    }
+  }
+
+  private async saveAudio(audioDataUrl: string, userId: string, roomId: string, ext?: string): Promise<string> {
+    const mimeMatch = audioDataUrl.match(/^data:(audio\/[a-zA-Z0-9.+-]+);base64,/);
+    const mime = mimeMatch ? mimeMatch[1] : 'audio/mpeg';
+    const base64 = audioDataUrl.split('base64,')[1] || '';
+    const buffer = Buffer.from(base64, 'base64');
+    const finalExt = ext || mime.split('/')[1] || 'mp3';
+    const filePath = `audios/${roomId}/${userId}_${Date.now()}_${uuidv4()}.${finalExt}`;
+    const file = this.firebase.storage.bucket().file(filePath);
+    await file.save(buffer, { contentType: mime, resumable: false });
+    await file.makePublic();
+    return file.publicUrl();
+  }
+
+  async handleDisconnect(socket: Socket): Promise<void> {
+    const userId = (socket as any).userId;
+    if (!userId) return;
+
+    const entry = this.state.connectedUsers.get(userId);
+    let isLastConnection = true;
+    if (entry) {
+      entry.sockets.delete(socket.id);
+      isLastConnection = entry.sockets.size === 0;
+    }
+
+    // Si tenía emergencia activa y es su última conexión: liberar lock + limpiar (seguridad/vida).
+    if (isLastConnection && this.state.emergencyAlerts.has(userId)) {
+      const emergencyRoomId = this.state.emergencyUserRoom.get(userId) || `emergencia_${userId}`;
+      try {
+        await this.emergency.releaseLock({ userId, roomId: emergencyRoomId, reason: 'user_disconnected_last_socket', force: true });
+      } catch { /* best-effort */ }
+      this.state.chatRooms.delete(emergencyRoomId);
+      this.state.emergencyUserRoom.delete(userId);
+      this.state.emergencyAlerts.delete(userId);
+      this.state.emergencyHelpers.delete(userId);
+    }
+
+    try {
+      const updateData: Record<string, any> = {
+        socketIds: admin.firestore.FieldValue.arrayRemove(socket.id),
+        lastSeen: Date.now(),
+      };
+      if (isLastConnection) {
+        updateData.isOnline = false;
+        updateData.currentRoom = 'general';
+      }
+      await this.firebase.firestore.collection('users').doc(userId).update(updateData);
+    } catch {
+      // el doc puede no existir; best-effort
     }
   }
 }

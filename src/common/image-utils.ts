@@ -6,6 +6,9 @@
 export const isDataUrl = (str: unknown): boolean =>
   typeof str === 'string' && /^data:image\/[a-zA-Z0-9.+-]+;base64,/i.test(str);
 
+export const isHttpUrl = (str: unknown): boolean =>
+  typeof str === 'string' && /^https?:\/\//i.test(str);
+
 export const getMimeFromDataUrl = (dataUrl: string): string => {
   const match = /^data:(image\/[a-zA-Z0-9.+-]+);base64,/.exec(dataUrl || '');
   return match ? match[1] : 'image/jpeg';
