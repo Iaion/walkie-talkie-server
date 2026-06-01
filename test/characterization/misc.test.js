@@ -8,9 +8,15 @@ const request = require('supertest');
 const { io } = require('socket.io-client');
 const { clearFirestore, setDoc, getDoc } = require('../setup/emulator');
 const { startServer, stopServer } = require('../setup/server');
+const { getIdToken } = require('../setup/auth');
 
 const URL = 'http://127.0.0.1:8080';
-const api = () => request(URL);
+let TOKEN;
+const api = () => {
+  const r = request(URL);
+  const auth = (req) => req.set('Authorization', `Bearer ${TOKEN}`);
+  return { get: (p) => auth(r.get(p)), post: (p) => auth(r.post(p)), delete: (p) => auth(r.delete(p)) };
+};
 
 // PNG 1x1 transparente
 const PNG_DATA_URL =
@@ -18,7 +24,7 @@ const PNG_DATA_URL =
 
 function connect() {
   return new Promise((resolve, reject) => {
-    const socket = io(URL, { transports: ['websocket'], forceNew: true });
+    const socket = io(URL, { transports: ['websocket'], forceNew: true, auth: { token: TOKEN } });
     socket.on('connect', () => resolve(socket));
     socket.on('connect_error', reject);
   });
@@ -36,7 +42,7 @@ async function pollUntil(fn, { timeoutMs = 5000, intervalMs = 150 } = {}) {
 
 describe('Caracterización — cierre de cobertura Fase 0.5', () => {
   let sockets = [];
-  beforeAll(startServer);
+  beforeAll(async () => { await startServer(); TOKEN = await getIdToken(); });
   afterAll(stopServer);
   beforeEach(async () => { await clearFirestore(); });
   afterEach(() => { sockets.forEach((s) => s.close()); sockets = []; });

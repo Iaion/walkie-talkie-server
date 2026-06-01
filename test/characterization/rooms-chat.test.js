@@ -7,13 +7,19 @@ const request = require('supertest');
 const { io } = require('socket.io-client');
 const { clearFirestore } = require('../setup/emulator');
 const { startServer, stopServer } = require('../setup/server');
+const { getIdToken } = require('../setup/auth');
 
 const URL = 'http://127.0.0.1:8080';
-const api = () => request(URL);
+let TOKEN;
+const api = () => {
+  const r = request(URL);
+  const auth = (req) => req.set('Authorization', `Bearer ${TOKEN}`);
+  return { get: (p) => auth(r.get(p)), post: (p) => auth(r.post(p)), delete: (p) => auth(r.delete(p)) };
+};
 
 function connect() {
   return new Promise((resolve, reject) => {
-    const socket = io(URL, { transports: ['websocket'], forceNew: true });
+    const socket = io(URL, { transports: ['websocket'], forceNew: true, auth: { token: TOKEN } });
     socket.on('connect', () => resolve(socket));
     socket.on('connect_error', reject);
   });
@@ -22,7 +28,7 @@ function connect() {
 describe('Caracterización — salas y chat', () => {
   let sockets = [];
 
-  beforeAll(startServer);
+  beforeAll(async () => { await startServer(); TOKEN = await getIdToken(); });
   afterAll(stopServer);
   beforeEach(async () => { await clearFirestore(); });
   afterEach(() => { sockets.forEach((s) => s.close()); sockets = []; });

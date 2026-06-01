@@ -7,12 +7,14 @@
 const { io } = require('socket.io-client');
 const { clearFirestore, setDoc } = require('../setup/emulator');
 const { startServer, stopServer } = require('../setup/server');
+const { getIdToken } = require('../setup/auth');
 
 const URL = 'http://127.0.0.1:8080';
+let TOKEN;
 
 function connect() {
   return new Promise((resolve, reject) => {
-    const socket = io(URL, { transports: ['websocket'], forceNew: true });
+    const socket = io(URL, { transports: ['websocket'], forceNew: true, auth: { token: TOKEN } });
     socket.on('connect', () => resolve(socket));
     socket.on('connect_error', reject);
   });
@@ -21,7 +23,7 @@ function connect() {
 describe('Caracterización Socket.IO — perfil', () => {
   let sockets = [];
 
-  beforeAll(startServer);
+  beforeAll(async () => { await startServer(); TOKEN = await getIdToken(); });
   afterAll(stopServer);
   beforeEach(async () => { await clearFirestore(); });
   afterEach(() => { sockets.forEach((s) => s.close()); sockets = []; });

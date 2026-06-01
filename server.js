@@ -66,6 +66,32 @@ const bucket = admin.storage().bucket();
 const messaging = admin.messaging();
 
 // ============================================================
+// 🔐 AUTENTICACIÓN (Fase 1) — el server verifica el Firebase ID token
+// en cada request REST. Cierra el agujero de "server abierto al mundo".
+// /health queda público (health checks de infraestructura).
+// ============================================================
+const PUBLIC_PATHS = new Set(["/health"]);
+
+async function authenticate(req, res, next) {
+  if (PUBLIC_PATHS.has(req.path)) return next();
+
+  const header = req.headers.authorization || "";
+  const match = header.match(/^Bearer (.+)$/i);
+  if (!match) {
+    return res.status(401).json({ success: false, message: "No autenticado: falta token" });
+  }
+
+  try {
+    req.user = await admin.auth().verifyIdToken(match[1]);
+    return next();
+  } catch (err) {
+    return res.status(401).json({ success: false, message: "Token inválido" });
+  }
+}
+
+app.use(authenticate);
+
+// ============================================================
 // 📦 COLECCIONES FIRESTORE
 // ============================================================
 const COLLECTIONS = {
@@ -1758,6 +1784,20 @@ app.post("/vehicles/photo", async (req, res) => {
 // ============================================================
 // 🔌 SOCKET.IO - MANEJO DE CONEXIONES
 // ============================================================
+
+// 🔐 AUTENTICACIÓN Socket.IO (Fase 1) — verifica el ID token en el handshake.
+// Sin token válido, la conexión se rechaza.
+io.use(async (socket, next) => {
+  const token = socket.handshake.auth?.token;
+  if (!token) return next(new Error("No autenticado: falta token"));
+  try {
+    socket.user = await admin.auth().verifyIdToken(token);
+    return next();
+  } catch (err) {
+    return next(new Error("Token inválido"));
+  }
+});
+
 io.on("connection", (socket) => {
   console.log(`${colors.cyan}🔗 NUEVA CONEXIÓN SOCKET:${colors.reset} ${socket.id}`);
 

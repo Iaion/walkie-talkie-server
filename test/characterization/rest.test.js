@@ -7,11 +7,17 @@
 const request = require('supertest');
 const { clearFirestore, setDoc } = require('../setup/emulator');
 const { startServer, stopServer } = require('../setup/server');
+const { getIdToken } = require('../setup/auth');
 
-const api = () => request('http://127.0.0.1:8080');
+let TOKEN;
+const api = () => {
+  const r = request('http://127.0.0.1:8080');
+  const auth = (req) => req.set('Authorization', `Bearer ${TOKEN}`);
+  return { get: (p) => auth(r.get(p)), post: (p) => auth(r.post(p)), delete: (p) => auth(r.delete(p)) };
+};
 
 describe('Caracterización REST — monolito actual', () => {
-  beforeAll(startServer);
+  beforeAll(async () => { await startServer(); TOKEN = await getIdToken(); });
   afterAll(stopServer);
 
   beforeEach(async () => {

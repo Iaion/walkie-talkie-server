@@ -11,13 +11,15 @@
 const { io } = require('socket.io-client');
 const { clearFirestore } = require('../setup/emulator');
 const { startServer, stopServer } = require('../setup/server');
+const { getIdToken } = require('../setup/auth');
 
 const URL = 'http://127.0.0.1:8080';
 const COORDS = { latitude: -34.6037, longitude: -58.3816 }; // Buenos Aires
+let TOKEN;
 
 function connect() {
   return new Promise((resolve, reject) => {
-    const socket = io(URL, { transports: ['websocket'], forceNew: true });
+    const socket = io(URL, { transports: ['websocket'], forceNew: true, auth: { token: TOKEN } });
     socket.on('connect', () => resolve(socket));
     socket.on('connect_error', reject);
   });
@@ -26,7 +28,7 @@ function connect() {
 describe('Caracterización Socket.IO — eventos críticos del monolito', () => {
   let sockets = [];
 
-  beforeAll(startServer);
+  beforeAll(async () => { await startServer(); TOKEN = await getIdToken(); });
   afterAll(stopServer);
 
   beforeEach(async () => {
