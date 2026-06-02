@@ -25,6 +25,9 @@ export class FirebaseService implements OnModuleInit {
     const serviceAccount = trimmed.startsWith('{') ? JSON.parse(trimmed) : JSON.parse(fs.readFileSync(trimmed, 'utf8'));
     admin.initializeApp({
       credential: admin.credential.cert(serviceAccount),
+      // Permite forzar el projectId (útil con emuladores: el cliente puede usar otro proyecto que la
+      // service account). Cae al project_id de la service account si no se setea.
+      projectId: process.env.FIREBASE_PROJECT_ID || serviceAccount.project_id,
       storageBucket: process.env.FIREBASE_STORAGE_BUCKET,
     });
     admin.firestore().settings({ ignoreUndefinedProperties: true });
