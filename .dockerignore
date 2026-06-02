@@ -1,0 +1,16 @@
+node_modules
+dist
+coverage
+test
+.git
+.gitignore
+*.log
+.e2e-*.log
+secrets
+.env
+.env.*
+firebase-debug.log
+firestore-debug.log
+ui-debug.log
+README.md
+ARQUITECTURA.md
