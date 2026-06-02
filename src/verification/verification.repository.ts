@@ -119,6 +119,23 @@ export class VerificationRepository {
     await this.auditLogs.add({ ...entry, timestamp: entry.timestamp || Date.now() });
   }
 
+  // ===== Grandfathering (migración puntual de usuarios previos a la verificación) =====
+
+  /** Todos los usuarios. Para el grandfathering (Firestore no puede consultar "campo ausente"). */
+  async getAllUsers(): Promise<Record<string, any>[]> {
+    const snap = await this.users.get();
+    return snap.docs.map((d) => ({ uid: d.id, ...(d.data() as Record<string, any>) }));
+  }
+
+  /** Aplica un patch (merge) a muchos usuarios en batches (límite de Firestore = 500). */
+  async patchUsers(uids: string[], patch: Record<string, any>): Promise<void> {
+    for (let i = 0; i < uids.length; i += 450) {
+      const batch = this.firebase.firestore.batch();
+      uids.slice(i, i + 450).forEach((uid) => batch.set(this.users.doc(uid), patch, { merge: true }));
+      await batch.commit();
+    }
+  }
+
   // ===== Cambio de titular =====
 
   async getActiveAssignmentForRenter(renterUid: string): Promise<Record<string, any> | null> {

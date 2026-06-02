@@ -24,6 +24,18 @@ export class AdminController {
     return this.service.getVerificationPhotos(uid);
   }
 
+  // Grandfathering de usuarios previos al sistema de verificación.
+  @Get('grandfather/preview')
+  grandfatherPreview(@Req() req: any) {
+    return this.service.grandfather(req.user.uid, false);
+  }
+
+  @Post('grandfather')
+  @HttpCode(200)
+  grandfatherApply(@Req() req: any) {
+    return this.service.grandfather(req.user.uid, true);
+  }
+
   @Post('verifications/:uid/approve')
   @HttpCode(200)
   approve(@Req() req: any, @Param('uid') uid: string) {

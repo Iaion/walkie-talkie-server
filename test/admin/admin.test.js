@@ -104,4 +104,26 @@ describe('Admin — review de verificaciones (Fase 3)', () => {
     const res = await api('get', '/admin/verifications/NOEXISTE/photos');
     expect(res.status).toBe(404);
   });
+
+  test('grandfathering: preview no escribe; apply marca a los legacy (sin state) como approved', async () => {
+    await setDoc('users', 'LEGACY1', { uid: 'LEGACY1', username: 'Viejo1' });
+    await setDoc('users', 'LEGACY2', { uid: 'LEGACY2', username: 'Viejo2' });
+    await setDoc('users', 'NUEVO', { uid: 'NUEVO', state: 'pending_review' });
+    const api = bearer(await getAdminIdToken());
+
+    // Preview: cuenta los 2 legacy y NO escribe
+    const prev = await api('get', '/admin/grandfather/preview');
+    expect(prev.status).toBe(200);
+    expect(prev.body).toMatchObject({ applied: false, count: 2 });
+    expect((await getDoc('users', 'LEGACY1')).state).toBeUndefined();
+
+    // Apply: los legacy quedan approved+grandfathered; el que ya tenía state no se toca
+    const res = await api('post', '/admin/grandfather');
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ applied: true, count: 2 });
+    const l1 = await getDoc('users', 'LEGACY1');
+    expect(l1.state).toBe('approved');
+    expect(l1.grandfathered).toBe(true);
+    expect((await getDoc('users', 'NUEVO')).state).toBe('pending_review');
+  });
 });

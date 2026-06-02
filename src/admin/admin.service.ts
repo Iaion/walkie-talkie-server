@@ -44,6 +44,32 @@ export class AdminService {
     return { success: true, photos };
   }
 
+  /**
+   * Grandfathering: los usuarios que existían ANTES del sistema de verificación (sin campo `state`)
+   * quedarían bloqueados por el gating al desplegar. Esto los marca como APPROVED (grandfathered).
+   * apply=false (default) solo PREVISUALIZA (cuántos y quiénes), no escribe nada.
+   * NO toca el `role` a propósito (para no pisar admins que no tengan `state`).
+   */
+  async grandfather(adminUid: string, apply: boolean) {
+    const all = await this.repo.getAllUsers();
+    const legacy = all.filter((u) => !u.state); // sin estado = previos a la verificación
+    const uids = legacy.map((u) => u.uid);
+
+    if (!apply) {
+      return { success: true, applied: false, count: uids.length, uids };
+    }
+
+    const now = Date.now();
+    await this.repo.patchUsers(uids, {
+      state: UserState.APPROVED,
+      grandfathered: true,
+      grandfatheredAt: now,
+      updatedAt: now,
+    });
+    await this.repo.writeAuditLog({ actorUid: adminUid, action: 'grandfather_users', details: { count: uids.length } });
+    return { success: true, applied: true, count: uids.length };
+  }
+
   private async signedUrl(path: string): Promise<string> {
     try {
       const [url] = await this.firebase.storage.bucket().file(path).getSignedUrl({
