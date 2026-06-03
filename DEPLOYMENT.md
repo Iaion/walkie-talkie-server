@@ -39,19 +39,39 @@ en prod (esas son solo para dev contra emuladores).
 Deploy típico (Render/Railway): conectar el repo, que detecte el `Dockerfile`, cargar las env vars,
 desplegar. Healthcheck: `GET /health` → 200. CORS ya está habilitado (`app.enableCors()`).
 
+**El backend también sirve el panel** (ver §2): el `Dockerfile` compila el panel y el server lo
+entrega en `/panel`. El build del panel necesita la config WEB de Firebase como **build args**:
+
+```
+docker build \
+  --build-arg VITE_FIREBASE_API_KEY=... \
+  --build-arg VITE_FIREBASE_AUTH_DOMAIN=<project>.firebaseapp.com \
+  --build-arg VITE_FIREBASE_PROJECT_ID=<project-id> \
+  --build-arg VITE_FIREBASE_APP_ID=1:...:web:... \
+  -t alrescate-backend .
+```
+(En Render/Railway esos build args se cargan en la config del servicio.)
+
 ---
 
-## 2. Panel admin (`alrescate-admin`)
+## 2. Panel admin (`admin-panel/`) — servido por el backend
 
-App estática (Vite) → **Vercel**.
+El panel vive **adentro de este repo** (`admin-panel/`) y lo **sirve el propio backend** en la ruta
+`/panel` → un solo deploy, una sola URL, sin Vercel ni CORS. Cómo funciona:
 
-1. Subir `alrescate-admin` a su propio repo de GitHub.
-2. En Vercel: importar el repo (framework Vite, build `npm run build`, output `dist/`).
-3. Env vars de **producción** (Project → Settings → Environment Variables):
-   - `VITE_FIREBASE_API_KEY`, `VITE_FIREBASE_AUTH_DOMAIN`, `VITE_FIREBASE_PROJECT_ID`,
-     `VITE_FIREBASE_APP_ID` → del **app web** registrada en el Firebase de prod.
-   - `VITE_API_URL` → la URL pública del **backend** desplegado.
-   - `VITE_USE_EMULATOR=false`.
+- `admin-panel/vite.config.ts` usa `base: '/panel/'` al compilar.
+- `admin-panel/.env.production` fija `VITE_API_URL=` (mismo origen) y `VITE_USE_EMULATOR=false`.
+- `src/main.ts` sirve `admin-panel/dist` en `/panel` si existe.
+- El `Dockerfile` compila el panel (con los build args de arriba) y lo copia a la imagen.
+
+Una vez desplegado el backend, el panel queda en **`https://<tu-backend>/panel`**. El admin entra ahí,
+se loguea con Firebase y opera. (No hace falta cuenta de Vercel.)
+
+> *Alternativa:* si en el futuro quisieran el panel separado (en Vercel, con su CDN), se puede —
+> habría que subir `admin-panel/` a su propio repo y setear `VITE_API_URL` a la URL del backend.
+
+**Dev local:** el panel sigue corriendo aparte con `npm run dev` (hot-reload), apuntando al backend
+local. Solo en producción lo sirve el backend.
 
 ---
 
