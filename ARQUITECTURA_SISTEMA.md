@@ -30,11 +30,13 @@ que **verifica y aprueba** a cada repartidor antes de dejarlo usar la app.
                                                   └──────────────────────┘
 ```
 
+Son 3 piezas lógicas pero **2 repos**: el panel vive dentro del backend.
+
 | Pieza | Repo | Rol |
 |---|---|---|
 | **App Android** | `alrescate-app` | La usa el repartidor: registro, verificación, chat, **botón de pánico**, mapa. |
 | **Backend** | `walkie-talkie-server` | Única fuente de verdad. Toda la lógica, seguridad y acceso a Firebase. |
-| **Panel admin** | `admin-panel` | Lo usa la asociación: revisar y aprobar/rechazar verificaciones. |
+| **Panel admin** | `walkie-talkie-server/admin-panel` | Dentro del backend; el propio backend lo **sirve en `/panel`** (un solo deploy). Lo usa la asociación: aprobar/rechazar verificaciones. |
 | **Firebase** | — | Infra: identidad (Auth), datos (Firestore), fotos (Storage), notificaciones (FCM). |
 
 **Principio rector:** el cliente NUNCA toca Firestore/Storage directo en el diseño final. Todo pasa
