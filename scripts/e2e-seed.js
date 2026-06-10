@@ -32,7 +32,7 @@ const DELIVERY = 'DELIVERY1';
     documentUrl: 'https://via.placeholder.com/200x200.png?text=DNI',
   });
 
-  // eslint-disable-next-line no-console
+   
   console.log('SEED OK', JSON.stringify(ADMIN));
   process.exit(0);
 })().catch((e) => { console.error('SEED FAIL', e); process.exit(1); });

@@ -44,8 +44,14 @@ function firebaseAdmin() {
   const admin = require('firebase-admin');
   if (!adminInitialized) {
     const keyPath = path.resolve(__dirname, '..', '..', 'secrets', 'serviceAccountKey.dev.json');
-    const serviceAccount = JSON.parse(fs.readFileSync(keyPath, 'utf8'));
-    admin.initializeApp({ credential: admin.credential.cert(serviceAccount), projectId: PROJECT });
+    if (fs.existsSync(keyPath)) {
+      const serviceAccount = JSON.parse(fs.readFileSync(keyPath, 'utf8'));
+      admin.initializeApp({ credential: admin.credential.cert(serviceAccount), projectId: PROJECT });
+    } else {
+      // CI / máquina sin la key: contra el Auth emulator no hacen falta credenciales
+      // (emulators:exec setea FIREBASE_AUTH_EMULATOR_HOST y los custom tokens van sin firma).
+      admin.initializeApp({ projectId: PROJECT });
+    }
     adminInitialized = true;
   }
   return admin;

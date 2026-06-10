@@ -8,10 +8,12 @@ import { NestFactory } from '@nestjs/core';
 import { NestExpressApplication } from '@nestjs/platform-express';
 import { AppModule } from './app.module';
 import { corsOrigins } from './common/cors';
+import { validateEnv } from './common/env.validation';
 import { join } from 'path';
 import * as fs from 'fs';
 
 async function bootstrap(): Promise<void> {
+  validateEnv();
   const app = await NestFactory.create<NestExpressApplication>(AppModule);
   app.enableCors({ origin: corsOrigins() });
   // Límite alto para fotos/audio en base64 (igual que el monolito: 25mb)
@@ -23,13 +25,13 @@ async function bootstrap(): Promise<void> {
   const panelDist = join(process.cwd(), 'admin-panel', 'dist');
   if (fs.existsSync(join(panelDist, 'index.html'))) {
     app.useStaticAssets(panelDist, { prefix: '/panel' });
-    // eslint-disable-next-line no-console
+     
     console.log('🖥️  Panel admin servido en /panel');
   }
 
   const port = process.env.PORT || 8080;
   await app.listen(port);
-  // eslint-disable-next-line no-console
+   
   console.log(`🚀 AlRescate NestJS corriendo en puerto ${port}`);
 }
 

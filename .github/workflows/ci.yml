@@ -1,0 +1,47 @@
+# CI del backend + panel (PLAN_MEJORAS B1).
+# Corre la suite completa contra los emuladores de Firebase (no necesita secretos:
+# FirebaseService y el harness inicializan sin service account en modo emulador).
+name: CI
+
+on:
+  push:
+    branches: [development, master]
+  pull_request:
+
+jobs:
+  backend:
+    name: Backend (build + 138 tests vs emuladores)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      # Los emuladores de Firestore/Storage necesitan Java (firebase-tools v13 = Java 17 OK).
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - run: npm ci
+      - run: npm run lint
+      - run: npm install -g firebase-tools@13
+      - run: npm run test:ci
+
+  panel:
+    name: Panel admin (typecheck + build + tests)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: admin-panel
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: admin-panel/package-lock.json
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run build
+      - run: npm test

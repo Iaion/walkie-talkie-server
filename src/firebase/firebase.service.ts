@@ -18,6 +18,19 @@ export class FirebaseService implements OnModuleInit {
     if (admin.apps.length) return;
 
     const raw = process.env.FIREBASE_SERVICE_ACCOUNT || process.env.GOOGLE_APPLICATION_CREDENTIALS;
+
+    // Modo emulador SIN service account (CI / máquinas sin la key): los emuladores no validan
+    // credenciales, alcanza con el projectId. En cualquier entorno SIN emuladores la key sigue
+    // siendo obligatoria.
+    const usingEmulators = !!process.env.FIRESTORE_EMULATOR_HOST;
+    if (!raw && usingEmulators) {
+      admin.initializeApp({
+        projectId: process.env.FIREBASE_PROJECT_ID || 'alrescate-dev',
+        storageBucket: process.env.FIREBASE_STORAGE_BUCKET,
+      });
+      admin.firestore().settings({ ignoreUndefinedProperties: true });
+      return;
+    }
     if (!raw) throw new Error('Falta FIREBASE_SERVICE_ACCOUNT (o GOOGLE_APPLICATION_CREDENTIALS): JSON o path de la service account');
 
     // JSON inline (empieza con '{') o path a un archivo .json

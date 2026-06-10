@@ -21,15 +21,16 @@ let child = null;
  *        porque cada archivo levanta su propio server.
  */
 async function startServer(extraEnv = {}) {
+  // Con la key presente (dev local) se usa; sin ella (CI) el server inicializa firebase-admin
+  // en modo emulador solo con projectId (los emuladores no validan credenciales).
   const keyPath = path.join(ROOT, 'secrets', 'serviceAccountKey.dev.json');
-  if (!fs.existsSync(keyPath)) {
-    throw new Error(`Falta la service account key en ${keyPath}. Ver project_progress / ARQUITECTURA.md.`);
-  }
-  const serviceAccount = fs.readFileSync(keyPath, 'utf8');
+  const credentials = fs.existsSync(keyPath)
+    ? { GOOGLE_APPLICATION_CREDENTIALS: fs.readFileSync(keyPath, 'utf8') }
+    : { FIREBASE_PROJECT_ID: 'alrescate-dev' };
 
   const env = {
     ...process.env,
-    GOOGLE_APPLICATION_CREDENTIALS: serviceAccount,
+    ...credentials,
     FIREBASE_STORAGE_BUCKET: 'alrescate-dev.firebasestorage.app',
     FIRESTORE_EMULATOR_HOST: '127.0.0.1:8081',
     FIREBASE_AUTH_EMULATOR_HOST: '127.0.0.1:9099',
