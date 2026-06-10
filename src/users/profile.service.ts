@@ -6,8 +6,10 @@
  * Seguridad: WHITELIST de campos. El cliente NUNCA puede escribir roles / isVerified / state /
  * isOnline / fcmToken — esos los maneja el backend (verification, gateway de presencia, /fcm).
  */
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
+import { v4 as uuidv4 } from 'uuid';
 import { FirebaseService } from '../firebase/firebase.service';
+import { getMimeFromDataUrl, getBase64FromDataUrl, isDataUrl } from '../common/image-utils';
 
 @Injectable()
 export class ProfileService {
@@ -54,5 +56,40 @@ export class ProfileService {
       tx.set(ref, out, { merge: true });
     });
     return { success: true };
+  }
+
+  /**
+   * Sube el avatar vía API (reemplaza el upload directo a Storage del prototipo, que se rompe
+   * con las storage.rules deny-all). Misma lógica que el update_profile del gateway: borra los
+   * avatares viejos del usuario (best-effort) y publica el nuevo. Devuelve la URL pública.
+   * (La unificación de uploads en un StorageService es Fase D5.)
+   */
+  async uploadAvatar(uid: string, imageData: unknown): Promise<Record<string, unknown>> {
+    if (typeof imageData !== 'string' || !isDataUrl(imageData)) {
+      throw new BadRequestException({ success: false, message: 'imageData debe ser una data URL base64' });
+    }
+    const mime = getMimeFromDataUrl(imageData);
+    const ext = mime.split('/')[1] || 'jpg';
+    const base64 = getBase64FromDataUrl(imageData);
+    if (!base64) throw new BadRequestException({ success: false, message: 'Data URL inválida (sin base64)' });
+    const buffer = Buffer.from(base64, 'base64');
+    try {
+      const [oldFiles] = await this.firebase.storage.bucket().getFiles({ prefix: `avatars/${uid}/` });
+      await Promise.all(oldFiles.map((f) => f.delete().catch(() => undefined)));
+    } catch { /* best-effort: no romper el upload por la limpieza */ }
+    const filePath = `avatars/${uid}/${Date.now()}_${uuidv4()}.${ext}`;
+    const file = this.firebase.storage.bucket().file(filePath);
+    await file.save(buffer, {
+      contentType: mime,
+      resumable: false,
+      metadata: { cacheControl: 'public, max-age=31536000', metadata: { userId: uid } },
+    });
+    await file.makePublic();
+    const url = file.publicUrl();
+    await this.firebase.firestore.collection('users').doc(uid).set(
+      { avatarUri: url, avatarUrl: url, photoURL: url, lastUpdated: Date.now() },
+      { merge: true },
+    );
+    return { success: true, url };
   }
 }

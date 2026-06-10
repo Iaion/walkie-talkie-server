@@ -83,6 +83,23 @@ describe('Perfil de usuario vía API (/users/:uid/profile)', () => {
     expect(get.body.profile.phone).toBe('999');
   });
 
+  test('POST avatar: sube data URL → URL pública y la guarda en el perfil', async () => {
+    // PNG 1x1 transparente
+    const png = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==';
+    const r = await api('POST', `/users/${me.uid}/avatar`, me.token, { imageData: png });
+    expect(r.status).toBe(200);
+    expect(r.body.success).toBe(true);
+    expect(typeof r.body.url).toBe('string');
+    const doc = await getDoc('users', me.uid);
+    expect(doc.avatarUri).toBe(r.body.url);
+    expect(doc.photoURL).toBe(r.body.url);
+  });
+
+  test('POST avatar: sin data URL válida → 400', async () => {
+    const r = await api('POST', `/users/${me.uid}/avatar`, me.token, { imageData: 'no-es-data-url' });
+    expect(r.status).toBe(400);
+  });
+
   test('WHITELIST: el cliente NO puede escribir roles/isVerified/state/isOnline/fcmToken', async () => {
     await api('PUT', `/users/${me.uid}/profile`, me.token, {
       username: 'pedro',
