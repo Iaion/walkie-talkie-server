@@ -18,6 +18,7 @@ import { FcmModule } from './fcm/fcm.module';
 import { RealtimeModule } from './realtime/realtime.module';
 import { VerificationModule } from './verification/verification.module';
 import { AdminModule } from './admin/admin.module';
+import { UsersModule } from './users/users.module';
 
 @Module({
   imports: [
@@ -36,6 +37,7 @@ import { AdminModule } from './admin/admin.module';
     RealtimeModule,
     VerificationModule,
     AdminModule,
+    UsersModule,
   ],
   controllers: [HealthController],
   providers: [
