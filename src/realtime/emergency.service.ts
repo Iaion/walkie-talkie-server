@@ -4,7 +4,7 @@
  * Portado del monolito: acquire (con reemplazo de lock viejo por TTL) + release (force).
  * Transacciones Firestore para evitar carreras.
  */
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import { FirebaseService } from '../firebase/firebase.service';
 
 export interface AcquireResult {
@@ -15,7 +15,9 @@ export interface AcquireResult {
 
 @Injectable()
 export class EmergencyService {
-  private readonly LOCK_TTL_MS = 5 * 60 * 1000; // 5 min
+  private readonly logger = new Logger(EmergencyService.name);
+  // TTL configurable (D7): si una emergencia real suele durar más de 5 min, subirlo por env.
+  private readonly LOCK_TTL_MS = Number(process.env.EMERGENCY_LOCK_TTL_MS) || 5 * 60 * 1000;
 
   constructor(private readonly firebase: FirebaseService) {}
 
@@ -33,7 +35,11 @@ export class EmergencyService {
         const age = Date.now() - startedAt;
 
         if (startedAt > 0 && age > this.LOCK_TTL_MS) {
-          // lock viejo (stale) → lo reemplazamos
+          // lock viejo (stale) → lo reemplazamos. OBSERVABLE (D7): si esto pasa con una
+          // emergencia legítima en curso (>TTL), es grave — tiene que quedar registrado.
+          this.logger.warn(
+            `Lock de emergencia STALE reemplazado: anterior user=${lock.userId} room=${lock.roomId} edad=${Math.round(age / 1000)}s → nuevo user=${userId}`,
+          );
           tx.set(this.lockRef, {
             active: true, userId, roomId: emergencyRoomId, startedAt: Date.now(), emergencyType,
             replacedStaleLock: true,

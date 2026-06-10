@@ -8,18 +8,21 @@ import { v4 as uuidv4 } from 'uuid';
 import { VerificationRepository } from './verification.repository';
 import { FirebaseService } from '../firebase/firebase.service';
 import { normalizeEmail, normalizePhone, normalizeDocument } from './normalize';
-import { isDataUrl, getMimeFromDataUrl, getBase64FromDataUrl } from '../common/image-utils';
+import { isDataUrl, getMimeFromDataUrl } from '../common/image-utils';
+import { StorageService } from '../common/storage.service';
 import { AccountType, UserState, VerificationFlag, VerificationSubmission } from './verification.types';
 
 @Injectable()
 export class VerificationService {
-  /** Tope de alquileres simultáneos por titular antes de levantar flag (cuenta-granja). */
-  private readonly MAX_RENTERS_PER_TITULAR = 5;
+  /** Tope de alquileres simultáneos por titular antes de levantar flag (cuenta-granja).
+   *  Configurable por env (D7). */
+  private readonly MAX_RENTERS_PER_TITULAR = Number(process.env.MAX_RENTERS_PER_TITULAR) || 5;
   private readonly PHOTO_TYPES = ['selfie', 'deliveryAppScreenshot', 'document', 'renterFace', 'workPhone'];
 
   constructor(
     private readonly repo: VerificationRepository,
     private readonly firebase: FirebaseService,
+    private readonly storage: StorageService,
   ) {}
 
   /**
@@ -33,16 +36,20 @@ export class VerificationService {
     if (!isDataUrl(imageData)) {
       throw new BadRequestException({ success: false, message: 'imageData inválido (no es data URL de imagen)' });
     }
-    const mime = getMimeFromDataUrl(imageData);
-    const ext = mime.split('/')[1] || 'jpg';
-    const base64 = getBase64FromDataUrl(imageData);
-    if (!base64) throw new BadRequestException({ success: false, message: 'Data URL inválida' });
-    const buffer = Buffer.from(base64, 'base64');
-    const path = `verifications/${uid}/${type}_${Date.now()}.${ext}`;
-    const file = this.firebase.storage.bucket().file(path);
-    await file.save(buffer, { contentType: mime, resumable: false, metadata: { metadata: { uid, type } } });
-    // Privado: NO makePublic. El acceso lo da el admin con URL firmada.
-    return { success: true, type, path };
+    const ext = getMimeFromDataUrl(imageData).split('/')[1] || 'jpg';
+    // Upload unificado (D5). Privado: NO makePublic — el acceso lo da el admin con URL firmada.
+    try {
+      const { path } = await this.storage.uploadDataUrl({
+        dataUrl: imageData,
+        pathPrefix: `verifications/${uid}`,
+        fileName: `${type}_${Date.now()}.${ext}`,
+        makePublic: false,
+        metadata: { uid, type },
+      });
+      return { success: true, type, path };
+    } catch (e) {
+      throw new BadRequestException({ success: false, message: (e as Error).message });
+    }
   }
 
   /** Estado del usuario para el gating. Crea el doc (pending_verification) si es la 1ª vez. */

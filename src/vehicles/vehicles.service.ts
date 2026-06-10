@@ -13,7 +13,8 @@ import {
 import { v4 as uuidv4 } from 'uuid';
 import { FirebaseService } from '../firebase/firebase.service';
 import { VehiclesRepository } from './vehicles.repository';
-import { isDataUrl, getMimeFromDataUrl, getBase64FromDataUrl } from '../common/image-utils';
+import { isDataUrl, getMimeFromDataUrl } from '../common/image-utils';
+import { StorageService } from '../common/storage.service';
 
 const VALID_TYPES = ['CAR', 'MOTORCYCLE', 'BICYCLE'];
 
@@ -22,6 +23,7 @@ export class VehiclesService {
   constructor(
     private readonly repo: VehiclesRepository,
     private readonly firebase: FirebaseService,
+    private readonly storage: StorageService,
   ) {}
 
   /** Mapea un doc de Firestore al shape de respuesta del monolito (con campos por tipo). */
@@ -137,19 +139,15 @@ export class VehiclesService {
   }
 
   private async savePhoto(userId: string, vehicleId: string, imageData: string): Promise<string> {
-    const mime = getMimeFromDataUrl(imageData);
-    const ext = mime.split('/')[1] || 'jpg';
-    const base64 = getBase64FromDataUrl(imageData);
-    if (!base64) throw new Error('Data URL inválida');
-    const buffer = Buffer.from(base64, 'base64');
-    const filePath = `vehicles/${userId}/${vehicleId}_${Date.now()}_${uuidv4()}.${ext}`;
-    const file = this.firebase.storage.bucket().file(filePath);
-    await file.save(buffer, {
-      contentType: mime,
-      resumable: false,
-      metadata: { cacheControl: 'public, max-age=31536000' },
+    // Upload unificado (D5).
+    const ext = getMimeFromDataUrl(imageData).split('/')[1] || 'jpg';
+    const { url } = await this.storage.uploadDataUrl({
+      dataUrl: imageData,
+      pathPrefix: `vehicles/${userId}`,
+      fileName: `${vehicleId}_${Date.now()}_${uuidv4()}.${ext}`,
+      makePublic: true,
+      cacheControl: 'public, max-age=31536000',
     });
-    await file.makePublic();
-    return file.publicUrl();
+    return url as string;
   }
 }

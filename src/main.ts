@@ -4,6 +4,7 @@
  * monolito, para que el mismo harness de tests pueda apuntarle.
  */
 import 'reflect-metadata';
+import { Logger, ValidationPipe } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { NestExpressApplication } from '@nestjs/platform-express';
 import { AppModule } from './app.module';
@@ -14,10 +15,17 @@ import * as fs from 'fs';
 
 async function bootstrap(): Promise<void> {
   validateEnv();
+  const logger = new Logger('Bootstrap');
   const app = await NestFactory.create<NestExpressApplication>(AppModule);
   app.enableCors({ origin: corsOrigins() });
   // Límite alto para fotos/audio en base64 (igual que el monolito: 25mb)
   app.useBodyParser('json', { limit: '25mb' });
+  // Validación de DTOs REST (D1): los endpoints con DTO tipado se validan/transforman;
+  // los que reciben Record<string,any> (contrato del monolito) pasan sin tocar.
+  app.useGlobalPipes(new ValidationPipe({ transform: true }));
+  // Cierre ordenado (D3): SIGTERM/SIGINT disparan onModuleDestroy/beforeApplicationShutdown
+  // (el orquestador puede matar el container sin dejar sockets/writes colgados).
+  app.enableShutdownHooks();
 
   // Si el panel admin está compilado (admin-panel/dist), el backend lo SIRVE en /panel.
   // Así queda un solo deploy y una sola URL (sin Vercel ni CORS). En dev, el panel corre
@@ -25,14 +33,12 @@ async function bootstrap(): Promise<void> {
   const panelDist = join(process.cwd(), 'admin-panel', 'dist');
   if (fs.existsSync(join(panelDist, 'index.html'))) {
     app.useStaticAssets(panelDist, { prefix: '/panel' });
-     
-    console.log('🖥️  Panel admin servido en /panel');
+    logger.log('🖥️  Panel admin servido en /panel');
   }
 
   const port = process.env.PORT || 8080;
   await app.listen(port);
-   
-  console.log(`🚀 AlRescate NestJS corriendo en puerto ${port}`);
+  logger.log(`🚀 AlRescate NestJS corriendo en puerto ${port}`);
 }
 
 bootstrap();

@@ -14,8 +14,8 @@
     "skipLibCheck": true,
     "strictNullChecks": true,
     "forceConsistentCasingInFileNames": true,
-    "noImplicitAny": false,
-    "strictBindCallApply": false,
+    "noImplicitAny": true,
+    "strictBindCallApply": true,
     "noFallthroughCasesInSwitch": false,
     "esModuleInterop": true,
     "resolveJsonModule": true
@@ -23,3 +23,4 @@
   "include": ["src/**/*"],
   "exclude": ["node_modules", "dist", "test", "server.js"]
 }
+

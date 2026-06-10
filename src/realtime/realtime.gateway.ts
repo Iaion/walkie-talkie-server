@@ -5,7 +5,7 @@
  * - Eventos migrados del monolito (se van agregando por grupos). Empezamos con user-connected.
  * El valor retornado por cada @SubscribeMessage se envía como ACK al cliente (emitWithAck).
  */
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
 import {
   ConnectedSocket,
   MessageBody,
@@ -22,9 +22,11 @@ import { FirebaseService } from '../firebase/firebase.service';
 import { NotificationsService } from '../notifications/notifications.service';
 import { StateStore } from './state.store';
 import { EmergencyService } from './emergency.service';
-import { isDataUrl, isHttpUrl, getMimeFromDataUrl, getBase64FromDataUrl } from '../common/image-utils';
+import { isDataUrl, isHttpUrl } from '../common/image-utils';
 import { corsOrigins } from '../common/cors';
 import { SocketThrottle, RATE_LIMITED_ACK } from '../common/socket-throttle';
+import { isValidLat, isValidLng, isBoundedString, MAX_TEXT_MESSAGE } from '../common/validate';
+import { StorageService } from '../common/storage.service';
 
 @WebSocketGateway({
   cors: { origin: corsOrigins(), methods: ['GET', 'POST'] },
@@ -32,11 +34,31 @@ import { SocketThrottle, RATE_LIMITED_ACK } from '../common/socket-throttle';
   allowEIO3: true,
 })
 @Injectable()
-export class RealtimeGateway implements OnGatewayInit, OnGatewayDisconnect {
+export class RealtimeGateway implements OnGatewayInit, OnGatewayDisconnect, OnModuleDestroy {
   @WebSocketServer() server: Server;
+
+  private readonly logger = new Logger(RealtimeGateway.name);
 
   // Anti-loop de resoluciones (equivalente a global.resolveInProgress del monolito).
   private readonly resolveInProgress = new Set<string>();
+
+  /**
+   * Las operaciones "best-effort" (persistencia secundaria que no debe romper el flujo de
+   * vida del evento) ahora se LOGUEAN (D2): antes fallaban en silencio y nadie se enteraba
+   * de cuotas/permisos/red rotos. El flujo del evento sigue sin romperse.
+   */
+  private bestEffort(op: string, e: unknown): void {
+    this.logger.warn(`best-effort falló [${op}]: ${(e as Error)?.message ?? e}`);
+  }
+
+  /** Cierre ordenado (D3): al apagar la app se cierran las conexiones Socket.IO. */
+  onModuleDestroy(): void {
+    try {
+      this.server?.close();
+    } catch (e) {
+      this.bestEffort('shutdown.server.close', e);
+    }
+  }
 
   constructor(
     private readonly state: StateStore,
@@ -44,6 +66,7 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayDisconnect {
     private readonly notifications: NotificationsService,
     private readonly emergency: EmergencyService,
     private readonly throttle: SocketThrottle,
+    private readonly storage: StorageService,
   ) {}
 
   afterInit(server: Server): void {
@@ -172,8 +195,9 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayDisconnect {
       if (typeof user.email === 'string' && user.email.trim()) patch.email = user.email.trim();
       if (typeof user.fullName === 'string' && user.fullName.trim()) patch.fullName = user.fullName.trim();
       await userRef.set(patch, { merge: true });
-    } catch {
+    } catch (e) {
       // no romper la conexión si falla la sync con Firestore
+      this.bestEffort('user-connected.syncFirestore', e);
     }
 
     this.server.emit(
@@ -247,8 +271,9 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayDisconnect {
           .orderBy('timestamp', 'desc').limit(50).get();
         const messages = snap.docs.map((d) => ({ id: d.id, ...d.data() })).reverse();
         socket.emit('room_messages', { roomId, messages });
-      } catch {
+      } catch (e) {
         // historial best-effort
+        this.bestEffort('join_room.historial', e);
       }
 
       socket.to(roomId).emit('user_joined_room', {
@@ -304,6 +329,8 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayDisconnect {
     const roomId = data.roomId || (socket as any).currentRoom || 'general';
 
     if (!userId || !username || !text) return { success: false, message: '❌ Datos de mensaje inválidos' };
+    // D1: mismo ack para texto desmedido (anti payloads gigantes)
+    if (!isBoundedString(text, MAX_TEXT_MESSAGE)) return { success: false, message: '❌ Datos de mensaje inválidos' };
     if (this.notSelf(socket, userId)) return this.FORBIDDEN_ACK;
     if (!(socket as any).currentRoom || !this.state.chatRooms.has(roomId)) {
       return { success: false, message: '❌ No estás en una sala válida' };
@@ -362,7 +389,7 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayDisconnect {
     if (!this.throttle.allow(socket.id, 'update_location')) return RATE_LIMITED_ACK;
     try {
       const { userId, lat, lng, timestamp } = data;
-      if (!userId || typeof lat !== 'number' || typeof lng !== 'number') {
+      if (!userId || !isValidLat(lat) || !isValidLng(lng)) {
         return { success: false, message: 'Datos inválidos' };
       }
       if (this.notSelf(socket, userId)) return this.FORBIDDEN_ACK;
@@ -384,7 +411,7 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayDisconnect {
     if (!this.throttle.allow(socket.id, 'update_emergency_location')) return RATE_LIMITED_ACK;
     try {
       const { roomId, userId, lat, lng, timestamp, accuracy } = data;
-      if (!roomId || !userId || typeof lat !== 'number' || typeof lng !== 'number') {
+      if (!roomId || !userId || !isValidLat(lat) || !isValidLng(lng)) {
         return { success: false, message: 'Datos de ubicación inválidos' };
       }
       if (this.notSelf(socket, userId)) return this.FORBIDDEN_ACK;
@@ -407,8 +434,9 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayDisconnect {
         await this.firebase.firestore.collection('emergencies').doc(userId).update({
           latitude: lat, longitude: lng, lastLocationUpdate: timestamp || Date.now(),
         });
-      } catch {
+      } catch (e) {
         // persistencia best-effort
+        this.bestEffort('update_emergency_location.persistencia', e);
       }
       return { success: true };
     } catch (e: any) {
@@ -421,7 +449,7 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayDisconnect {
     if (!this.throttle.allow(socket.id, 'update_helper_location')) return RATE_LIMITED_ACK;
     try {
       const { roomId, helperId, emergencyUserId, lat, lng, timestamp, accuracy } = data;
-      if (!roomId || !helperId || typeof lat !== 'number' || typeof lng !== 'number') {
+      if (!roomId || !helperId || !isValidLat(lat) || !isValidLng(lng)) {
         return { success: false, message: 'Datos de ubicación inválidos' };
       }
       if (this.notSelf(socket, helperId)) return this.FORBIDDEN_ACK;
@@ -445,8 +473,8 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayDisconnect {
         await this.firebase.firestore.collection('emergencies').doc(victimId).collection('active_helpers').doc(helperId).set({
           helperId, lastLocation: { lat, lng }, lastLocationUpdate: timestamp || Date.now(), isActive: true,
         }, { merge: true });
-      } catch {
-        // best-effort
+      } catch (e) {
+        this.bestEffort('update_helper_location.persistencia', e);
       }
       return { success: true };
     } catch (e: any) {
@@ -477,8 +505,8 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayDisconnect {
           } else {
             this.server.to(helperId).emit('victim_location_response', { userId: emergencyUserId, error: 'No hay ubicación disponible', timestamp: Date.now() });
           }
-        } catch {
-          // best-effort
+        } catch (e) {
+          this.bestEffort('request_victim_location', e);
         }
       }
       return { success: true };
@@ -507,8 +535,8 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayDisconnect {
               const loc = snap.docs[0].data();
               helpersLocations.push({ userId: helperId, userName: 'Ayudante', lat: loc.lat, lng: loc.lng, timestamp: loc.timestamp, type: 'helper', fromFirestore: true });
             }
-          } catch {
-            // best-effort
+          } catch (e) {
+            this.bestEffort('helpers_location_request', e);
           }
         }
       }
@@ -530,8 +558,9 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayDisconnect {
         this.server.to(emergencyUserId).emit('helper_driving_update', { helperId, isDriving, timestamp: Date.now() });
       }
       socket.to(roomId).emit('helper_driving_update', { helperId, isDriving, timestamp: Date.now() });
-    } catch {
-      // fire-and-forget
+    } catch (e) {
+      // fire-and-forget (este evento no tiene ack)
+      this.bestEffort('helper_driving_status', e);
     }
   }
 
@@ -553,7 +582,7 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayDisconnect {
 
       if (!userId || !userName) return { success: false, code: 'INVALID_DATA', message: 'Datos de usuario inválidos' };
       if (this.notSelf(socket, userId)) return { success: false, code: 'FORBIDDEN', message: 'No autorizado: solo podés disparar tu propia emergencia' };
-      if (typeof latitude !== 'number' || typeof longitude !== 'number') {
+      if (!isValidLat(latitude) || !isValidLng(longitude)) {
         return { success: false, code: 'INVALID_LOCATION', message: 'Ubicación inválida' };
       }
 
@@ -576,7 +605,7 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayDisconnect {
       try {
         const userDoc = await this.firebase.firestore.collection('users').doc(userId).get();
         if (userDoc.exists) { const ud = userDoc.data() || {}; avatarUrl = ud.avatarUrl || ud.avatarUri || null; }
-      } catch { /* best-effort */ }
+      } catch (e) { this.bestEffort('persistencia', e); }
 
       let vehicleData: Record<string, any> | null = null;
       try {
@@ -595,7 +624,7 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayDisconnect {
             ...(t === 'BICYCLE' && { frameSerialNumber: v.frameSerialNumber, hasElectricMotor: v.hasElectricMotor, frameSize: v.frameSize }),
           };
         }
-      } catch { /* best-effort */ }
+      } catch (e) { this.bestEffort('persistencia', e); }
 
       const emergencyData: Record<string, any> = {
         userId, userName, avatarUrl, latitude, longitude,
@@ -608,7 +637,7 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayDisconnect {
       try {
         await this.firebase.firestore.collection('emergencies').doc(userId).set({ ...emergencyData, isActive: true, createdAt: Date.now() }, { merge: true });
         await this.firebase.firestore.collection('users').doc(userId).update({ hasActiveEmergency: true, emergencyRoomId, lastEmergencyStarted: Date.now() });
-      } catch { /* best-effort */ }
+      } catch (e) { this.bestEffort('persistencia', e); }
 
       const emergencyRoom = {
         id: emergencyRoomId, name: `Emergencia ${userName}`, type: 'emergency',
@@ -650,7 +679,7 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayDisconnect {
           });
           if (ok) pushNotifications++;
         }
-      } catch { /* best-effort */ }
+      } catch (e) { this.bestEffort('persistencia', e); }
 
       return {
         success: true, message: 'Alerta de emergencia enviada correctamente',
@@ -665,7 +694,7 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayDisconnect {
             roomId: emergencyRoomId || (reqUserId ? `emergencia_${reqUserId}` : null),
             reason: 'error_during_emergency',
           });
-        } catch { /* rollback best-effort */ }
+        } catch (e) { this.bestEffort('emergency_alert.rollback', e); }
       }
       return { success: false, code: 'SERVER_ERROR', message: 'Error procesando alerta de emergencia' };
     }
@@ -731,7 +760,7 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayDisconnect {
 
       try {
         await this.emergency.releaseLock({ userId, roomId: emergencyRoomId, reason, force: true });
-      } catch { /* best-effort */ }
+      } catch (e) { this.bestEffort('persistencia', e); }
 
       this.server.emit('emergency_cancelled', { userId, userName: username, username, roomId: emergencyRoomId, reason, timestamp: Date.now(), isActive: false });
       this.server.to(emergencyRoomId).emit('emergency_resolved', { roomId: emergencyRoomId, userId, message: 'Emergencia resuelta', reason, timestamp: Date.now() });
@@ -753,16 +782,16 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayDisconnect {
         await this.firebase.firestore.collection('emergencies').doc(userId).update({
           status: 'resolved', isActive: false, resolvedAt: Date.now(), endedAt: Date.now(), roomId: emergencyRoomId, endReason: reason,
         });
-      } catch { /* best-effort */ }
+      } catch (e) { this.bestEffort('persistencia', e); }
       try {
         await this.firebase.firestore.collection('users').doc(userId).update({
           hasActiveEmergency: false, emergencyRoomId: null, lastEmergencyEnded: Date.now(),
         });
-      } catch { /* best-effort */ }
+      } catch (e) { this.bestEffort('persistencia', e); }
 
       // Borrar el historial de chat de la sala de emergencia (portado del monolito; el ack
       // declaraba chatHistoryDeleted:true pero la limpieza no estaba migrada).
-      try { await this.deleteRoomMessages(emergencyRoomId); } catch { /* best-effort */ }
+      try { await this.deleteRoomMessages(emergencyRoomId); } catch (e) { this.bestEffort('persistencia', e); }
 
       this.server.to(userId).emit('emergency_fully_cleaned', { userId, roomId: emergencyRoomId, reason, timestamp: Date.now() });
       this.server.emit('user_status_changed', { userId, username, hasActiveEmergency: false, emergencyCleared: true, timestamp: Date.now() });
@@ -848,22 +877,16 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayDisconnect {
   }
 
   private async uploadAvatar(userId: string, dataUrl: string): Promise<string> {
-    const mime = getMimeFromDataUrl(dataUrl);
-    const ext = mime.split('/')[1] || 'jpg';
-    const base64 = getBase64FromDataUrl(dataUrl);
-    if (!base64) throw new Error('Data URL inválida (sin base64)');
-    const buffer = Buffer.from(base64, 'base64');
-    // Cleanup de avatares anteriores (portado del monolito): borrar los del usuario antes de subir
-    // el nuevo, para no acumular basura en Storage. Best-effort (no romper el update si falla).
-    try {
-      const [oldFiles] = await this.firebase.storage.bucket().getFiles({ prefix: `avatars/${userId}/` });
-      await Promise.all(oldFiles.map((f) => f.delete().catch(() => undefined)));
-    } catch { /* best-effort */ }
-    const filePath = `avatars/${userId}/${Date.now()}_${uuidv4()}.${ext}`;
-    const file = this.firebase.storage.bucket().file(filePath);
-    await file.save(buffer, { contentType: mime, resumable: false, metadata: { cacheControl: 'public, max-age=31536000', metadata: { userId } } });
-    await file.makePublic();
-    return file.publicUrl();
+    // Upload unificado (D5): el cleanup de avatares anteriores lo hace el StorageService.
+    const { url } = await this.storage.uploadDataUrl({
+      dataUrl,
+      pathPrefix: `avatars/${userId}`,
+      makePublic: true,
+      metadata: { userId },
+      cacheControl: 'public, max-age=31536000',
+      cleanupPrefix: `avatars/${userId}/`,
+    });
+    return url as string;
   }
 
   @SubscribeMessage('register_fcm_token')
@@ -953,16 +976,18 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayDisconnect {
   }
 
   private async saveAudio(audioDataUrl: string, userId: string, roomId: string, ext?: string): Promise<string> {
+    // El MIME de audio se detecta acá (getMimeFromDataUrl es solo-imagen); upload unificado (D5).
     const mimeMatch = audioDataUrl.match(/^data:(audio\/[a-zA-Z0-9.+-]+);base64,/);
     const mime = mimeMatch ? mimeMatch[1] : 'audio/mpeg';
-    const base64 = audioDataUrl.split('base64,')[1] || '';
-    const buffer = Buffer.from(base64, 'base64');
     const finalExt = ext || mime.split('/')[1] || 'mp3';
-    const filePath = `audios/${roomId}/${userId}_${Date.now()}_${uuidv4()}.${finalExt}`;
-    const file = this.firebase.storage.bucket().file(filePath);
-    await file.save(buffer, { contentType: mime, resumable: false });
-    await file.makePublic();
-    return file.publicUrl();
+    const { url } = await this.storage.uploadDataUrl({
+      dataUrl: audioDataUrl,
+      mime,
+      pathPrefix: `audios/${roomId}`,
+      fileName: `${userId}_${Date.now()}_${uuidv4()}.${finalExt}`,
+      makePublic: true,
+    });
+    return url as string;
   }
 
   async handleDisconnect(socket: Socket): Promise<void> {
@@ -982,7 +1007,7 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayDisconnect {
       const emergencyRoomId = this.state.emergencyUserRoom.get(userId) || `emergencia_${userId}`;
       try {
         await this.emergency.releaseLock({ userId, roomId: emergencyRoomId, reason: 'user_disconnected_last_socket', force: true });
-      } catch { /* best-effort */ }
+      } catch (e) { this.bestEffort('persistencia', e); }
       this.state.chatRooms.delete(emergencyRoomId);
       this.state.emergencyUserRoom.delete(userId);
       this.state.emergencyAlerts.delete(userId);
@@ -999,8 +1024,9 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayDisconnect {
         updateData.currentRoom = 'general';
       }
       await this.firebase.firestore.collection('users').doc(userId).update(updateData);
-    } catch {
+    } catch (e) {
       // el doc puede no existir; best-effort
+      this.bestEffort('disconnect.markOffline', e);
     }
   }
 }

@@ -7,13 +7,16 @@
  * isOnline / fcmToken — esos los maneja el backend (verification, gateway de presencia, /fcm).
  */
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
-import { v4 as uuidv4 } from 'uuid';
 import { FirebaseService } from '../firebase/firebase.service';
-import { getMimeFromDataUrl, getBase64FromDataUrl, isDataUrl } from '../common/image-utils';
+import { StorageService } from '../common/storage.service';
+import { isDataUrl } from '../common/image-utils';
 
 @Injectable()
 export class ProfileService {
-  constructor(private readonly firebase: FirebaseService) {}
+  constructor(
+    private readonly firebase: FirebaseService,
+    private readonly storage: StorageService,
+  ) {}
 
   async getProfile(uid: string): Promise<Record<string, unknown>> {
     const doc = await this.firebase.firestore.collection('users').doc(uid).get();
@@ -68,24 +71,15 @@ export class ProfileService {
     if (typeof imageData !== 'string' || !isDataUrl(imageData)) {
       throw new BadRequestException({ success: false, message: 'imageData debe ser una data URL base64' });
     }
-    const mime = getMimeFromDataUrl(imageData);
-    const ext = mime.split('/')[1] || 'jpg';
-    const base64 = getBase64FromDataUrl(imageData);
-    if (!base64) throw new BadRequestException({ success: false, message: 'Data URL inválida (sin base64)' });
-    const buffer = Buffer.from(base64, 'base64');
-    try {
-      const [oldFiles] = await this.firebase.storage.bucket().getFiles({ prefix: `avatars/${uid}/` });
-      await Promise.all(oldFiles.map((f) => f.delete().catch(() => undefined)));
-    } catch { /* best-effort: no romper el upload por la limpieza */ }
-    const filePath = `avatars/${uid}/${Date.now()}_${uuidv4()}.${ext}`;
-    const file = this.firebase.storage.bucket().file(filePath);
-    await file.save(buffer, {
-      contentType: mime,
-      resumable: false,
-      metadata: { cacheControl: 'public, max-age=31536000', metadata: { userId: uid } },
+    // Upload unificado (D5): misma lógica que el update_profile del gateway.
+    const { url } = await this.storage.uploadDataUrl({
+      dataUrl: imageData,
+      pathPrefix: `avatars/${uid}`,
+      makePublic: true,
+      metadata: { userId: uid },
+      cacheControl: 'public, max-age=31536000',
+      cleanupPrefix: `avatars/${uid}/`,
     });
-    await file.makePublic();
-    const url = file.publicUrl();
     await this.firebase.firestore.collection('users').doc(uid).set(
       { avatarUri: url, avatarUrl: url, photoURL: url, lastUpdated: Date.now() },
       { merge: true },
