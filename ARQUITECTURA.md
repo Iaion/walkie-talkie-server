@@ -91,6 +91,24 @@ src/
 
 ---
 
+## 6b. Estado de emergencias: memoria + espejo en Firestore (Fase E del plan de mejoras)
+
+- El **StateStore en memoria** sigue siendo la verdad en runtime (ubicaciones/presencia no se
+  persisten — no quemar cuota). Decisión: **NO Redis** — el equipo no tiene infra para operarlo
+  y Firestore ya está; el server es **single-instance** (documentado: escalar horizontal
+  requeriría revisar esto).
+- Las **emergencias activas** se espejan en `emergencies/{userId}` (`isActive`, `helpers[]`):
+  se escriben al disparar la alerta, al confirmar/rechazar ayudantes y al resolver/desconectar.
+- Al **boot**, `RealtimeGateway.onApplicationBootstrap` REHIDRATA el StateStore desde ese espejo
+  (alerts + helpers + sala de emergencia) ANTES de aceptar tráfico → un deploy/crash durante un
+  robo ya no "desaparece" la emergencia. El lock global ya vivía en Firestore.
+- Durante el **shutdown ordenado** el gateway marca `shuttingDown` para que el disconnect masivo
+  de sockets NO se confunda con "el usuario se fue" (eso limpiaría las emergencias).
+- Harness de tests: `startServer()` limpia Firestore antes de bootear (la rehidratación
+  contaminaría suites con restos de la anterior); el test de restart usa `clearData:false`.
+
+---
+
 ## 7. Config, entornos y secretos
 
 - **Dev/prod separados.** Se desarrolla contra un proyecto Firebase de **dev**; prod se toca solo al desplegar.

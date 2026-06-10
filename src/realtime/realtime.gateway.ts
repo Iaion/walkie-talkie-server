@@ -5,7 +5,7 @@
  * - Eventos migrados del monolito (se van agregando por grupos). Empezamos con user-connected.
  * El valor retornado por cada @SubscribeMessage se envía como ACK al cliente (emitWithAck).
  */
-import { Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
+import { Injectable, Logger, OnApplicationBootstrap, OnModuleDestroy } from '@nestjs/common';
 import {
   ConnectedSocket,
   MessageBody,
@@ -34,7 +34,7 @@ import { StorageService } from '../common/storage.service';
   allowEIO3: true,
 })
 @Injectable()
-export class RealtimeGateway implements OnGatewayInit, OnGatewayDisconnect, OnModuleDestroy {
+export class RealtimeGateway implements OnGatewayInit, OnGatewayDisconnect, OnModuleDestroy, OnApplicationBootstrap {
   @WebSocketServer() server: Server;
 
   private readonly logger = new Logger(RealtimeGateway.name);
@@ -51,8 +51,16 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayDisconnect, OnMo
     this.logger.warn(`best-effort falló [${op}]: ${(e as Error)?.message ?? e}`);
   }
 
+  /**
+   * Flag de apagado: durante un shutdown ordenado los sockets se desconectan en masa,
+   * pero eso NO significa que las víctimas "se fueron" — sin este flag, un simple deploy
+   * limpiaría todas las emergencias activas (que la Fase E justamente quiere preservar).
+   */
+  private shuttingDown = false;
+
   /** Cierre ordenado (D3): al apagar la app se cierran las conexiones Socket.IO. */
   onModuleDestroy(): void {
+    this.shuttingDown = true;
     try {
       this.server?.close();
     } catch (e) {
@@ -81,6 +89,54 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayDisconnect, OnMo
         return next(new Error('Token inválido'));
       }
     });
+
+  }
+
+  /**
+   * E2: rehidratar emergencias activas desde Firestore ANTES de aceptar tráfico (corre
+   * después de todos los onModuleInit — Firebase ya está inicializado — y antes del listen).
+   * Antes, un restart del server durante un robo hacía "desaparecer" la emergencia.
+   */
+  async onApplicationBootstrap(): Promise<void> {
+    await this.rehydrateEmergencies();
+  }
+
+  /**
+   * Reconstruye el estado de emergencias activas (alerts, helpers, salas) desde el espejo
+   * en Firestore (colección `emergencies`, isActive=true). El StateStore sigue siendo la
+   * verdad en runtime (single-instance, documentado en ARQUITECTURA.md); Firestore es el
+   * respaldo para sobrevivir restarts. El lock global ya vivía en Firestore.
+   */
+  private async rehydrateEmergencies(): Promise<void> {
+    try {
+      const snap = await this.firebase.firestore.collection('emergencies').where('isActive', '==', true).get();
+      let count = 0;
+      for (const doc of snap.docs) {
+        const data = doc.data() || {};
+        const userId = doc.id;
+        const emergencyRoomId = data.emergencyRoomId || `emergencia_${userId}`;
+        this.state.emergencyAlerts.set(userId, { ...data, userId });
+        this.state.emergencyHelpers.set(userId, new Set<string>(Array.isArray(data.helpers) ? data.helpers : []));
+        this.state.emergencyUserRoom.set(userId, emergencyRoomId);
+        if (!this.state.chatRooms.has(emergencyRoomId)) {
+          this.state.chatRooms.set(emergencyRoomId, {
+            id: emergencyRoomId,
+            name: `Emergencia ${data.userName || userId}`,
+            type: 'emergency',
+            description: `Sala de emergencia para ${data.userName || userId}`,
+            users: new Set<string>([userId]),
+            createdAt: typeof data.createdAt === 'number' ? data.createdAt : Date.now(),
+            messageCount: 0,
+          });
+        }
+        count++;
+      }
+      if (count > 0) {
+        this.logger.warn(`⛑️ Rehidratadas ${count} emergencia(s) ACTIVA(s) desde Firestore (restart con emergencia en curso)`);
+      }
+    } catch (e) {
+      this.bestEffort('rehydrate.emergencies', e);
+    }
   }
 
   /**
@@ -708,6 +764,10 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayDisconnect, OnMo
       if (this.notSelf(socket, helperId)) return this.FORBIDDEN_ACK;
       const helpers = this.state.emergencyHelpers.get(emergencyUserId);
       if (helpers) helpers.add(helperId);
+      // Espejo en Firestore (E1, fire-and-forget): sobrevive a un restart del server.
+      this.firebase.firestore.collection('emergencies').doc(emergencyUserId)
+        .update({ helpers: admin.firestore.FieldValue.arrayUnion(helperId) })
+        .catch((e) => this.bestEffort('help_confirm.espejo', e));
       this.server.to(emergencyUserId).emit('help_confirmed', {
         emergencyUserId, helperId, helperName: helperName || 'Ayudante', latitude, longitude, timestamp: timestamp || Date.now(),
       });
@@ -726,6 +786,9 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayDisconnect, OnMo
       if (this.notSelf(socket, helperId)) return this.FORBIDDEN_ACK;
       const helpers = this.state.emergencyHelpers.get(emergencyUserId);
       if (helpers) helpers.delete(helperId);
+      this.firebase.firestore.collection('emergencies').doc(emergencyUserId)
+        .update({ helpers: admin.firestore.FieldValue.arrayRemove(helperId) })
+        .catch((e) => this.bestEffort('help_reject.espejo', e));
       this.server.to(helperId).emit('help_rejected', { emergencyUserId, helperId, timestamp: Date.now() });
       return { success: true };
     } catch (e: any) {
@@ -1003,7 +1066,9 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayDisconnect, OnMo
     }
 
     // Si tenía emergencia activa y es su última conexión: liberar lock + limpiar (seguridad/vida).
-    if (isLastConnection && this.state.emergencyAlerts.has(userId)) {
+    // EXCEPTO durante el shutdown: ahí el "disconnect" es del server, no del usuario — la
+    // emergencia debe sobrevivir al restart (rehidratación, Fase E).
+    if (!this.shuttingDown && isLastConnection && this.state.emergencyAlerts.has(userId)) {
       const emergencyRoomId = this.state.emergencyUserRoom.get(userId) || `emergencia_${userId}`;
       try {
         await this.emergency.releaseLock({ userId, roomId: emergencyRoomId, reason: 'user_disconnected_last_socket', force: true });
@@ -1012,6 +1077,13 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayDisconnect, OnMo
       this.state.emergencyUserRoom.delete(userId);
       this.state.emergencyAlerts.delete(userId);
       this.state.emergencyHelpers.delete(userId);
+      // Espejo (E1): si la memoria la descarta, Firestore también — si no, la rehidratación
+      // del próximo boot resucitaría una emergencia que el server ya dio por terminada.
+      try {
+        await this.firebase.firestore.collection('emergencies').doc(userId).update({
+          status: 'resolved', isActive: false, endedAt: Date.now(), endReason: 'user_disconnected_last_socket',
+        });
+      } catch (e) { this.bestEffort('disconnect.emergencia.espejo', e); }
     }
 
     try {

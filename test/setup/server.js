@@ -19,8 +19,17 @@ let child = null;
  * @param {Record<string,string>} extraEnv — env extra para ESTA suite (ej. ALLOWED_ORIGINS
  *        para probar CORS, o límites de rate-limit bajos). No afecta a las demás suites
  *        porque cada archivo levanta su propio server.
+ * @param {{clearData?: boolean}} opts — clearData=true (default) limpia Firestore ANTES de
+ *        bootear: el server rehidrata emergencias activas al arrancar (Fase E) y sin esta
+ *        limpieza los restos de una suite anterior contaminarían a la siguiente.
+ *        El test de restart usa clearData:false para verificar justamente la rehidratación.
  */
-async function startServer(extraEnv = {}) {
+async function startServer(extraEnv = {}, opts = {}) {
+  const { clearData = true } = opts;
+  if (clearData) {
+    const { clearFirestore } = require('./emulator');
+    await clearFirestore();
+  }
   // Con la key presente (dev local) se usa; sin ella (CI) el server inicializa firebase-admin
   // en modo emulador solo con projectId (los emuladores no validan credenciales).
   const keyPath = path.join(ROOT, 'secrets', 'serviceAccountKey.dev.json');
