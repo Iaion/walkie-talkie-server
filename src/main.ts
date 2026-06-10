@@ -7,12 +7,13 @@ import 'reflect-metadata';
 import { NestFactory } from '@nestjs/core';
 import { NestExpressApplication } from '@nestjs/platform-express';
 import { AppModule } from './app.module';
+import { corsOrigins } from './common/cors';
 import { join } from 'path';
 import * as fs from 'fs';
 
 async function bootstrap(): Promise<void> {
   const app = await NestFactory.create<NestExpressApplication>(AppModule);
-  app.enableCors();
+  app.enableCors({ origin: corsOrigins() });
   // Límite alto para fotos/audio en base64 (igual que el monolito: 25mb)
   app.useBodyParser('json', { limit: '25mb' });
 

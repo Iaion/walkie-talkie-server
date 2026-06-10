@@ -15,7 +15,12 @@ const ROOT = path.resolve(__dirname, '..', '..');
 const PORT = 8080;
 let child = null;
 
-async function startServer() {
+/**
+ * @param {Record<string,string>} extraEnv — env extra para ESTA suite (ej. ALLOWED_ORIGINS
+ *        para probar CORS, o límites de rate-limit bajos). No afecta a las demás suites
+ *        porque cada archivo levanta su propio server.
+ */
+async function startServer(extraEnv = {}) {
   const keyPath = path.join(ROOT, 'secrets', 'serviceAccountKey.dev.json');
   if (!fs.existsSync(keyPath)) {
     throw new Error(`Falta la service account key en ${keyPath}. Ver project_progress / ARQUITECTURA.md.`);
@@ -30,6 +35,7 @@ async function startServer() {
     FIREBASE_AUTH_EMULATOR_HOST: '127.0.0.1:9099',
     FIREBASE_STORAGE_EMULATOR_HOST: '127.0.0.1:9199',
     PORT: String(PORT),
+    ...extraEnv,
   };
 
   // El server activo es NestJS (dist/main.js). SERVER_ENTRY permite override (ej. para comparar con el viejo monolito).

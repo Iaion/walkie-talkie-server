@@ -12,11 +12,12 @@ import { UsersController } from './users.controller';
 import { RoomsController } from './rooms.controller';
 import { EmergenciesController } from './emergencies.controller';
 import { NotificationsModule } from '../notifications/notifications.module';
+import { SocketThrottle } from '../common/socket-throttle';
 
 @Module({
   imports: [NotificationsModule],
   controllers: [UsersController, RoomsController, EmergenciesController],
-  providers: [StateStore, RealtimeGateway, EmergencyService],
+  providers: [StateStore, RealtimeGateway, EmergencyService, SocketThrottle],
   exports: [StateStore],
 })
 export class RealtimeModule {}

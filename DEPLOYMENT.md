@@ -31,13 +31,17 @@ Imagen lista con el `Dockerfile` (multi-stage, sin secretos horneados).
 | `FIREBASE_SERVICE_ACCOUNT` | el JSON de la service account de prod (inline) **o** un path a un archivo montado |
 | `FIREBASE_STORAGE_BUCKET` | `<project-id>.firebasestorage.app` |
 | `PORT` | el que asigne el host (el server lee `process.env.PORT`) |
+| `ALLOWED_ORIGINS` | **OBLIGATORIA en prod.** CSV de orígenes web permitidos para CORS (REST + Socket.IO), ej. `https://alrescate.example`. Sin setear = abierto (solo aceptable en dev). El panel servido en `/panel` es same-origin y la app Android no manda Origin: ninguno de los dos la necesita listada. |
 | `FIREBASE_PROJECT_ID` | *(opcional)* solo si hace falta forzar el projectId |
+| `REST_RATE_LIMIT` / `REST_RATE_WINDOW_MS` | *(opcional)* rate limit REST por IP (default 600 req/60s) |
+| `SOCKET_RATE_WINDOW_MS` y `SOCKET_RATE_LIMIT_<EVENTO>` | *(opcional)* límites por-socket de eventos calientes (`EMERGENCY_ALERT`, `SEND_MESSAGE`, `AUDIO_MESSAGE`, `UPDATE_LOCATION`, `UPDATE_EMERGENCY_LOCATION`, `UPDATE_HELPER_LOCATION`); defaults en `src/common/socket-throttle.ts` |
 
 **NO** setear `FIRESTORE_EMULATOR_HOST` / `FIREBASE_AUTH_EMULATOR_HOST` / `FIREBASE_STORAGE_EMULATOR_HOST`
 en prod (esas son solo para dev contra emuladores).
 
 Deploy típico (Render/Railway): conectar el repo, que detecte el `Dockerfile`, cargar las env vars,
-desplegar. Healthcheck: `GET /health` → 200. CORS ya está habilitado (`app.enableCors()`).
+desplegar. Healthcheck: `GET /health` → 200 (la imagen además trae `HEALTHCHECK` propio). CORS: con
+`ALLOWED_ORIGINS` seteada queda restringido a esos orígenes.
 
 **El backend también sirve el panel** (ver §2): el `Dockerfile` compila el panel y el server lo
 entrega en `/panel`. El build del panel necesita la config WEB de Firebase como **build args**:
@@ -103,6 +107,8 @@ local. Solo en producción lo sirve el backend.
 ## 5. Checklist de seguridad
 
 - [ ] Service account de prod fuera del repo (solo como env var del host).
+- [ ] `ALLOWED_ORIGINS` seteada con los orígenes web reales (sin ella CORS queda abierto).
+- [ ] Google Maps API key de la app restringida por package+SHA1 en Google Cloud Console (la key vieja quedó en el historial de git → rotar).
 - [ ] Rotar credenciales que hayan estado expuestas (Maps API key del manifest, claves Firebase).
 - [ ] Restringir la Maps API key por package + SHA-1 en la consola de Google Cloud.
 - [ ] Fotos de verificación = datos sensibles (Ley 25.326): privadas en Storage, acceso solo por

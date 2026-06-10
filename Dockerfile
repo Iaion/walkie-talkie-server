@@ -38,5 +38,11 @@ RUN npm ci --omit=dev && npm cache clean --force
 COPY --from=build /app/dist ./dist
 # El panel compilado donde main.ts lo busca (admin-panel/dist) → se sirve en /panel.
 COPY --from=panel /panel/dist ./admin-panel/dist
+# Sin privilegios de root en runtime (la imagen node trae el usuario "node").
+RUN chown -R node:node /app
+USER node
 EXPOSE 8080
+# El orquestador (Cloud Run/Render/Docker) detecta un container muerto vía /health.
+HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
+  CMD node -e "require('http').get('http://127.0.0.1:'+(process.env.PORT||8080)+'/health',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"
 CMD ["node", "dist/main.js"]

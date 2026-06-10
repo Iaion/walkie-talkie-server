@@ -23,9 +23,11 @@ import { NotificationsService } from '../notifications/notifications.service';
 import { StateStore } from './state.store';
 import { EmergencyService } from './emergency.service';
 import { isDataUrl, isHttpUrl, getMimeFromDataUrl, getBase64FromDataUrl } from '../common/image-utils';
+import { corsOrigins } from '../common/cors';
+import { SocketThrottle, RATE_LIMITED_ACK } from '../common/socket-throttle';
 
 @WebSocketGateway({
-  cors: { origin: '*', methods: ['GET', 'POST'] },
+  cors: { origin: corsOrigins(), methods: ['GET', 'POST'] },
   transports: ['websocket', 'polling'],
   allowEIO3: true,
 })
@@ -41,6 +43,7 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayDisconnect {
     private readonly firebase: FirebaseService,
     private readonly notifications: NotificationsService,
     private readonly emergency: EmergencyService,
+    private readonly throttle: SocketThrottle,
   ) {}
 
   afterInit(server: Server): void {
@@ -296,6 +299,7 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayDisconnect {
 
   @SubscribeMessage('send_message')
   async sendMessage(@ConnectedSocket() socket: Socket, @MessageBody() data: Record<string, any> = {}) {
+    if (!this.throttle.allow(socket.id, 'send_message')) return RATE_LIMITED_ACK;
     const { userId, username, text } = data;
     const roomId = data.roomId || (socket as any).currentRoom || 'general';
 
@@ -355,6 +359,7 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayDisconnect {
 
   @SubscribeMessage('update_location')
   async updateLocation(@ConnectedSocket() socket: Socket, @MessageBody() data: Record<string, any> = {}) {
+    if (!this.throttle.allow(socket.id, 'update_location')) return RATE_LIMITED_ACK;
     try {
       const { userId, lat, lng, timestamp } = data;
       if (!userId || typeof lat !== 'number' || typeof lng !== 'number') {
@@ -376,6 +381,7 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayDisconnect {
 
   @SubscribeMessage('update_emergency_location')
   async updateEmergencyLocation(@ConnectedSocket() socket: Socket, @MessageBody() data: Record<string, any> = {}) {
+    if (!this.throttle.allow(socket.id, 'update_emergency_location')) return RATE_LIMITED_ACK;
     try {
       const { roomId, userId, lat, lng, timestamp, accuracy } = data;
       if (!roomId || !userId || typeof lat !== 'number' || typeof lng !== 'number') {
@@ -412,6 +418,7 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayDisconnect {
 
   @SubscribeMessage('update_helper_location')
   async updateHelperLocation(@ConnectedSocket() socket: Socket, @MessageBody() data: Record<string, any> = {}) {
+    if (!this.throttle.allow(socket.id, 'update_helper_location')) return RATE_LIMITED_ACK;
     try {
       const { roomId, helperId, emergencyUserId, lat, lng, timestamp, accuracy } = data;
       if (!roomId || !helperId || typeof lat !== 'number' || typeof lng !== 'number') {
@@ -534,6 +541,9 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayDisconnect {
 
   @SubscribeMessage('emergency_alert')
   async emergencyAlert(@ConnectedSocket() socket: Socket, @MessageBody() data: Record<string, any> = {}) {
+    if (!this.throttle.allow(socket.id, 'emergency_alert')) {
+      return { ...RATE_LIMITED_ACK, code: 'RATE_LIMITED' };
+    }
     let lockAcquired = false;
     let reqUserId: string | null = null;
     let emergencyRoomId: string | null = null;
@@ -888,6 +898,7 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayDisconnect {
 
   @SubscribeMessage('audio_message')
   async audioMessage(@ConnectedSocket() socket: Socket, @MessageBody() data: Record<string, any> = {}) {
+    if (!this.throttle.allow(socket.id, 'audio_message')) return RATE_LIMITED_ACK;
     try {
       const { userId, username } = data;
       const roomId = data.roomId || (socket as any).currentRoom || 'general';
@@ -955,6 +966,7 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayDisconnect {
   }
 
   async handleDisconnect(socket: Socket): Promise<void> {
+    this.throttle.forget(socket.id);
     const userId = (socket as any).userId;
     if (!userId) return;
 
