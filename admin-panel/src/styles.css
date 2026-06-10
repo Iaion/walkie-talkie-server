@@ -132,3 +132,16 @@ main { padding: 1.25rem; max-width: 900px; margin: 0 auto; }
 .actions input { flex: 1; }
 .actions .approve { background: var(--green); }
 .actions .reject { background: var(--accent); }
+
+/* Toasts de feedback (G3) */
+.toasts { position: fixed; bottom: 1rem; right: 1rem; display: flex; flex-direction: column; gap: 0.5rem; z-index: 100; }
+.toast { padding: 0.6rem 1rem; border-radius: 10px; border: 1px solid var(--border); background: #0b1220; box-shadow: 0 4px 16px rgba(0,0,0,.4); animation: toast-in .2s ease-out; }
+.toast.success { border-color: var(--green); }
+.toast.error { border-color: var(--accent); }
+@keyframes toast-in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+
+/* Paginacion (G2) */
+.load-more { display: block; margin: 1rem auto; }
+
+/* a11y: label visible solo para lectores de pantalla */
+.visually-hidden { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }

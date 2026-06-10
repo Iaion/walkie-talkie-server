@@ -10,6 +10,7 @@ import {
   type User,
 } from 'firebase/auth';
 import { auth } from '../firebase';
+import { setOnUnauthorized } from '../api';
 
 interface AuthState {
   user: User | null;
@@ -25,6 +26,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<User | null>(null);
   const [isAdmin, setIsAdmin] = useState(false);
   const [loading, setLoading] = useState(true);
+
+  // 401 de la API = sesión caída → logout global y de vuelta al login (G1).
+  useEffect(() => {
+    setOnUnauthorized(() => void signOut(auth));
+    return () => setOnUnauthorized(null);
+  }, []);
 
   useEffect(() => {
     return onAuthStateChanged(auth, async (u) => {

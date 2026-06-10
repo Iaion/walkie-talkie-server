@@ -80,10 +80,23 @@ export class VerificationRepository {
     return d.exists ? { uid: d.id, ...(d.data() as Record<string, any>) } : null;
   }
 
-  /** Cola de verificaciones por estado (default: las que esperan review). */
-  async listByStatus(status: string): Promise<Record<string, any>[]> {
-    const snap = await this.verifications.where('status', '==', status).get();
-    return snap.docs.map((d) => ({ uid: d.id, ...(d.data() as Record<string, any>) }));
+  /**
+   * Cola de verificaciones por estado (default: las que esperan review).
+   * Con paginación (G2): pide limit+1 para saber si hay más sin un count extra.
+   * Sin `page` trae todo (comportamiento original).
+   */
+  async listByStatus(
+    status: string,
+    page?: { limit: number; offset: number },
+  ): Promise<{ items: Record<string, any>[]; hasMore: boolean }> {
+    let query: FirebaseFirestore.Query = this.verifications.where('status', '==', status);
+    if (page) query = query.offset(page.offset).limit(page.limit + 1);
+    const snap = await query.get();
+    const docs = snap.docs.map((d) => ({ uid: d.id, ...(d.data() as Record<string, any>) }));
+    if (page && docs.length > page.limit) {
+      return { items: docs.slice(0, page.limit), hasMore: true };
+    }
+    return { items: docs, hasMore: false };
   }
 
   /** Aprobar/rechazar: actualiza estado del user y de la verification de forma atómica. */

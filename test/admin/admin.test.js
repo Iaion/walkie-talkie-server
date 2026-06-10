@@ -37,6 +37,24 @@ describe('Admin — review de verificaciones (Fase 3)', () => {
     expect(res.body.verifications.map((v) => v.uid)).toContain('U1');
   });
 
+  test('paginación (G2): limit+offset + hasMore; sin limit trae todo', async () => {
+    for (let i = 1; i <= 5; i++) await seedPending(`P${i}`);
+    const api = bearer(await getAdminIdToken());
+
+    const page1 = await api('get', '/admin/verifications?limit=2&offset=0');
+    expect(page1.status).toBe(200);
+    expect(page1.body.verifications).toHaveLength(2);
+    expect(page1.body.hasMore).toBe(true);
+
+    const page3 = await api('get', '/admin/verifications?limit=2&offset=4');
+    expect(page3.body.verifications).toHaveLength(1);
+    expect(page3.body.hasMore).toBe(false);
+
+    const all = await api('get', '/admin/verifications');
+    expect(all.body.verifications).toHaveLength(5);
+    expect(all.body.hasMore).toBe(false);
+  });
+
   test('admin aprueba → usuario approved', async () => {
     await seedPending('U1');
     const api = bearer(await getAdminIdToken());

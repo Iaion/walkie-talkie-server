@@ -1,4 +1,5 @@
-/** Cola de verificaciones con tabs por estado (pendientes/aprobados/rechazados); abre el detalle. */
+/** Cola de verificaciones con tabs por estado (pendientes/aprobados/rechazados); abre el detalle.
+ *  Paginada (G2): trae de a PAGE_SIZE con "Cargar más" — no se descarga la cola entera. */
 import { useEffect, useState } from 'react';
 import { adminApi, type Verification } from '../api';
 import { VerificationDetail } from './VerificationDetail';
@@ -12,6 +13,7 @@ const TABS = [
 export function VerificationsPage() {
   const [status, setStatus] = useState<string>('pending_review');
   const [items, setItems] = useState<Verification[]>([]);
+  const [hasMore, setHasMore] = useState(false);
   const [selected, setSelected] = useState<Verification | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
@@ -20,10 +22,25 @@ export function VerificationsPage() {
     setLoading(true);
     setError('');
     try {
-      const res = await adminApi.listVerifications(st);
+      const res = await adminApi.listVerifications(st, 0);
       setItems(res.verifications || []);
+      setHasMore(!!res.hasMore);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Error cargando la lista');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const loadMore = async () => {
+    setLoading(true);
+    setError('');
+    try {
+      const res = await adminApi.listVerifications(status, items.length);
+      setItems((prev) => [...prev, ...(res.verifications || [])]);
+      setHasMore(!!res.hasMore);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Error cargando más resultados');
     } finally {
       setLoading(false);
     }
@@ -52,14 +69,21 @@ export function VerificationsPage() {
   return (
     <div className="queue">
       <header>
-        <h2>Verificaciones ({items.length})</h2>
-        <button onClick={() => void load(status)}>Actualizar</button>
+        <h2>
+          Verificaciones ({items.length}
+          {hasMore ? '+' : ''})
+        </h2>
+        <button onClick={() => void load(status)} aria-label="Actualizar la lista">
+          Actualizar
+        </button>
       </header>
 
-      <div className="tabs">
+      <div className="tabs" role="tablist">
         {TABS.map((t) => (
           <button
             key={t.value}
+            role="tab"
+            aria-selected={status === t.value}
             className={`tab ${status === t.value ? 'active' : ''}`}
             onClick={() => setStatus(t.value)}
           >
@@ -69,7 +93,14 @@ export function VerificationsPage() {
       </div>
 
       {loading && <p>Cargando…</p>}
-      {error && <p className="error">{error}</p>}
+      {error && (
+        <p className="error">
+          {error}{' '}
+          <button onClick={() => void load(status)} aria-label="Reintentar la carga">
+            Reintentar
+          </button>
+        </p>
+      )}
       {!loading && !error && items.length === 0 && <p>No hay verificaciones en esta categoría.</p>}
 
       <ul className="list">
@@ -82,6 +113,12 @@ export function VerificationsPage() {
           </li>
         ))}
       </ul>
+
+      {hasMore && !loading && (
+        <button className="load-more" onClick={() => void loadMore()}>
+          Cargar más
+        </button>
+      )}
     </div>
   );
 }

@@ -21,9 +21,14 @@ export class AdminService {
     private readonly firebase: FirebaseService,
   ) {}
 
-  async listVerifications(status: string = UserState.PENDING_REVIEW) {
-    const verifications = await this.repo.listByStatus(status);
-    return { success: true, verifications, total: verifications.length };
+  /**
+   * Cola para el panel. Con limit/offset pagina (G2; `hasMore` para el "cargar más");
+   * sin limit devuelve todo (contrato original intacto).
+   */
+  async listVerifications(status: string = UserState.PENDING_REVIEW, limit?: number, offset?: number) {
+    const page = limit && limit > 0 ? { limit, offset: Math.max(0, offset || 0) } : undefined;
+    const { items, hasMore } = await this.repo.listByStatus(status, page);
+    return { success: true, verifications: items, total: items.length, hasMore };
   }
 
   /**

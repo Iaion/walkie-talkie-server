@@ -15,8 +15,12 @@ export class AdminController {
   constructor(private readonly service: AdminService) {}
 
   @Get('verifications')
-  list(@Query('status') status?: string) {
-    return this.service.listVerifications(status || 'pending_review');
+  list(@Query('status') status?: string, @Query('limit') limit?: string, @Query('offset') offset?: string) {
+    return this.service.listVerifications(
+      status || 'pending_review',
+      limit ? Number(limit) : undefined,
+      offset ? Number(offset) : undefined,
+    );
   }
 
   @Get('verifications/:uid/photos')
