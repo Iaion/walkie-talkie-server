@@ -1,0 +1,21 @@
+# Aplica a backend Y al panel anidado (admin-panel/). Usar **/ para alcanzar lo anidado.
+**/node_modules
+**/dist
+**/coverage
+**/.env
+**/.env.local
+**/*.log
+.git
+.gitignore
+.e2e-*.log
+.serve-test.log
+secrets
+**/firebase-debug.log
+**/firestore-debug.log
+**/ui-debug.log
+test
+**/.playwright-mcp
+README.md
+ARQUITECTURA.md
+ARQUITECTURA_SISTEMA.md
+DEPLOYMENT.md

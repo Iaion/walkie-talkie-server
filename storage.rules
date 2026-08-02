@@ -1,0 +1,13 @@
+rules_version = '2';
+
+// Reglas de seguridad de Storage — VERSIONADAS en git (parte del plan).
+// Punto de partida (Fase 0): acceso de CLIENTES denegado por completo.
+// El backend (Admin SDK) sube/lee archivos y no pasa por estas reglas.
+// Se afinan en Fase 3, cuando entran las fotos de verificación (acceso solo a admins, URLs firmadas).
+service firebase.storage {
+  match /b/{bucket}/o {
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}
