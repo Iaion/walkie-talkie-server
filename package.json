@@ -10,6 +10,7 @@
     "test": "jest --runInBand --forceExit",
     "test:ci": "nest build && firebase emulators:exec --project alrescate-dev \"jest --runInBand --forceExit\"",
     "lint": "eslint .",
+    "prepare": "git config core.hooksPath .githooks",
     "format": "prettier --write \\src/**/*.ts\""
   },
   "dependencies": {
