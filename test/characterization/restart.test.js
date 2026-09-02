@@ -7,7 +7,7 @@
 const { io } = require('socket.io-client');
 const { startServer, stopServer, PORT } = require('../setup/server');
 const { getIdTokenForUid } = require('../setup/auth');
-const { getDoc } = require('../setup/emulator');
+const { getDoc, setDoc } = require('../setup/emulator');
 
 const URL = `http://127.0.0.1:${PORT}`;
 const LOC = { latitude: -34.6037, longitude: -58.3816 };
@@ -43,7 +43,9 @@ describe('Emergencias sobreviven a un restart del server (Fase E)', () => {
     });
     expect(alert.success).toBe(true);
 
-    // 2) Un ayudante confirma (queda espejado en Firestore)
+    // 2) Un ayudante confirma (queda espejado en Firestore).
+    // help_confirm exige que el ayudante esté approved en users/ (regla de 8da8438).
+    await setDoc('users', 'HELPER_R', { state: 'approved' });
     const helper = await newSocket('HELPER_R');
     const confirm = await helper.emitWithAck('help_confirm', {
       emergencyUserId: 'VICTIMA_R', helperId: 'HELPER_R', helperName: 'Ayudante', ...LOC,

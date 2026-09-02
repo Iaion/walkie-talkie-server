@@ -9,7 +9,7 @@
  * en beforeEach lo resetea, garantizando aislamiento entre tests.
  */
 const { io } = require('socket.io-client');
-const { clearFirestore, listDocs } = require('../setup/emulator');
+const { clearFirestore, listDocs, setDoc } = require('../setup/emulator');
 const { startServer, stopServer } = require('../setup/server');
 const { getIdTokenForUid } = require('../setup/auth');
 
@@ -118,6 +118,11 @@ describe('Caracterización Socket.IO — eventos críticos del monolito', () => 
   });
 
   describe('help_confirm / help_reject', () => {
+    // Desde 8da8438 el ayudante debe existir en users/ con state=approved.
+    beforeEach(async () => {
+      await setDoc('users', 'H1', { state: 'approved' });
+    });
+
     test('help_confirm sin datos → "Datos incompletos"', async () => {
       const s = await newSocket();
       const res = await s.emitWithAck('help_confirm', {});
@@ -130,6 +135,23 @@ describe('Caracterización Socket.IO — eventos críticos del monolito', () => 
         emergencyUserId: 'U1', helperId: 'H1', helperName: 'Pedro',
       });
       expect(res).toEqual({ success: true });
+    });
+
+    test('help_confirm de un usuario inexistente → USER_NOT_FOUND', async () => {
+      const s = await newSocket('H2');
+      const res = await s.emitWithAck('help_confirm', {
+        emergencyUserId: 'U1', helperId: 'H2', helperName: 'Fantasma',
+      });
+      expect(res).toMatchObject({ success: false, code: 'USER_NOT_FOUND' });
+    });
+
+    test('help_confirm de un usuario sin aprobar → USER_NOT_APPROVED', async () => {
+      await setDoc('users', 'H2', { state: 'pending_review' });
+      const s = await newSocket('H2');
+      const res = await s.emitWithAck('help_confirm', {
+        emergencyUserId: 'U1', helperId: 'H2', helperName: 'Pendiente',
+      });
+      expect(res).toMatchObject({ success: false, code: 'USER_NOT_APPROVED' });
     });
 
     test('help_reject sin datos → "Datos incompletos"', async () => {
