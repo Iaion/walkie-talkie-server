@@ -1,8 +1,12 @@
 /**
- * scripts/bootstrap-admin-prod.js — crea (o encuentra) el usuario admin en PRODUCCIÓN
- * y le setea el claim role=admin. Usa secrets/serviceAccountKey.prod.json.
+ * scripts/bootstrap-admin-prod.js — da rol de admin a un usuario en PRODUCCIÓN.
+ * Usa secrets/serviceAccountKey.prod.json.
  *
- * Uso: node scripts/bootstrap-admin-prod.js <email> <password>
+ * Uso:
+ *   node scripts/bootstrap-admin-prod.js <email>              → usuario EXISTENTE: solo agrega el rol (no toca su contraseña)
+ *   node scripts/bootstrap-admin-prod.js <email> <password>   → si no existe, lo CREA con esa contraseña
+ *
+ * El flamante admin tiene que cerrar sesión y volver a entrar al panel para que el rol tome efecto.
  */
 const fs = require('fs');
 const path = require('path');
@@ -13,19 +17,22 @@ admin.initializeApp({ credential: admin.credential.cert(key), projectId: key.pro
 
 async function main() {
   const [email, password] = process.argv.slice(2);
-  if (!email || !password) {
-    console.error('Uso: node scripts/bootstrap-admin-prod.js <email> <password>');
+  if (!email) {
+    console.error('Uso: node scripts/bootstrap-admin-prod.js <email> [password-solo-si-es-usuario-nuevo]');
     process.exit(1);
   }
 
   let user;
   try {
     user = await admin.auth().getUserByEmail(email);
-    console.log(`Usuario ya existía: uid=${user.uid}`);
-    await admin.auth().updateUser(user.uid, { password, emailVerified: true });
-    console.log('Password actualizada y email marcado verificado.');
+    // Usuario existente: SOLO se agrega el rol. Su contraseña no se toca.
+    console.log(`Usuario ya existía: uid=${user.uid} — se le agrega el rol admin, contraseña intacta.`);
   } catch (e) {
     if (e.code === 'auth/user-not-found') {
+      if (!password) {
+        console.error(`${email} no existe. Para crearlo pasá también una contraseña: node scripts/bootstrap-admin-prod.js <email> <password>`);
+        process.exit(1);
+      }
       user = await admin.auth().createUser({ email, password, emailVerified: true });
       console.log(`Usuario creado: uid=${user.uid}`);
     } else {
