@@ -625,189 +625,823 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayDisconnect, OnMo
 // ============================================================
 
 @SubscribeMessage('emergency_alert')
-async emergencyAlert(@ConnectedSocket() socket: Socket, @MessageBody() data: Record<string, any> = {}) {
+async emergencyAlert(
+  @ConnectedSocket() socket: Socket,
+  @MessageBody() data: Record<string, any> = {}
+) {
   if (!this.throttle.allow(socket.id, 'emergency_alert')) {
     return { ...RATE_LIMITED_ACK, code: 'RATE_LIMITED' };
   }
+
   let lockAcquired = false;
   let reqUserId: string | null = null;
   let emergencyRoomId: string | null = null;
+
   try {
-    const { userId, userName, latitude, longitude, timestamp, emergencyType = 'general' } = data;
+    const {
+      userId,
+      userName,
+      latitude,
+      longitude,
+      timestamp,
+      emergencyType = 'general'
+    } = data;
+
     reqUserId = userId || null;
 
-    if (!userId || !userName) return { success: false, code: 'INVALID_DATA', message: 'Datos de usuario inválidos' };
-    if (this.notSelf(socket, userId)) return { success: false, code: 'FORBIDDEN', message: 'No autorizado: solo podés disparar tu propia emergencia' };
+    if (!userId || !userName) {
+      return {
+        success: false,
+        code: 'INVALID_DATA',
+        message: 'Datos de usuario inválidos'
+      };
+    }
+
+    if (this.notSelf(socket, userId)) {
+      return {
+        success: false,
+        code: 'FORBIDDEN',
+        message: 'No autorizado: solo podés disparar tu propia emergencia'
+      };
+    }
+
     if (!isValidLat(latitude) || !isValidLng(longitude)) {
-      return { success: false, code: 'INVALID_LOCATION', message: 'Ubicación inválida' };
+      return {
+        success: false,
+        code: 'INVALID_LOCATION',
+        message: 'Ubicación inválida'
+      };
     }
 
     emergencyRoomId = `emergencia_${userId}`;
-    const lockResult = await this.emergency.acquireLock(userId, emergencyRoomId, emergencyType);
+
+    const lockResult = await this.emergency.acquireLock(
+      userId,
+      emergencyRoomId,
+      emergencyType
+    );
+
     if (!lockResult.allowed) {
       return {
         success: false,
         code: 'EMERGENCY_ALREADY_ACTIVE',
-        message: '⚠️ Esta es una versión de prueba. Actualmente manejamos una emergencia a la vez, y ya hay una en curso. Volvé a intentarlo más tarde.',
+        message:
+          '⚠️ Esta es una versión de prueba. Actualmente manejamos una emergencia a la vez, y ya hay una en curso. Volvé a intentarlo más tarde.',
         activeEmergency: lockResult.activeEmergency,
       };
     }
+
     lockAcquired = true;
 
     socket.join(emergencyRoomId);
     (socket as any).currentRoom = emergencyRoomId;
 
+    // ============================================================
+    // 👤 Avatar del usuario que dispara la emergencia
+    // ============================================================
+
     let avatarUrl: string | null = null;
+
     try {
-      const userDoc = await this.firebase.firestore.collection('users').doc(userId).get();
-      if (userDoc.exists) { const ud = userDoc.data() || {}; avatarUrl = ud.avatarUrl || ud.avatarUri || null; }
-    } catch (e) { this.bestEffort('persistencia', e); }
+      const userDoc = await this.firebase.firestore
+        .collection('users')
+        .doc(userId)
+        .get();
+
+      if (userDoc.exists) {
+        const ud = userDoc.data() || {};
+        avatarUrl = ud.avatarUrl || ud.avatarUri || null;
+      }
+    } catch (e) {
+      this.bestEffort('persistencia', e);
+    }
+
+    // ============================================================
+    // 🚗 Vehículo principal activo
+    // ============================================================
 
     let vehicleData: Record<string, any> | null = null;
+
     try {
-      const vs = await this.firebase.firestore.collection('vehicles')
-        .where('userId', '==', userId).where('isPrimary', '==', true).where('isActive', '==', true).limit(1).get();
+      const vs = await this.firebase.firestore
+        .collection('vehicles')
+        .where('userId', '==', userId)
+        .where('isPrimary', '==', true)
+        .where('isActive', '==', true)
+        .limit(1)
+        .get();
+
       if (!vs.empty) {
         const v = vs.docs[0].data() || {};
         const t = v.type || v.tipo || null;
+
         vehicleData = {
-          id: vs.docs[0].id, type: t,
-          name: v.name || v.nombre || null, brand: v.brand || v.marca || null, model: v.model || v.modelo || null,
-          year: v.year || null, color: v.color || null, licensePlate: v.licensePlate || v.patente || null,
-          photoUri: v.photoUri || v.fotoVehiculoUri || null,
-          ...(t === 'CAR' && { doors: v.doors }),
-          ...(t === 'MOTORCYCLE' && { cylinderCapacity: v.cylinderCapacity, mileage: v.mileage }),
-          ...(t === 'BICYCLE' && { frameSerialNumber: v.frameSerialNumber, hasElectricMotor: v.hasElectricMotor, frameSize: v.frameSize }),
+          id: vs.docs[0].id,
+          type: t,
+
+          name: v.name || v.nombre || null,
+          brand: v.brand || v.marca || null,
+          model: v.model || v.modelo || null,
+
+          year: v.year || null,
+          color: v.color || null,
+
+          licensePlate:
+            v.licensePlate ||
+            v.patente ||
+            null,
+
+          photoUri:
+            v.photoUri ||
+            v.fotoVehiculoUri ||
+            null,
+
+          ...(t === 'CAR' && {
+            doors: v.doors
+          }),
+
+          ...(t === 'MOTORCYCLE' && {
+            cylinderCapacity: v.cylinderCapacity,
+            mileage: v.mileage
+          }),
+
+          ...(t === 'BICYCLE' && {
+            frameSerialNumber: v.frameSerialNumber,
+            hasElectricMotor: v.hasElectricMotor,
+            frameSize: v.frameSize
+          }),
         };
       }
-    } catch (e) { this.bestEffort('persistencia', e); }
-
-    const emergencyData: Record<string, any> = {
-      userId, userName, avatarUrl, latitude, longitude,
-      timestamp: typeof timestamp === 'number' ? timestamp : Date.now(),
-      socketId: socket.id, emergencyType, status: 'active', emergencyRoomId, roomId: emergencyRoomId, vehicleInfo: vehicleData,
-    };
-    this.state.emergencyAlerts.set(userId, emergencyData);
-    if (!this.state.emergencyHelpers.has(userId)) this.state.emergencyHelpers.set(userId, new Set());
-
-    try {
-      await this.firebase.firestore.collection('emergencies').doc(userId).set({ ...emergencyData, isActive: true, createdAt: Date.now() }, { merge: true });
-      await this.firebase.firestore.collection('users').doc(userId).update({ hasActiveEmergency: true, emergencyRoomId, lastEmergencyStarted: Date.now() });
-    } catch (e) { this.bestEffort('persistencia', e); }
-
-    const emergencyRoom = {
-      id: emergencyRoomId, name: `Emergencia ${userName}`, type: 'emergency',
-      description: `Sala de emergencia para ${userName}`, users: new Set<string>([userId]),
-      createdAt: Date.now(), messageCount: 0,
-    } as any;
-    this.state.chatRooms.set(emergencyRoomId, emergencyRoom);
-    this.state.emergencyUserRoom.set(userId, emergencyRoomId);
-
-    socket.emit('emergency_room_created', { emergencyUserId: userId, emergencyRoomId });
-    this.server.emit('new_room_created', {
-      id: emergencyRoom.id, name: emergencyRoom.name, type: emergencyRoom.type, description: emergencyRoom.description,
-      userCount: emergencyRoom.users.size, messageCount: emergencyRoom.messageCount, createdAt: emergencyRoom.createdAt,
-    });
-
-    const approvedUsersSnap = await this.firebase.firestore
-      .collection('users')
-      .where('state', '==', 'approved')
-      .get();
-
-    const approvedUserIds = new Set(
-      approvedUsersSnap.docs.map((doc) => doc.id)
-    );
-
-    // Broadcast a sockets conectados
-    let socketNotifications = 0;
-    const notifiedUsers = new Set<string>();
-    for (const [sid, s] of this.server.sockets.sockets) {
-      if (sid === socket.id) continue;
-      if ((s as any).userId && (s as any).userId === userId) continue;
-
-      const targetUserId = (s as any).userId;
-      if (!targetUserId) continue;
-      if (!approvedUserIds.has(targetUserId)) continue;
-
-      this.server.to(sid).emit('emergency_alert', { ...emergencyData, emergencyRoomId });
-      socketNotifications++;
-      if ((s as any).userId) notifiedUsers.add((s as any).userId);
+    } catch (e) {
+      this.bestEffort('persistencia', e);
     }
 
-    // Push a los no notificados por socket (best-effort)
-    let pushNotifications = 0;
+    // ============================================================
+    // 🚨 Datos de emergencia
+    // ============================================================
+
+    const emergencyData: Record<string, any> = {
+      userId,
+      userName,
+      avatarUrl,
+      latitude,
+      longitude,
+
+      timestamp:
+        typeof timestamp === 'number'
+          ? timestamp
+          : Date.now(),
+
+      socketId: socket.id,
+
+      emergencyType,
+      status: 'active',
+
+      emergencyRoomId,
+      roomId: emergencyRoomId,
+
+      vehicleInfo: vehicleData,
+    };
+
+    this.state.emergencyAlerts.set(
+      userId,
+      emergencyData
+    );
+
+    if (!this.state.emergencyHelpers.has(userId)) {
+      this.state.emergencyHelpers.set(
+        userId,
+        new Set()
+      );
+    }
+
+    // ============================================================
+    // 🔥 Persistir emergencia
+    // ============================================================
+
     try {
-      for (const doc of approvedUsersSnap.docs) {
-        const targetUserId = doc.id;
-        if (targetUserId === userId) continue;
-        if (notifiedUsers.has(targetUserId)) continue;
-        const ok = await this.notifications.sendPushNotification(targetUserId, '🚨 EMERGENCIA', `${userName} necesita ayuda`, {
-          emergency_user_id: userId, emergency_user_name: userName,
-          emergency_latitude: latitude, emergency_longitude: longitude,
-          emergency_avatar_url: avatarUrl || '', emergency_room_id: emergencyRoomId,
+      await this.firebase.firestore
+        .collection('emergencies')
+        .doc(userId)
+        .set(
+          {
+            ...emergencyData,
+            isActive: true,
+            createdAt: Date.now()
+          },
+          { merge: true }
+        );
+
+      await this.firebase.firestore
+        .collection('users')
+        .doc(userId)
+        .update({
+          hasActiveEmergency: true,
+          emergencyRoomId,
+          lastEmergencyStarted: Date.now()
         });
-        if (ok) pushNotifications++;
+
+    } catch (e) {
+      this.bestEffort('persistencia', e);
+    }
+
+    // ============================================================
+    // 💬 Crear sala de emergencia
+    // ============================================================
+
+    const emergencyRoom = {
+      id: emergencyRoomId,
+      name: `Emergencia ${userName}`,
+      type: 'emergency',
+
+      description:
+        `Sala de emergencia para ${userName}`,
+
+      users: new Set<string>([userId]),
+
+      createdAt: Date.now(),
+      messageCount: 0,
+    } as any;
+
+    this.state.chatRooms.set(
+      emergencyRoomId,
+      emergencyRoom
+    );
+
+    this.state.emergencyUserRoom.set(
+      userId,
+      emergencyRoomId
+    );
+
+    // ============================================================
+    // ✅ Obtener SOLO usuarios dados de alta
+    // ============================================================
+
+    const approvedUsersSnap =
+      await this.firebase.firestore
+        .collection('users')
+        .where('state', '==', 'approved')
+        .get();
+
+    const approvedUserIds = new Set<string>(
+      approvedUsersSnap.docs.map(
+        (doc) => doc.id
+      )
+    );
+
+    // ============================================================
+    // 🚨 Avisar al dueño que su sala fue creada
+    // ============================================================
+
+    socket.emit(
+      'emergency_room_created',
+      {
+        emergencyUserId: userId,
+        emergencyRoomId
       }
-    } catch (e) { this.bestEffort('persistencia', e); }
+    );
+
+    // ============================================================
+    // 🔒 CAMBIO 1:
+    // new_room_created SOLO a usuarios aprobados
+    // ============================================================
+
+    for (
+      const [sid, s]
+      of this.server.sockets.sockets
+    ) {
+      if (sid === socket.id) {
+        continue;
+      }
+
+      const targetUserId =
+        (s as any).userId;
+
+      if (!targetUserId) {
+        continue;
+      }
+
+      // No mandar a otros sockets
+      // del dueño de la emergencia
+      if (targetUserId === userId) {
+        continue;
+      }
+
+      // 🚫 Usuario pendiente / rechazado
+      if (
+        !approvedUserIds.has(targetUserId)
+      ) {
+        console.log(
+          `⛔ new_room_created bloqueado para usuario no aprobado: ${targetUserId}`
+        );
+
+        continue;
+      }
+
+      // ✅ Usuario aprobado
+      this.server
+        .to(sid)
+        .emit(
+          'new_room_created',
+          {
+            id: emergencyRoom.id,
+
+            name:
+              emergencyRoom.name,
+
+            type:
+              emergencyRoom.type,
+
+            description:
+              emergencyRoom.description,
+
+            userCount:
+              emergencyRoom.users.size,
+
+            messageCount:
+              emergencyRoom.messageCount,
+
+            createdAt:
+              emergencyRoom.createdAt,
+          }
+        );
+    }
+
+    // ============================================================
+    // 🔒 CAMBIO 2:
+    // emergency_alert SOLO a usuarios aprobados
+    // ============================================================
+
+    let socketNotifications = 0;
+
+    const notifiedUsers =
+      new Set<string>();
+
+    for (
+      const [sid, s]
+      of this.server.sockets.sockets
+    ) {
+      // No mandar al socket que creó la emergencia
+      if (sid === socket.id) {
+        continue;
+      }
+
+      const targetUserId =
+        (s as any).userId;
+
+      if (!targetUserId) {
+        continue;
+      }
+
+      // No mandar al mismo usuario
+      if (targetUserId === userId) {
+        continue;
+      }
+
+      // 🚫 CRÍTICO:
+      // solo usuarios dados de alta
+      if (
+        !approvedUserIds.has(targetUserId)
+      ) {
+        console.log(
+          `⛔ emergency_alert bloqueado para usuario no aprobado: ${targetUserId}`
+        );
+
+        continue;
+      }
+
+      // ✅ Usuario aprobado
+      this.server
+        .to(sid)
+        .emit(
+          'emergency_alert',
+          {
+            ...emergencyData,
+            emergencyRoomId
+          }
+        );
+
+      socketNotifications++;
+
+      notifiedUsers.add(
+        targetUserId
+      );
+    }
+
+    // ============================================================
+    // 📲 Push FCM
+    // SOLO usuarios aprobados que NO fueron notificados por socket
+    // ============================================================
+
+    let pushNotifications = 0;
+
+    try {
+      for (
+        const doc
+        of approvedUsersSnap.docs
+      ) {
+        const targetUserId =
+          doc.id;
+
+        // No notificar al creador
+        if (
+          targetUserId === userId
+        ) {
+          continue;
+        }
+
+        // Ya recibió por socket
+        if (
+          notifiedUsers.has(
+            targetUserId
+          )
+        ) {
+          continue;
+        }
+
+        const ok =
+          await this.notifications
+            .sendPushNotification(
+              targetUserId,
+              '🚨 EMERGENCIA',
+              `${userName} necesita ayuda`,
+              {
+                emergency_user_id:
+                  userId,
+
+                emergency_user_name:
+                  userName,
+
+                emergency_latitude:
+                  latitude,
+
+                emergency_longitude:
+                  longitude,
+
+                emergency_avatar_url:
+                  avatarUrl || '',
+
+                emergency_room_id:
+                  emergencyRoomId,
+              }
+            );
+
+        if (ok) {
+          pushNotifications++;
+        }
+      }
+
+    } catch (e) {
+      this.bestEffort(
+        'persistencia',
+        e
+      );
+    }
+
+    // ============================================================
+    // ✅ RESPUESTA
+    // ============================================================
 
     return {
-      success: true, message: 'Alerta de emergencia enviada correctamente',
-      vehicle: vehicleData, avatarUrl, socketNotifications, pushNotifications,
-      emergencyRoomId, staleReplaced: !!lockResult.staleReplaced,
+      success: true,
+
+      message:
+        'Alerta de emergencia enviada correctamente',
+
+      vehicle:
+        vehicleData,
+
+      avatarUrl,
+
+      socketNotifications,
+
+      pushNotifications,
+
+      emergencyRoomId,
+
+      staleReplaced:
+        !!lockResult.staleReplaced,
     };
+
   } catch {
+
+    // ============================================================
+    // 🔄 Rollback si algo falla
+    // ============================================================
+
     if (lockAcquired) {
       try {
         await this.emergency.releaseLock({
-          userId: reqUserId,
-          roomId: emergencyRoomId || (reqUserId ? `emergencia_${reqUserId}` : null),
-          reason: 'error_during_emergency',
+          userId:
+            reqUserId,
+
+          roomId:
+            emergencyRoomId ||
+            (
+              reqUserId
+                ? `emergencia_${reqUserId}`
+                : null
+            ),
+
+          reason:
+            'error_during_emergency',
         });
-      } catch (e) { this.bestEffort('emergency_alert.rollback', e); }
+
+      } catch (e) {
+        this.bestEffort(
+          'emergency_alert.rollback',
+          e
+        );
+      }
     }
-    return { success: false, code: 'SERVER_ERROR', message: 'Error procesando alerta de emergencia' };
+
+    return {
+      success: false,
+      code: 'SERVER_ERROR',
+      message:
+        'Error procesando alerta de emergencia'
+    };
   }
 }
 
-  @SubscribeMessage('help_confirm')
-  helpConfirm(@ConnectedSocket() socket: Socket, @MessageBody() data: Record<string, any> = {}) {
-    try {
-      const { emergencyUserId, helperId, helperName, latitude, longitude, timestamp } = data;
-      if (!emergencyUserId || !helperId) return { success: false, message: 'Datos incompletos' };
-      if (this.notSelf(socket, helperId)) return this.FORBIDDEN_ACK;
-      const helpers = this.state.emergencyHelpers.get(emergencyUserId);
-      if (helpers) helpers.add(helperId);
-      // Espejo en Firestore (E1, fire-and-forget): sobrevive a un restart del server.
-      this.firebase.firestore.collection('emergencies').doc(emergencyUserId)
-        .update({ helpers: admin.firestore.FieldValue.arrayUnion(helperId) })
-        .catch((e) => this.bestEffort('help_confirm.espejo', e));
-      this.server.to(emergencyUserId).emit('help_confirmed', {
-        emergencyUserId, helperId, helperName: helperName || 'Ayudante', latitude, longitude, timestamp: timestamp || Date.now(),
-      });
-      this.server.to(helperId).emit('help_confirmed_notification', { emergencyUserId, helperId, helperName, timestamp: Date.now() });
-      return { success: true };
-    } catch (e: any) {
-      return { success: false, message: e.message };
-    }
-  }
 
-  @SubscribeMessage('help_reject')
-  helpReject(@ConnectedSocket() socket: Socket, @MessageBody() data: Record<string, any> = {}) {
-    try {
-      const { emergencyUserId, helperId } = data;
-      if (!emergencyUserId || !helperId) return { success: false, message: 'Datos incompletos' };
-      if (this.notSelf(socket, helperId)) return this.FORBIDDEN_ACK;
-      const helpers = this.state.emergencyHelpers.get(emergencyUserId);
-      if (helpers) helpers.delete(helperId);
-      this.firebase.firestore.collection('emergencies').doc(emergencyUserId)
-        .update({ helpers: admin.firestore.FieldValue.arrayRemove(helperId) })
-        .catch((e) => this.bestEffort('help_reject.espejo', e));
-      this.server.to(helperId).emit('help_rejected', { emergencyUserId, helperId, timestamp: Date.now() });
-      return { success: true };
-    } catch (e: any) {
-      return { success: false, message: e.message };
+// ============================================================
+// 🤝 CONFIRMAR AYUDA
+// ============================================================
+
+@SubscribeMessage('help_confirm')
+async helpConfirm(
+  @ConnectedSocket() socket: Socket,
+  @MessageBody() data: Record<string, any> = {}
+) {
+  try {
+    const {
+      emergencyUserId,
+      helperId,
+      helperName,
+      latitude,
+      longitude,
+      timestamp
+    } = data;
+
+    if (
+      !emergencyUserId ||
+      !helperId
+    ) {
+      return {
+        success: false,
+        message: 'Datos incompletos'
+      };
     }
+
+    if (
+      this.notSelf(
+        socket,
+        helperId
+      )
+    ) {
+      return this.FORBIDDEN_ACK;
+    }
+
+    // ============================================================
+    // 🔒 CAMBIO 3:
+    // El ayudante debe estar dado de alta
+    // ============================================================
+
+    const helperDoc =
+      await this.firebase.firestore
+        .collection('users')
+        .doc(helperId)
+        .get();
+
+    if (!helperDoc.exists) {
+      return {
+        success: false,
+        code: 'USER_NOT_FOUND',
+        message:
+          'Usuario ayudante no encontrado'
+      };
+    }
+
+    const helperData =
+      helperDoc.data() || {};
+
+    if (
+      helperData.state !==
+      'approved'
+    ) {
+      console.log(
+        `⛔ help_confirm bloqueado. Usuario ${helperId} tiene state=${helperData.state}`
+      );
+
+      return {
+        success: false,
+        code:
+          'USER_NOT_APPROVED',
+
+        message:
+          'Usuario no habilitado para participar en emergencias'
+      };
+    }
+
+    // ============================================================
+    // ✅ Usuario aprobado
+    // ============================================================
+
+    const helpers =
+      this.state.emergencyHelpers
+        .get(emergencyUserId);
+
+    if (helpers) {
+      helpers.add(helperId);
+    }
+
+    // Espejo en Firestore:
+    // sobrevive a restart del servidor
+    this.firebase.firestore
+      .collection('emergencies')
+      .doc(emergencyUserId)
+      .update({
+        helpers:
+          admin.firestore.FieldValue
+            .arrayUnion(helperId)
+      })
+      .catch(
+        (e) =>
+          this.bestEffort(
+            'help_confirm.espejo',
+            e
+          )
+      );
+
+    this.server
+      .to(emergencyUserId)
+      .emit(
+        'help_confirmed',
+        {
+          emergencyUserId,
+          helperId,
+
+          helperName:
+            helperName ||
+            'Ayudante',
+
+          latitude,
+          longitude,
+
+          timestamp:
+            timestamp ||
+            Date.now(),
+        }
+      );
+
+    this.server
+      .to(helperId)
+      .emit(
+        'help_confirmed_notification',
+        {
+          emergencyUserId,
+          helperId,
+          helperName,
+
+          timestamp:
+            Date.now()
+        }
+      );
+
+    return {
+      success: true
+    };
+
+  } catch (e: any) {
+    return {
+      success: false,
+      message: e.message
+    };
   }
+}
+
+
+// ============================================================
+// ❌ RECHAZAR AYUDA
+// ============================================================
+
+@SubscribeMessage('help_reject')
+async helpReject(
+  @ConnectedSocket() socket: Socket,
+  @MessageBody() data: Record<string, any> = {}
+) {
+  try {
+    const {
+      emergencyUserId,
+      helperId
+    } = data;
+
+    if (
+      !emergencyUserId ||
+      !helperId
+    ) {
+      return {
+        success: false,
+        message: 'Datos incompletos'
+      };
+    }
+
+    if (
+      this.notSelf(
+        socket,
+        helperId
+      )
+    ) {
+      return this.FORBIDDEN_ACK;
+    }
+
+    // ============================================================
+    // 🔒 Verificar que siga siendo usuario aprobado
+    // ============================================================
+
+    const helperDoc =
+      await this.firebase.firestore
+        .collection('users')
+        .doc(helperId)
+        .get();
+
+    if (!helperDoc.exists) {
+      return {
+        success: false,
+        code: 'USER_NOT_FOUND',
+        message:
+          'Usuario ayudante no encontrado'
+      };
+    }
+
+    const helperData =
+      helperDoc.data() || {};
+
+    if (
+      helperData.state !==
+      'approved'
+    ) {
+      console.log(
+        `⛔ help_reject bloqueado. Usuario ${helperId} tiene state=${helperData.state}`
+      );
+
+      return {
+        success: false,
+        code:
+          'USER_NOT_APPROVED',
+
+        message:
+          'Usuario no habilitado para participar en emergencias'
+      };
+    }
+
+    const helpers =
+      this.state.emergencyHelpers
+        .get(emergencyUserId);
+
+    if (helpers) {
+      helpers.delete(helperId);
+    }
+
+    this.firebase.firestore
+      .collection('emergencies')
+      .doc(emergencyUserId)
+      .update({
+        helpers:
+          admin.firestore.FieldValue
+            .arrayRemove(helperId)
+      })
+      .catch(
+        (e) =>
+          this.bestEffort(
+            'help_reject.espejo',
+            e
+          )
+      );
+
+    this.server
+      .to(helperId)
+      .emit(
+        'help_rejected',
+        {
+          emergencyUserId,
+          helperId,
+          timestamp: Date.now()
+        }
+      );
+
+    return {
+      success: true
+    };
+
+  } catch (e: any) {
+    return {
+      success: false,
+      message: e.message
+    };
+  }
+}
 
   @SubscribeMessage('emergency_resolve')
   async emergencyResolve(@ConnectedSocket() socket: Socket, @MessageBody() data: Record<string, any> = {}) {
