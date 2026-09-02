@@ -965,123 +965,35 @@ async emergencyAlert(@ConnectedSocket() socket: Socket, @MessageBody() data: Rec
     return url as string;
   }
 
- @SubscribeMessage('register_fcm_token')
-async registerFcmToken(
-  @ConnectedSocket() socket: Socket,
-  @MessageBody() data: Record<string, any> = {}
-) {
-  try {
-    const { userId, fcmToken, deviceId, platform, deviceModel } = data;
-
-    if (!userId || !fcmToken) {
-      return {
-        success: false,
-        message: 'userId y fcmToken requeridos'
-      };
-    }
-
-    if (this.notSelf(socket, userId)) {
-      return this.FORBIDDEN_ACK;
-    }
-
-    const token = String(fcmToken);
-
-    const userRef = this.firebase.firestore
-      .collection('users')
-      .doc(userId);
-
-    // ============================================================
-    // 🔎 Verificar estado real del usuario
-    // ============================================================
-
-    const userSnap = await userRef.get();
-
-    if (!userSnap.exists) {
-      return {
-        success: false,
-        code: 'USER_NOT_FOUND',
-        message: 'Usuario no encontrado'
-      };
-    }
-
-    const userData = userSnap.data() || {};
-
-    // ============================================================
-    // 🧹 Eliminar este token de cualquier usuario anterior
-    // ============================================================
-
+  @SubscribeMessage('register_fcm_token')
+  async registerFcmToken(@ConnectedSocket() socket: Socket, @MessageBody() data: Record<string, any> = {}) {
     try {
-      const existingTokens = await this.firebase.firestore
-        .collectionGroup('fcmTokens')
-        .where('token', '==', token)
-        .get();
+      const { userId, fcmToken, deviceId, platform, deviceModel } = data;
+      if (!userId || !fcmToken) return { success: false, message: 'userId y fcmToken requeridos' };
+      if (this.notSelf(socket, userId)) return this.FORBIDDEN_ACK;
 
-      if (!existingTokens.empty) {
-        const batch = this.firebase.firestore.batch();
-
-        for (const tokenDoc of existingTokens.docs) {
-          batch.delete(tokenDoc.ref);
-        }
-
-        await batch.commit();
-      }
-    } catch (e) {
-      this.bestEffort('register_fcm_token.cleanup', e);
-    }
-
-    // ============================================================
-    // 🚫 Usuario todavía no aprobado
-    // ============================================================
-
-    if (userData.state !== 'approved') {
-      return {
-        success: false,
-        code: 'USER_NOT_APPROVED',
-        message: 'Usuario pendiente de aprobación'
-      };
-    }
-
-    // ============================================================
-    // ✅ Usuario aprobado: registrar token
-    // ============================================================
-
-    const uniqueDeviceId =
-      (typeof deviceId === 'string' && deviceId.trim().length > 0)
+      const uniqueDeviceId = (typeof deviceId === 'string' && deviceId.trim().length > 0)
         ? deviceId.trim()
         : `device_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
 
-    await userRef
-      .collection('fcmTokens')
-      .doc(uniqueDeviceId)
-      .set({
-        token,
-        platform: platform || 'android',
-        deviceModel: deviceModel || null,
-        socketId: socket.id,
+      const userRef = this.firebase.firestore.collection('users').doc(userId);
+      await userRef.collection('fcmTokens').doc(uniqueDeviceId).set({
+        token: String(fcmToken), platform: platform || 'android', deviceModel: deviceModel || null, socketId: socket.id,
         enabled: true,
         lastActiveAt: admin.firestore.FieldValue.serverTimestamp(),
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
       }, { merge: true });
+      await userRef.set({
+        socketIds: admin.firestore.FieldValue.arrayUnion(socket.id),
+        lastTokenRefreshAt: admin.firestore.FieldValue.serverTimestamp(),
+      }, { merge: true });
 
-    await userRef.set({
-      socketIds: admin.firestore.FieldValue.arrayUnion(socket.id),
-      lastTokenRefreshAt: admin.firestore.FieldValue.serverTimestamp(),
-    }, { merge: true });
-
-    return {
-      success: true,
-      message: 'Token registrado',
-      deviceId: uniqueDeviceId
-    };
-
-  } catch (e: any) {
-    return {
-      success: false,
-      message: e.message
-    };
+      return { success: true, message: 'Token registrado', deviceId: uniqueDeviceId };
+    } catch (e: any) {
+      return { success: false, message: e.message };
+    }
   }
-}
 
   @SubscribeMessage('audio_message')
   async audioMessage(@ConnectedSocket() socket: Socket, @MessageBody() data: Record<string, any> = {}) {
