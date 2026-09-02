@@ -75,17 +75,29 @@ export class AdminService {
     return { success: true, applied: true, count: uids.length };
   }
 
-  private async signedUrl(path: string): Promise<string> {
-    try {
-      const [url] = await this.firebase.storage.bucket().file(path).getSignedUrl({
-        action: 'read',
-        expires: Date.now() + 15 * 60 * 1000,
-      });
-      return url;
-    } catch {
-      return path; // fallback (emulador sin capacidad de firmar): el panel recibe el path
-    }
+private async signedUrl(path: string): Promise<string> {
+  try {
+    const bucket = this.firebase.storage.bucket();
+    const file = bucket.file(path);
+
+    const [url] = await file.getSignedUrl({
+      version: 'v4',
+      action: 'read',
+      expires: Date.now() + 15 * 60 * 1000,
+    });
+
+    console.log(`✅ Signed URL generada para: ${path}`);
+
+    return url;
+  } catch (error) {
+    console.error(
+      `❌ Error generando signed URL para ${path}:`,
+      error,
+    );
+
+    throw error;
   }
+}
 
   async approve(adminUid: string, targetUid: string) {
     const v = await this.repo.getVerification(targetUid);
