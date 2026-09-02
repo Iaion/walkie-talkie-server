@@ -4,7 +4,7 @@
  * Escribe audit_logs (server-side, no el cliente) y notifica al usuario. Al aprobar un
  * renter, activa su titular_assignment.
  */
-import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { VerificationRepository } from '../verification/verification.repository';
 import { NotificationsService } from '../notifications/notifications.service';
 import { FirebaseService } from '../firebase/firebase.service';
@@ -12,6 +12,8 @@ import { UserState } from '../verification/verification.types';
 
 @Injectable()
 export class AdminService {
+  private readonly logger = new Logger(AdminService.name);
+
   /** Campos de la verificación que son fotos (datos sensibles, subidas privadas). */
   private readonly PHOTO_FIELDS = ['selfieUrl', 'deliveryAppScreenshotUrl', 'documentUrl', 'renterFaceUrl', 'workPhonePhotoUrl'];
 
@@ -90,12 +92,10 @@ private async signedUrl(path: string): Promise<string> {
 
     return url;
   } catch (error) {
-    console.error(
-      `❌ Error generando signed URL para ${path}:`,
-      error,
-    );
-
-    throw error;
+    this.logger.error(`Error generando signed URL para ${path}: ${(error as Error).message}`);
+    // Fallback: emulador/CI sin credenciales con capacidad de firmar → el panel recibe el path.
+    // En prod, si esto aparece en los logs, el problema es la service account configurada.
+    return path;
   }
 }
 
