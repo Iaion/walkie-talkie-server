@@ -106,6 +106,37 @@ export interface ReviewResponse {
 /** Tamaño de página de la cola (G2). */
 export const PAGE_SIZE = 50;
 
+export interface AdminEntry {
+  uid: string;
+  email: string | null;
+  role: 'admin' | 'superadmin';
+}
+
+export interface AdminsListResponse {
+  success: boolean;
+  admins: AdminEntry[];
+}
+
+export interface AdminMutationResponse {
+  success: boolean;
+  uid?: string;
+  email?: string;
+  role?: string;
+  message?: string;
+}
+
+/** Gestión de administradores — solo superadmin (el backend rechaza a los demás). */
+export const adminsApi = {
+  list: () => authedFetch<AdminsListResponse>('/admin/admins'),
+  grant: (email: string) =>
+    authedFetch<AdminMutationResponse>('/admin/admins', {
+      method: 'POST',
+      body: JSON.stringify({ email }),
+    }),
+  revoke: (uid: string) =>
+    authedFetch<AdminMutationResponse>(`/admin/admins/${uid}`, { method: 'DELETE' }),
+};
+
 export const adminApi = {
   listVerifications: (status = 'pending_review', offset = 0) =>
     authedFetch<ListVerificationsResponse>(
