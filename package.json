@@ -10,7 +10,7 @@
     "test": "jest --runInBand --forceExit",
     "test:ci": "nest build && firebase emulators:exec --project alrescate-dev \"jest --runInBand --forceExit\"",
     "lint": "eslint .",
-    "prepare": "git config core.hooksPath .githooks",
+    "prepare": "node -e \"try{require('child_process').execSync('git config core.hooksPath .githooks',{stdio:'ignore'})}catch(e){}\"",
     "format": "prettier --write \\src/**/*.ts\""
   },
   "dependencies": {
