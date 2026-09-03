@@ -33,6 +33,11 @@ export class VehiclesRepository {
     return ref.id;
   }
 
+  /** Crea con un id ELEGIDO por el cliente (la app genera UUID antes de guardar). */
+  async createWithId(id: string, data: Record<string, any>): Promise<void> {
+    await this.col.doc(id).set(data);
+  }
+
   async update(id: string, data: Record<string, any>): Promise<void> {
     await this.col.doc(id).update(data);
   }

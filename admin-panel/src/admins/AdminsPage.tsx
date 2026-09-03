@@ -107,7 +107,7 @@ export function AdminsPage() {
       <ul className="list">
         {admins.map((a) => (
           <li key={a.uid} className="static">
-            <span className={`badge ${a.role === 'superadmin' ? 'renter' : 'owner'}`}>{a.role}</span>
+            <span className={`pill role-${a.role}`}>{a.role}</span>
             <strong>{a.email || a.uid}</strong>
             {a.role === 'admin' ? (
               <button

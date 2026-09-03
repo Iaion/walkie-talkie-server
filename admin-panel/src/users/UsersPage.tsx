@@ -149,9 +149,7 @@ export function UsersPage() {
                       <span className={`pill ${b.cls}`}>{b.label}</span>
                     </td>
                     <td>
-                      <span className={`pill ${u.role === 'superadmin' ? 'warn' : 'off'}`}>
-                        {u.role || 'usuario'}
-                      </span>
+                      <span className={`pill role-${u.role || 'user'}`}>{u.role || 'usuario'}</span>
                     </td>
                     <td className="cell-sub">{fmtDate(u.createdAt)}</td>
                     <td className="cell-sub">{fmtDate(u.lastLoginAt)}</td>

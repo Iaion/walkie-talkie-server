@@ -335,3 +335,17 @@ nav .nav-link.active { background: var(--surface2); color: var(--text); border-c
   .shell .content { padding: 1.1rem; }
 }
 
+
+/* Colores de rol pedidos por el user: usuario azul, admin rojo, superadmin amarillo */
+.pill.role-user { color: #6c9ef8; background: rgba(108, 158, 248, 0.12); border-color: transparent; }
+.pill.role-admin { color: var(--accent); background: var(--accent-soft); border-color: transparent; }
+.pill.role-superadmin { color: var(--amber); background: var(--amber-soft); border-color: transparent; }
+
+/* === Actividad (feed de auditoría) === */
+.feed { list-style: none; padding: 0; margin: 0; background: var(--card); border: 1px solid var(--border); border-radius: 14px; }
+.feed li { display: flex; align-items: center; gap: 0.8rem; padding: 0.7rem 1.1rem; border-bottom: 1px solid var(--border); font-size: 0.88rem; }
+.feed li:last-child { border-bottom: none; }
+.feed-icon { flex: 0 0 1.6rem; text-align: center; }
+.feed-text { flex: 1; min-width: 0; color: var(--muted); }
+.feed-text strong { color: var(--text); font-weight: 600; }
+.feed-when { color: var(--muted2); font-size: 0.78rem; white-space: nowrap; }

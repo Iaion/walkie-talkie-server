@@ -33,6 +33,48 @@ export class AdminsService {
     return { success: true, admins };
   }
 
+  /** Auditoría: los últimos movimientos, con el email del actor resuelto para lectura humana. */
+  async listAudit(limit = 100) {
+    const capped = Math.min(Math.max(limit, 1), 500);
+    const snap = await this.firebase.firestore
+      .collection('audit_logs')
+      .orderBy('timestamp', 'desc')
+      .limit(capped)
+      .get();
+
+    // Resolver uids → emails en tanda (los logs guardan uid; el panel muestra personas).
+    const uids = new Set<string>();
+    snap.docs.forEach((d) => {
+      const e = d.data();
+      if (e.actorUid) uids.add(e.actorUid);
+      if (e.targetUid) uids.add(e.targetUid);
+    });
+    const emails = new Map<string, string>();
+    await Promise.all(
+      [...uids].map(async (uid) => {
+        try {
+          const u = await this.firebase.auth.getUser(uid);
+          emails.set(uid, u.email || uid);
+        } catch {
+          emails.set(uid, uid); // usuario borrado: queda el uid
+        }
+      }),
+    );
+
+    const entries = snap.docs.map((d) => {
+      const e = d.data();
+      return {
+        id: d.id,
+        action: e.action,
+        actor: emails.get(e.actorUid) || e.actorUid || null,
+        target: e.targetUid ? emails.get(e.targetUid) || e.targetUid : null,
+        details: e.details || null,
+        timestamp: e.timestamp || null,
+      };
+    });
+    return { success: true, entries, total: entries.length };
+  }
+
   /** Da rol admin a un usuario EXISTENTE (por email). No crea cuentas ni toca contraseñas. */
   async grant(actorUid: string, email: string) {
     const clean = (email || '').trim().toLowerCase();

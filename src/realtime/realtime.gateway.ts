@@ -27,6 +27,7 @@ import { corsOrigins } from '../common/cors';
 import { SocketThrottle, RATE_LIMITED_ACK } from '../common/socket-throttle';
 import { isValidLat, isValidLng, isBoundedString, MAX_TEXT_MESSAGE } from '../common/validate';
 import { StorageService } from '../common/storage.service';
+import { AuditService } from '../common/audit.service';
 
 @WebSocketGateway({
   cors: { origin: corsOrigins(), methods: ['GET', 'POST'] },
@@ -75,6 +76,7 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayDisconnect, OnMo
     private readonly emergency: EmergencyService,
     private readonly throttle: SocketThrottle,
     private readonly storage: StorageService,
+    private readonly audit: AuditService,
   ) {}
 
   afterInit(server: Server): void {
@@ -1102,6 +1104,8 @@ async emergencyAlert(
     // ✅ RESPUESTA
     // ============================================================
 
+    void this.audit.record({ actorUid: userId, action: 'emergency_alert', details: { roomId: emergencyRoomId, sockets: socketNotifications, push: pushNotifications } });
+
     return {
       success: true,
 
@@ -1256,6 +1260,8 @@ async helpConfirm(
       helpers.add(helperId);
     }
 
+    void this.audit.record({ actorUid: helperId, action: 'help_confirm', targetUid: emergencyUserId });
+
     // Espejo en Firestore:
     // sobrevive a restart del servidor
     this.firebase.firestore
@@ -1404,6 +1410,8 @@ async helpReject(
       helpers.delete(helperId);
     }
 
+    void this.audit.record({ actorUid: helperId, action: 'help_reject', targetUid: emergencyUserId });
+
     this.firebase.firestore
       .collection('emergencies')
       .doc(emergencyUserId)
@@ -1472,6 +1480,7 @@ async helpReject(
         await this.emergency.releaseLock({ userId, roomId: emergencyRoomId, reason, force: true });
       } catch (e) { this.bestEffort('persistencia', e); }
 
+      void this.audit.record({ actorUid: userId, action: 'emergency_resolve', details: { roomId: emergencyRoomId, reason } });
       this.server.emit('emergency_cancelled', { userId, userName: username, username, roomId: emergencyRoomId, reason, timestamp: Date.now(), isActive: false });
       this.server.to(emergencyRoomId).emit('emergency_resolved', { roomId: emergencyRoomId, userId, message: 'Emergencia resuelta', reason, timestamp: Date.now() });
 

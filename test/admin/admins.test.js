@@ -6,7 +6,7 @@
 const request = require('supertest');
 const { clearFirestore } = require('../setup/emulator');
 const { startServer, stopServer } = require('../setup/server');
-const { getIdToken, getAdminIdToken, getSuperadminIdToken } = require('../setup/auth');
+const { getIdToken, getIdTokenWithUid, getAdminIdToken, getSuperadminIdToken } = require('../setup/auth');
 
 const URL = 'http://127.0.0.1:8080';
 const AUTH_HOST = 'http://127.0.0.1:9099';
@@ -129,6 +129,34 @@ describe('Admins — gestión de administradores (superadmin)', () => {
 
     const sinRol = bearer(await getIdToken());
     expect((await sinRol('get', '/admin/users')).status).toBe(403);
+  });
+
+  test('auditoría: solo superadmin la lee, y las acciones quedan registradas', async () => {
+    const { token: saToken } = await getSuperadminIdToken();
+
+    // Un admin común NO ve la auditoría
+    expect((await bearer(await getAdminIdToken())('get', '/admin/admins/audit')).status).toBe(403);
+
+    // Una acción de usuario (crear vehículo) queda auditada
+    const { token: userToken, uid } = await getIdTokenWithUid();
+    const created = await bearer(userToken)('post', '/vehicles', {
+      userId: uid, type: 'MOTORCYCLE', name: 'Moto audit', brand: 'Test', model: 'X', year: 2024, color: 'rojo', licensePlate: 'AUD123',
+    });
+    expect(created.status).toBe(200);
+
+    // Una acción de superadmin (dar admin) también
+    const email = uniqueEmail('auditado');
+    await signUpWithEmail(email);
+    await bearer(saToken)('post', '/admin/admins', { email });
+
+    const audit = await bearer(saToken)('get', '/admin/admins/audit');
+    expect(audit.status).toBe(200);
+    const actions = audit.body.entries.map((e) => e.action);
+    expect(actions).toContain('vehicle_created');
+    expect(actions).toContain('grant_admin');
+    const grant = audit.body.entries.find((e) => e.action === 'grant_admin');
+    expect(grant.target).toBe(email); // uid resuelto a email para lectura humana
+    expect(grant.timestamp).toBeGreaterThan(0);
   });
 
   test('quitar a alguien que no es admin → 400', async () => {

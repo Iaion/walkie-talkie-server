@@ -10,6 +10,7 @@ import { FirebaseService } from '../firebase/firebase.service';
 import { normalizeEmail, normalizePhone, normalizeDocument } from './normalize';
 import { isDataUrl, getMimeFromDataUrl } from '../common/image-utils';
 import { StorageService } from '../common/storage.service';
+import { AuditService } from '../common/audit.service';
 import { AccountType, UserState, VerificationFlag, VerificationSubmission } from './verification.types';
 
 @Injectable()
@@ -23,6 +24,7 @@ export class VerificationService {
     private readonly repo: VerificationRepository,
     private readonly firebase: FirebaseService,
     private readonly storage: StorageService,
+    private readonly audit: AuditService,
   ) {}
 
   /**
@@ -46,6 +48,7 @@ export class VerificationService {
         makePublic: false,
         metadata: { uid, type },
       });
+      await this.audit.record({ actorUid: uid, action: 'verification_photo_uploaded', details: { type } });
       return { success: true, type, path };
     } catch (e) {
       throw new BadRequestException({ success: false, message: (e as Error).message });
@@ -107,6 +110,7 @@ export class VerificationService {
     }
 
     await this.repo.saveSubmission(uid, userPatch, verificationDoc, assignment);
+    await this.audit.record({ actorUid: uid, action: 'verification_submitted', details: { accountType: body.accountType, flags: flags.length } });
     return { success: true, state: UserState.PENDING_REVIEW, flags };
   }
 
