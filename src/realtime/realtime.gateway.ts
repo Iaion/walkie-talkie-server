@@ -1059,36 +1059,53 @@ async emergencyAlert(
           continue;
         }
 
-        const ok =
-          await this.notifications
-            .sendPushNotification(
-              targetUserId,
-              '🚨 EMERGENCIA',
-              `${userName} necesita ayuda`,
-              {
-                emergency_user_id:
-                  userId,
+      const ok =
+  await this.notifications
+    .sendPushNotification(
+      targetUserId,
+      '🚨 EMERGENCIA',
+      `${userName} necesita ayuda`,
+      {
+        type: 'emergency',
 
-                emergency_user_name:
-                  userName,
+        emergency_user_id:
+          userId,
 
-                emergency_latitude:
-                  latitude,
+        emergency_user_name:
+          userName,
 
-                emergency_longitude:
-                  longitude,
+        emergency_latitude:
+          latitude,
 
-                emergency_avatar_url:
-                  avatarUrl || '',
+        emergency_longitude:
+          longitude,
 
-                emergency_room_id:
-                  emergencyRoomId,
-              }
-            );
+        emergency_avatar_url:
+          avatarUrl || '',
 
-        if (ok) {
-          pushNotifications++;
-        }
+        emergency_room_id:
+          emergencyRoomId,
+
+        vehicle_marca:
+          vehicleData?.brand || '',
+
+        vehicle_modelo:
+          vehicleData?.model || '',
+
+        vehicle_patente:
+          vehicleData?.licensePlate || '',
+
+        vehicle_color:
+          vehicleData?.color || '',
+
+        vehicle_foto:
+          vehicleData?.photoUri || '',
+      }
+    );
+
+if (ok) {
+  pushNotifications++;
+}
       }
 
     } catch (e) {
