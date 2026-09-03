@@ -12,6 +12,16 @@ interface Props {
 
 const MAX_REASON_LENGTH = 500;
 
+/** Nombres legibles de cada foto (las claves crudas de la API no se muestran al usuario). */
+const PHOTO_LABELS: Record<string, string> = {
+  selfieUrl: 'Selfie',
+  documentUrl: 'Documento',
+  deliveryAppScreenshotUrl: 'App de delivery',
+  renterFaceUrl: 'Cara del alquilador',
+  workPhonePhotoUrl: 'Teléfono de trabajo',
+};
+const photoLabel = (key: string) => PHOTO_LABELS[key] || key.replace(/Url$/, '');
+
 export function VerificationDetail({ verification, onBack, onReviewed }: Props) {
   const [photos, setPhotos] = useState<Record<string, string>>({});
   const [photosLoading, setPhotosLoading] = useState(true);
@@ -78,7 +88,7 @@ export function VerificationDetail({ verification, onBack, onReviewed }: Props) 
       <h2>{v.fullName || v.uid}</h2>
       <dl>
         <dt>Tipo de cuenta</dt>
-        <dd>{v.accountType}</dd>
+        <dd>{v.accountType === 'owner' ? 'Titular de la cuenta' : 'Alquila la cuenta'}</dd>
         <dt>Documento</dt>
         <dd>{v.documentNumber || '—'}</dd>
         <dt>Teléfono</dt>
@@ -107,9 +117,9 @@ export function VerificationDetail({ verification, onBack, onReviewed }: Props) 
         {Object.entries(photos).map(([key, url]) => (
           <figure key={key}>
             <a href={url} target="_blank" rel="noreferrer">
-              <img src={url} alt={`Foto de ${key}`} />
+              <img src={url} alt={`Foto: ${photoLabel(key)}`} />
             </a>
-            <figcaption>{key}</figcaption>
+            <figcaption>{photoLabel(key)}</figcaption>
           </figure>
         ))}
       </div>

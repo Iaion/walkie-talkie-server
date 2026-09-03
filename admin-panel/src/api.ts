@@ -103,6 +103,22 @@ export interface ReviewResponse {
   reason?: string;
 }
 
+export interface PanelUser {
+  uid: string;
+  email: string | null;
+  name: string | null;
+  state: string | null;
+  role: 'admin' | 'superadmin' | null;
+  createdAt: string | null;
+  lastLoginAt: string | null;
+}
+
+export interface UsersListResponse {
+  success: boolean;
+  users: PanelUser[];
+  total: number;
+}
+
 /** Tamaño de página de la cola (G2). */
 export const PAGE_SIZE = 50;
 
@@ -143,6 +159,7 @@ export const adminApi = {
       `/admin/verifications?status=${encodeURIComponent(status)}&limit=${PAGE_SIZE}&offset=${offset}`,
     ),
   getPhotos: (uid: string) => authedFetch<PhotosResponse>(`/admin/verifications/${uid}/photos`),
+  listUsers: () => authedFetch<UsersListResponse>('/admin/users'),
   approve: (uid: string) =>
     authedFetch<ReviewResponse>(`/admin/verifications/${uid}/approve`, { method: 'POST' }),
   reject: (uid: string, reason: string) =>

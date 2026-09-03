@@ -77,6 +77,40 @@ export class AdminService {
     return { success: true, applied: true, count: uids.length };
   }
 
+  /**
+   * Directorio de usuarios para el panel: combina Auth (email, rol, fechas) con el doc de
+   * Firestore (nombre, estado de verificación). A esta escala se devuelve todo y el panel
+   * filtra/busca en el cliente.
+   */
+  async listUsers() {
+    const docs = new Map<string, FirebaseFirestore.DocumentData>();
+    const snap = await this.firebase.firestore.collection('users').get();
+    snap.docs.forEach((d) => docs.set(d.id, d.data()));
+
+    const users: Array<Record<string, unknown>> = [];
+    let pageToken: string | undefined;
+    do {
+      const page = await this.firebase.auth.listUsers(1000, pageToken);
+      for (const u of page.users) {
+        const doc = docs.get(u.uid) || {};
+        users.push({
+          uid: u.uid,
+          email: u.email || null,
+          name: doc.fullName || doc.name || u.displayName || null,
+          state: doc.state || null,
+          role: (u.customClaims?.role as string) || null,
+          createdAt: u.metadata.creationTime || null,
+          lastLoginAt: u.metadata.lastSignInTime || null,
+        });
+        docs.delete(u.uid);
+      }
+      pageToken = page.pageToken;
+    } while (pageToken);
+
+    users.sort((a, b) => String(a.name || a.email || '').localeCompare(String(b.name || b.email || '')));
+    return { success: true, users, total: users.length };
+  }
+
 private async signedUrl(path: string): Promise<string> {
   try {
     const bucket = this.firebase.storage.bucket();

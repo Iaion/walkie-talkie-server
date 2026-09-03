@@ -106,7 +106,7 @@ export function VerificationsPage() {
       <ul className="list">
         {items.map((v) => (
           <li key={v.uid} onClick={() => setSelected(v)}>
-            <span className={`badge ${v.accountType}`}>{v.accountType}</span>
+            <span className={`badge ${v.accountType}`}>{v.accountType === 'renter' ? 'alquila' : 'titular'}</span>
             <strong>{v.fullName || v.uid}</strong>
             <span className="doc">{v.documentNumber}</span>
             {v.flags && v.flags.length > 0 && <span className="flag">⚠ {v.flags.length}</span>}

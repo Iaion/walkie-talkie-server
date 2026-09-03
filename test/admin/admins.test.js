@@ -115,6 +115,22 @@ describe('Admins — gestión de administradores (superadmin)', () => {
     expect(revoke.body.message).toMatch(/superadmin/);
   });
 
+  test('directorio de usuarios: lo ve un admin común, combina Auth + Firestore', async () => {
+    const { setDoc } = require('../setup/emulator');
+    const email = uniqueEmail('vecino');
+    const { localId } = await signUpWithEmail(email);
+    await setDoc('users', localId, { fullName: 'Vecino Test', state: 'approved' });
+
+    const api = bearer(await getAdminIdToken());
+    const res = await api('get', '/admin/users');
+    expect(res.status).toBe(200);
+    const row = res.body.users.find((u) => u.uid === localId);
+    expect(row).toMatchObject({ email, name: 'Vecino Test', state: 'approved', role: null });
+
+    const sinRol = bearer(await getIdToken());
+    expect((await sinRol('get', '/admin/users')).status).toBe(403);
+  });
+
   test('quitar a alguien que no es admin → 400', async () => {
     const { token } = await getSuperadminIdToken();
     const email = uniqueEmail('comun');
