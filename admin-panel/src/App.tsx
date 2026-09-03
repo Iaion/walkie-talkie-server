@@ -7,14 +7,16 @@ import { VerificationsPage } from './verifications/VerificationsPage';
 import { AdminsPage } from './admins/AdminsPage';
 import { UsersPage } from './users/UsersPage';
 import { DashboardPage } from './dashboard/DashboardPage';
+import { ActivityPage } from './activity/ActivityPage';
 
-type Section = 'dashboard' | 'verifications' | 'users' | 'admins';
+type Section = 'dashboard' | 'verifications' | 'users' | 'admins' | 'activity';
 
 const NAV: Array<{ id: Section; label: string; icon: string; superadminOnly?: boolean }> = [
   { id: 'dashboard', label: 'Resumen', icon: '◧' },
   { id: 'verifications', label: 'Verificaciones', icon: '🪪' },
   { id: 'users', label: 'Usuarios', icon: '👥' },
   { id: 'admins', label: 'Administradores', icon: '🛡', superadminOnly: true },
+  { id: 'activity', label: 'Actividad', icon: '📜', superadminOnly: true },
 ];
 
 export function App() {
@@ -70,6 +72,7 @@ export function App() {
         {section === 'verifications' && <VerificationsPage />}
         {section === 'users' && <UsersPage />}
         {section === 'admins' && isSuperadmin && <AdminsPage />}
+        {section === 'activity' && isSuperadmin && <ActivityPage />}
       </main>
     </div>
   );

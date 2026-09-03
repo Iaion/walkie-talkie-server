@@ -8,9 +8,11 @@
  */
 import { Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
-import { APP_GUARD } from '@nestjs/core';
+import { APP_GUARD, APP_INTERCEPTOR } from '@nestjs/core';
+import { LoggingInterceptor } from './common/logging.interceptor';
 import { ThrottlerModule, ThrottlerGuard } from '@nestjs/throttler';
 import { FirebaseModule } from './firebase/firebase.module';
+import { AuditModule } from './common/audit.module';
 import { HealthController } from './health/health.controller';
 import { AuthGuard } from './common/auth.guard';
 import { VehiclesModule } from './vehicles/vehicles.module';
@@ -32,6 +34,7 @@ import { UsersModule } from './users/users.module';
       },
     ]),
     FirebaseModule,
+    AuditModule,
     VehiclesModule,
     FcmModule,
     RealtimeModule,
@@ -43,6 +46,8 @@ import { UsersModule } from './users/users.module';
   providers: [
     { provide: APP_GUARD, useClass: AuthGuard },
     { provide: APP_GUARD, useClass: ThrottlerGuard },
+    // Auditoría operativa: cada pedido REST queda logueado (quién, qué, resultado, duración).
+    { provide: APP_INTERCEPTOR, useClass: LoggingInterceptor },
   ],
 })
 export class AppModule {}

@@ -3,7 +3,7 @@
  * Endpoints de gestión de administradores. SOLO superadmin (el RolesGuard rechaza
  * a los admin comunes: la ruta pide el rol mayor).
  */
-import { Body, Controller, Delete, Get, HttpCode, Param, Post, Req, UseGuards } from '@nestjs/common';
+import { Body, Controller, Delete, Get, HttpCode, Param, Post, Query, Req, UseGuards } from '@nestjs/common';
 import { AdminsService } from './admins.service';
 import { Roles } from '../common/roles.decorator';
 import { RolesGuard } from '../common/roles.guard';
@@ -17,6 +17,12 @@ export class AdminsController {
   @Get()
   list() {
     return this.service.list();
+  }
+
+  /** Registro de auditoría (lo más reciente primero). */
+  @Get('audit')
+  audit(@Query('limit') limit?: string) {
+    return this.service.listAudit(limit ? Number(limit) : 100);
   }
 
   @Post()

@@ -141,9 +141,25 @@ export interface AdminMutationResponse {
   message?: string;
 }
 
+export interface AuditEntry {
+  id: string;
+  action: string;
+  actor: string | null;
+  target: string | null;
+  details: Record<string, unknown> | null;
+  timestamp: number | null;
+}
+
+export interface AuditListResponse {
+  success: boolean;
+  entries: AuditEntry[];
+  total: number;
+}
+
 /** Gestión de administradores — solo superadmin (el backend rechaza a los demás). */
 export const adminsApi = {
   list: () => authedFetch<AdminsListResponse>('/admin/admins'),
+  audit: (limit = 100) => authedFetch<AuditListResponse>(`/admin/admins/audit?limit=${limit}`),
   grant: (email: string) =>
     authedFetch<AdminMutationResponse>('/admin/admins', {
       method: 'POST',
