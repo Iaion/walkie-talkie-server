@@ -1072,6 +1072,8 @@ async emergencyAlert(
         ) {
           continue;
         }
+        
+        
         console.log('🚗 DEBUG VEHÍCULO EMERGENCIA:', {
   userId,
   vehicleData,

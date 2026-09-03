@@ -42,16 +42,30 @@ export class VehiclesRepository {
     await this.col.doc(id).update(data);
   }
 
-  /** Pone isPrimary=false a los activos primarios del usuario y isPrimary=true al elegido (batch). */
-  async setPrimary(userId: string, vehicleId: string): Promise<void> {
-    const batch = this.firebase.firestore.batch();
-    const currentPrimary = await this.col
-      .where('userId', '==', userId)
-      .where('isPrimary', '==', true)
-      .where('isActive', '==', true)
-      .get();
-    currentPrimary.docs.forEach((d) => batch.update(d.ref, { isPrimary: false, updatedAt: Date.now() }));
-    batch.update(this.col.doc(vehicleId), { isPrimary: true, updatedAt: Date.now() });
-    await batch.commit();
-  }
-}
+ /** Pone isPrimary=false a todos los primarios del usuario
+ *  y isPrimary=true al elegido.
+ */
+async setPrimary(userId: string, vehicleId: string): Promise<void> {
+  const batch = this.firebase.firestore.batch();
+
+  const currentPrimary = await this.col
+    .where('userId', '==', userId)
+    .where('isPrimary', '==', true)
+    .get();
+
+  const now = Date.now();
+
+  currentPrimary.docs.forEach((d) => {
+    batch.update(d.ref, {
+      isPrimary: false,
+      updatedAt: now,
+    });
+  });
+
+  batch.update(this.col.doc(vehicleId), {
+    isPrimary: true,
+    updatedAt: now,
+  });
+
+  await batch.commit();
+}}

@@ -111,15 +111,39 @@ export class VehiclesService {
   }
 
   async remove(userId: string, vehicleId: string) {
-    const v = await this.repo.getById(vehicleId);
-    if (!v) throw new NotFoundException({ success: false, message: 'Vehículo no encontrado' });
-    if (v.userId !== userId) {
-      throw new ForbiddenException({ success: false, message: 'No tienes permisos para eliminar este vehículo' });
-    }
-    await this.repo.update(vehicleId, { isActive: false, updatedAt: Date.now() });
-    await this.audit.record({ actorUid: userId, action: 'vehicle_deleted', details: { vehicleId } });
-    return { success: true, message: 'Vehículo eliminado correctamente' };
+  const v = await this.repo.getById(vehicleId);
+
+  if (!v) {
+    throw new NotFoundException({
+      success: false,
+      message: 'Vehículo no encontrado',
+    });
   }
+
+  if (v.userId !== userId) {
+    throw new ForbiddenException({
+      success: false,
+      message: 'No tienes permisos para eliminar este vehículo',
+    });
+  }
+
+  await this.repo.update(vehicleId, {
+    isActive: false,
+    isPrimary: false,
+    updatedAt: Date.now(),
+  });
+
+  await this.audit.record({
+    actorUid: userId,
+    action: 'vehicle_deleted',
+    details: { vehicleId },
+  });
+
+  return {
+    success: true,
+    message: 'Vehículo eliminado correctamente',
+  };
+}
 
   async setPrimary(userId: string, vehicleId: string | undefined) {
     if (!vehicleId) throw new BadRequestException({ success: false, message: 'vehicleId es requerido' });
