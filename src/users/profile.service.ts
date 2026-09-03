@@ -9,6 +9,7 @@
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
 import { FirebaseService } from '../firebase/firebase.service';
 import { StorageService } from '../common/storage.service';
+import { AuditService } from '../common/audit.service';
 import { isDataUrl } from '../common/image-utils';
 
 @Injectable()
@@ -16,6 +17,7 @@ export class ProfileService {
   constructor(
     private readonly firebase: FirebaseService,
     private readonly storage: StorageService,
+    private readonly audit: AuditService,
   ) {}
 
   async getProfile(uid: string): Promise<Record<string, unknown>> {
@@ -58,6 +60,7 @@ export class ProfileService {
       if (!snap.exists) out.createdAt = Date.now();
       tx.set(ref, out, { merge: true });
     });
+    await this.audit.record({ actorUid: uid, action: 'profile_updated', details: { fields: Object.keys(data) } });
     return { success: true };
   }
 
@@ -84,6 +87,7 @@ export class ProfileService {
       { avatarUri: url, avatarUrl: url, photoURL: url, lastUpdated: Date.now() },
       { merge: true },
     );
+    await this.audit.record({ actorUid: uid, action: 'avatar_uploaded' });
     return { success: true, url };
   }
 }

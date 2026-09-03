@@ -14,7 +14,10 @@ import { setOnUnauthorized } from '../api';
 
 interface AuthState {
   user: User | null;
+  /** true para role=admin Y role=superadmin (el superadmin puede todo lo del admin). */
   isAdmin: boolean;
+  /** true solo para role=superadmin (habilita la gestión de administradores). */
+  isSuperadmin: boolean;
   loading: boolean;
   login: (email: string, password: string) => Promise<void>;
   logout: () => Promise<void>;
@@ -25,6 +28,7 @@ const AuthContext = createContext<AuthState | null>(null);
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<User | null>(null);
   const [isAdmin, setIsAdmin] = useState(false);
+  const [isSuperadmin, setIsSuperadmin] = useState(false);
   const [loading, setLoading] = useState(true);
 
   // 401 de la API = sesión caída → logout global y de vuelta al login (G1).
@@ -38,9 +42,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       setUser(u);
       if (u) {
         const token = await u.getIdTokenResult();
-        setIsAdmin(token.claims.role === 'admin');
+        const role = token.claims.role;
+        setIsAdmin(role === 'admin' || role === 'superadmin');
+        setIsSuperadmin(role === 'superadmin');
       } else {
         setIsAdmin(false);
+        setIsSuperadmin(false);
       }
       setLoading(false);
     });
@@ -54,7 +61,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   };
 
   return (
-    <AuthContext.Provider value={{ user, isAdmin, loading, login, logout }}>
+    <AuthContext.Provider value={{ user, isAdmin, isSuperadmin, loading, login, logout }}>
       {children}
     </AuthContext.Provider>
   );

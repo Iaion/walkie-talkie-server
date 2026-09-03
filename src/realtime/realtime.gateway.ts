@@ -27,6 +27,9 @@ import { corsOrigins } from '../common/cors';
 import { SocketThrottle, RATE_LIMITED_ACK } from '../common/socket-throttle';
 import { isValidLat, isValidLng, isBoundedString, MAX_TEXT_MESSAGE } from '../common/validate';
 import { StorageService } from '../common/storage.service';
+import { AuditService } from '../common/audit.service';
+import { UseInterceptors } from '@nestjs/common';
+import { LoggingInterceptor } from '../common/logging.interceptor';
 
 @WebSocketGateway({
   cors: { origin: corsOrigins(), methods: ['GET', 'POST'] },
@@ -34,6 +37,9 @@ import { StorageService } from '../common/storage.service';
   allowEIO3: true,
 })
 @Injectable()
+// El interceptor global (APP_INTERCEPTOR) NO alcanza a los gateways: acá va explícito
+// para que cada evento de socket quede logueado (auditoría de punta a punta).
+@UseInterceptors(LoggingInterceptor)
 export class RealtimeGateway implements OnGatewayInit, OnGatewayDisconnect, OnModuleDestroy, OnApplicationBootstrap {
   @WebSocketServer() server: Server;
 
@@ -75,6 +81,7 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayDisconnect, OnMo
     private readonly emergency: EmergencyService,
     private readonly throttle: SocketThrottle,
     private readonly storage: StorageService,
+    private readonly audit: AuditService,
   ) {}
 
   afterInit(server: Server): void {
@@ -973,6 +980,11 @@ async emergencyAlert(
     // ============================================================
 
     let socketNotifications = 0;
+    // Contadores de diagnóstico: si sockets=0, estos dicen POR QUÉ (¿no había nadie
+    // conectado? ¿sockets sin identidad —no emitieron user-connected—? ¿no aprobados?).
+    let wsSinIdentidad = 0;
+    let wsNoAprobados = 0;
+    const totalSockets = this.server.sockets.sockets.size;
 
     const notifiedUsers =
       new Set<string>();
@@ -990,6 +1002,7 @@ async emergencyAlert(
         (s as any).userId;
 
       if (!targetUserId) {
+        wsSinIdentidad++;
         continue;
       }
 
@@ -1003,7 +1016,8 @@ async emergencyAlert(
       if (
         !approvedUserIds.has(targetUserId)
       ) {
-        console.log(
+        wsNoAprobados++;
+        this.logger.warn(
           `⛔ emergency_alert bloqueado para usuario no aprobado: ${targetUserId}`
         );
 
@@ -1118,6 +1132,19 @@ if (ok) {
     // ============================================================
     // ✅ RESPUESTA
     // ============================================================
+
+    void this.audit.record({
+      actorUid: userId,
+      action: 'emergency_alert',
+      details: {
+        roomId: emergencyRoomId,
+        sockets: socketNotifications,
+        push: pushNotifications,
+        conectados: totalSockets,
+        sinIdentidad: wsSinIdentidad,
+        noAprobados: wsNoAprobados,
+      },
+    });
 
     return {
       success: true,
@@ -1273,6 +1300,8 @@ async helpConfirm(
       helpers.add(helperId);
     }
 
+    void this.audit.record({ actorUid: helperId, action: 'help_confirm', targetUid: emergencyUserId });
+
     // Espejo en Firestore:
     // sobrevive a restart del servidor
     this.firebase.firestore
@@ -1421,6 +1450,8 @@ async helpReject(
       helpers.delete(helperId);
     }
 
+    void this.audit.record({ actorUid: helperId, action: 'help_reject', targetUid: emergencyUserId });
+
     this.firebase.firestore
       .collection('emergencies')
       .doc(emergencyUserId)
@@ -1489,6 +1520,7 @@ async helpReject(
         await this.emergency.releaseLock({ userId, roomId: emergencyRoomId, reason, force: true });
       } catch (e) { this.bestEffort('persistencia', e); }
 
+      void this.audit.record({ actorUid: userId, action: 'emergency_resolve', details: { roomId: emergencyRoomId, reason } });
       this.server.emit('emergency_cancelled', { userId, userName: username, username, roomId: emergencyRoomId, reason, timestamp: Date.now(), isActive: false });
       this.server.to(emergencyRoomId).emit('emergency_resolved', { roomId: emergencyRoomId, userId, message: 'Emergencia resuelta', reason, timestamp: Date.now() });
 

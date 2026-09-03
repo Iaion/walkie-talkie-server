@@ -103,8 +103,71 @@ export interface ReviewResponse {
   reason?: string;
 }
 
+export interface PanelUser {
+  uid: string;
+  email: string | null;
+  name: string | null;
+  state: string | null;
+  role: 'admin' | 'superadmin' | null;
+  createdAt: string | null;
+  lastLoginAt: string | null;
+}
+
+export interface UsersListResponse {
+  success: boolean;
+  users: PanelUser[];
+  total: number;
+}
+
 /** Tamaño de página de la cola (G2). */
 export const PAGE_SIZE = 50;
+
+export interface AdminEntry {
+  uid: string;
+  email: string | null;
+  role: 'admin' | 'superadmin';
+}
+
+export interface AdminsListResponse {
+  success: boolean;
+  admins: AdminEntry[];
+}
+
+export interface AdminMutationResponse {
+  success: boolean;
+  uid?: string;
+  email?: string;
+  role?: string;
+  message?: string;
+}
+
+export interface AuditEntry {
+  id: string;
+  action: string;
+  actor: string | null;
+  target: string | null;
+  details: Record<string, unknown> | null;
+  timestamp: number | null;
+}
+
+export interface AuditListResponse {
+  success: boolean;
+  entries: AuditEntry[];
+  total: number;
+}
+
+/** Gestión de administradores — solo superadmin (el backend rechaza a los demás). */
+export const adminsApi = {
+  list: () => authedFetch<AdminsListResponse>('/admin/admins'),
+  audit: (limit = 100) => authedFetch<AuditListResponse>(`/admin/admins/audit?limit=${limit}`),
+  grant: (email: string) =>
+    authedFetch<AdminMutationResponse>('/admin/admins', {
+      method: 'POST',
+      body: JSON.stringify({ email }),
+    }),
+  revoke: (uid: string) =>
+    authedFetch<AdminMutationResponse>(`/admin/admins/${uid}`, { method: 'DELETE' }),
+};
 
 export const adminApi = {
   listVerifications: (status = 'pending_review', offset = 0) =>
@@ -112,6 +175,7 @@ export const adminApi = {
       `/admin/verifications?status=${encodeURIComponent(status)}&limit=${PAGE_SIZE}&offset=${offset}`,
     ),
   getPhotos: (uid: string) => authedFetch<PhotosResponse>(`/admin/verifications/${uid}/photos`),
+  listUsers: () => authedFetch<UsersListResponse>('/admin/users'),
   approve: (uid: string) =>
     authedFetch<ReviewResponse>(`/admin/verifications/${uid}/approve`, { method: 'POST' }),
   reject: (uid: string, reason: string) =>

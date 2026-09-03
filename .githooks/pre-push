@@ -1,0 +1,31 @@
+#!/bin/sh
+# pre-push: antes de pushear a master o development corre la suite completa (npm run test:ci).
+# Si esta roja, el push se CANCELA. master deploya directo a Railway: nunca puede ir roto.
+# Se activa solo con `npm install` (script "prepare" en package.json).
+# Escape de emergencia (usar solo a conciencia): git push --no-verify
+
+ran=0
+while read local_ref local_sha remote_ref remote_sha; do
+  # borrado de rama remota -> no hay nada que testear
+  case "$local_sha" in 0000000000000000000000000000000000000000) continue ;; esac
+
+  case "$remote_ref" in
+    refs/heads/master|refs/heads/development)
+      if [ "$ran" -eq 0 ]; then
+        ran=1
+        branch=${remote_ref#refs/heads/}
+        echo ""
+        echo ">> pre-push: vas a pushear a '$branch' — corriendo npm run test:ci (~2 min)..."
+        if ! npm run test:ci; then
+          echo ""
+          echo ">> ❌ TESTS EN ROJO — push a '$branch' CANCELADO."
+          echo ">>    Arregla los tests y volve a pushear."
+          exit 1
+        fi
+        echo ">> ✅ suite verde — el push sigue."
+      fi
+      ;;
+  esac
+done
+
+exit 0

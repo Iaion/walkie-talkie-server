@@ -28,6 +28,12 @@ export class AdminController {
     return this.service.getVerificationPhotos(uid);
   }
 
+  /** Directorio de usuarios (todos los registrados, con estado y rol). */
+  @Get('users')
+  users() {
+    return this.service.listUsers();
+  }
+
   // Grandfathering de usuarios previos al sistema de verificación.
   @Get('grandfather/preview')
   grandfatherPreview(@Req() req: any) {

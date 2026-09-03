@@ -15,6 +15,7 @@ import { FirebaseService } from '../firebase/firebase.service';
 import { VehiclesRepository } from './vehicles.repository';
 import { isDataUrl, getMimeFromDataUrl } from '../common/image-utils';
 import { StorageService } from '../common/storage.service';
+import { AuditService } from '../common/audit.service';
 
 const VALID_TYPES = ['CAR', 'MOTORCYCLE', 'BICYCLE'];
 
@@ -24,6 +25,7 @@ export class VehiclesService {
     private readonly repo: VehiclesRepository,
     private readonly firebase: FirebaseService,
     private readonly storage: StorageService,
+    private readonly audit: AuditService,
   ) {}
 
   /** Mapea un doc de Firestore al shape de respuesta del monolito (con campos por tipo). */
@@ -77,7 +79,15 @@ export class VehiclesService {
 
     if (body.id) {
       const existing = await this.repo.getById(body.id);
-      if (!existing) throw new NotFoundException({ success: false, message: 'Vehículo no encontrado' });
+      if (!existing) {
+        // La app genera el id (UUID) ANTES de guardar: un id desconocido es un ALTA con id
+        // propio, no un error. (El 404 de acá rompía la creación de vehículos en silencio.)
+        const active = await this.repo.listActiveByUser(body.userId);
+        const newVehicle = { ...body, createdAt: now, updatedAt: now, isActive: true, isPrimary: active.length === 0 };
+        await this.repo.createWithId(body.id, newVehicle);
+        await this.audit.record({ actorUid: body.userId, action: 'vehicle_created', details: { vehicleId: body.id, type: body.type } });
+        return { success: true, message: 'Vehículo creado', vehicle: newVehicle };
+      }
       if (existing.userId !== body.userId) {
         throw new ForbiddenException({ success: false, message: 'No tienes permisos para editar este vehículo' });
       }
@@ -89,12 +99,14 @@ export class VehiclesService {
         isPrimary: body.isPrimary !== undefined ? body.isPrimary : existing.isPrimary,
       };
       await this.repo.update(body.id, updateData);
+      await this.audit.record({ actorUid: body.userId, action: 'vehicle_updated', details: { vehicleId: body.id, type: body.type } });
       return { success: true, message: 'Vehículo actualizado', vehicle: { id: body.id, ...updateData } };
     }
 
     const active = await this.repo.listActiveByUser(body.userId);
     const newVehicle = { ...body, createdAt: now, updatedAt: now, isActive: true, isPrimary: active.length === 0 };
     const id = await this.repo.create(newVehicle);
+    await this.audit.record({ actorUid: body.userId, action: 'vehicle_created', details: { vehicleId: id, type: body.type } });
     return { success: true, message: 'Vehículo creado', vehicle: { id, ...newVehicle } };
   }
 
@@ -105,6 +117,7 @@ export class VehiclesService {
       throw new ForbiddenException({ success: false, message: 'No tienes permisos para eliminar este vehículo' });
     }
     await this.repo.update(vehicleId, { isActive: false, updatedAt: Date.now() });
+    await this.audit.record({ actorUid: userId, action: 'vehicle_deleted', details: { vehicleId } });
     return { success: true, message: 'Vehículo eliminado correctamente' };
   }
 
@@ -135,6 +148,7 @@ export class VehiclesService {
 
     const url = await this.savePhoto(userId, vehicleId, imageData);
     await this.repo.update(vehicleId, { photoUri: url, updatedAt: Date.now() });
+    await this.audit.record({ actorUid: userId, action: 'vehicle_photo_uploaded', details: { vehicleId } });
     return { success: true, message: 'Foto de vehículo subida correctamente', url };
   }
 

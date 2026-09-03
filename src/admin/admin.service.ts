@@ -4,7 +4,7 @@
  * Escribe audit_logs (server-side, no el cliente) y notifica al usuario. Al aprobar un
  * renter, activa su titular_assignment.
  */
-import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { VerificationRepository } from '../verification/verification.repository';
 import { NotificationsService } from '../notifications/notifications.service';
 import { FirebaseService } from '../firebase/firebase.service';
@@ -12,6 +12,8 @@ import { UserState } from '../verification/verification.types';
 
 @Injectable()
 export class AdminService {
+  private readonly logger = new Logger(AdminService.name);
+
   /** Campos de la verificación que son fotos (datos sensibles, subidas privadas). */
   private readonly PHOTO_FIELDS = ['selfieUrl', 'deliveryAppScreenshotUrl', 'documentUrl', 'renterFaceUrl', 'workPhonePhotoUrl'];
 
@@ -75,6 +77,40 @@ export class AdminService {
     return { success: true, applied: true, count: uids.length };
   }
 
+  /**
+   * Directorio de usuarios para el panel: combina Auth (email, rol, fechas) con el doc de
+   * Firestore (nombre, estado de verificación). A esta escala se devuelve todo y el panel
+   * filtra/busca en el cliente.
+   */
+  async listUsers() {
+    const docs = new Map<string, FirebaseFirestore.DocumentData>();
+    const snap = await this.firebase.firestore.collection('users').get();
+    snap.docs.forEach((d) => docs.set(d.id, d.data()));
+
+    const users: Array<Record<string, unknown>> = [];
+    let pageToken: string | undefined;
+    do {
+      const page = await this.firebase.auth.listUsers(1000, pageToken);
+      for (const u of page.users) {
+        const doc = docs.get(u.uid) || {};
+        users.push({
+          uid: u.uid,
+          email: u.email || null,
+          name: doc.fullName || doc.name || u.displayName || null,
+          state: doc.state || null,
+          role: (u.customClaims?.role as string) || null,
+          createdAt: u.metadata.creationTime || null,
+          lastLoginAt: u.metadata.lastSignInTime || null,
+        });
+        docs.delete(u.uid);
+      }
+      pageToken = page.pageToken;
+    } while (pageToken);
+
+    users.sort((a, b) => String(a.name || a.email || '').localeCompare(String(b.name || b.email || '')));
+    return { success: true, users, total: users.length };
+  }
+
 private async signedUrl(path: string): Promise<string> {
   try {
     const bucket = this.firebase.storage.bucket();
@@ -90,12 +126,10 @@ private async signedUrl(path: string): Promise<string> {
 
     return url;
   } catch (error) {
-    console.error(
-      `❌ Error generando signed URL para ${path}:`,
-      error,
-    );
-
-    throw error;
+    this.logger.error(`Error generando signed URL para ${path}: ${(error as Error).message}`);
+    // Fallback: emulador/CI sin credenciales con capacidad de firmar → el panel recibe el path.
+    // En prod, si esto aparece en los logs, el problema es la service account configurada.
+    return path;
   }
 }
 

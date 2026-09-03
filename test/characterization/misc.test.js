@@ -79,10 +79,17 @@ describe('Caracterización — cierre de cobertura Fase 0.5', () => {
   });
 
   describe('POST /vehicles (modo actualización con id)', () => {
-    test('id inexistente → 404', async () => {
-      const res = await api().post('/vehicles').send({ id: 'no-existe', userId: UID, type: 'CAR' });
-      expect(res.status).toBe(404);
-      expect(res.body).toEqual({ success: false, message: 'Vehículo no encontrado' });
+    // CAMBIO DELIBERADO (2026-09-03): el monolito respondía 404, pero la app genera el id
+    // (UUID) ANTES de guardar → ese 404 rompía el ALTA de vehículos en silencio (bug de las
+    // pruebas de campo). Un id desconocido ahora es un alta con id propio.
+    test('id inexistente → lo CREA con ese id', async () => {
+      const res = await api().post('/vehicles').send({ id: 'nuevo-con-id', userId: UID, type: 'CAR', name: 'AutoNuevo' });
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+      expect(res.body.message).toBe('Vehículo creado');
+
+      const list = await api().get(`/vehicles/${UID}`);
+      expect(list.body.vehicles.map((v) => v.id)).toContain('nuevo-con-id');
     });
 
     // Body.userId = uid propio (pasa authz), pero el vehículo es de OTRO → check interno del handler.

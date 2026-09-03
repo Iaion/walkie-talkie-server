@@ -64,6 +64,13 @@ async function getAdminIdToken() {
   return refreshIdToken(refreshToken);
 }
 
+/** Como getAdminIdToken pero con el rol mayor (gestión de admins). Devuelve también el uid. */
+async function getSuperadminIdToken() {
+  const { refreshToken, localId } = await signUp();
+  await firebaseAdmin().auth().setCustomUserClaims(localId, { role: 'superadmin' });
+  return { token: await refreshIdToken(refreshToken), uid: localId };
+}
+
 /**
  * Mintea un ID token con un uid ESPECÍFICO (para tests de autorización por-usuario en sockets:
  * el evento manda userId='U1' y el socket debe conectarse con un token cuyo uid sea 'U1').
@@ -79,4 +86,4 @@ async function getIdTokenForUid(uid, claims) {
   return (await res.json()).idToken;
 }
 
-module.exports = { getIdToken, getIdTokenWithUid, getIdTokenForUid, getAdminIdToken };
+module.exports = { getIdToken, getIdTokenWithUid, getIdTokenForUid, getAdminIdToken, getSuperadminIdToken };

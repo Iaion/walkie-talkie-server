@@ -20,8 +20,10 @@ export class RolesGuard implements CanActivate {
 
     const req = context.switchToHttp().getRequest();
     const role = req.user?.role;
-    if (!required.includes(role)) {
-      throw new ForbiddenException({ success: false, message: 'Acceso denegado: requiere rol admin' });
+    // Jerarquía: superadmin pasa cualquier requisito de rol. Un rol menor NO pasa uno mayor
+    // (una ruta @Roles('superadmin') rechaza a un admin común).
+    if (!required.includes(role) && role !== 'superadmin') {
+      throw new ForbiddenException({ success: false, message: `Acceso denegado: requiere rol ${required.join(' o ')}` });
     }
     return true;
   }
