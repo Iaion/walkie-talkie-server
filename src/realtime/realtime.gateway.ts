@@ -28,6 +28,8 @@ import { SocketThrottle, RATE_LIMITED_ACK } from '../common/socket-throttle';
 import { isValidLat, isValidLng, isBoundedString, MAX_TEXT_MESSAGE } from '../common/validate';
 import { StorageService } from '../common/storage.service';
 import { AuditService } from '../common/audit.service';
+import { UseInterceptors } from '@nestjs/common';
+import { LoggingInterceptor } from '../common/logging.interceptor';
 
 @WebSocketGateway({
   cors: { origin: corsOrigins(), methods: ['GET', 'POST'] },
@@ -35,6 +37,9 @@ import { AuditService } from '../common/audit.service';
   allowEIO3: true,
 })
 @Injectable()
+// El interceptor global (APP_INTERCEPTOR) NO alcanza a los gateways: acá va explícito
+// para que cada evento de socket quede logueado (auditoría de punta a punta).
+@UseInterceptors(LoggingInterceptor)
 export class RealtimeGateway implements OnGatewayInit, OnGatewayDisconnect, OnModuleDestroy, OnApplicationBootstrap {
   @WebSocketServer() server: Server;
 
@@ -975,6 +980,11 @@ async emergencyAlert(
     // ============================================================
 
     let socketNotifications = 0;
+    // Contadores de diagnóstico: si sockets=0, estos dicen POR QUÉ (¿no había nadie
+    // conectado? ¿sockets sin identidad —no emitieron user-connected—? ¿no aprobados?).
+    let wsSinIdentidad = 0;
+    let wsNoAprobados = 0;
+    const totalSockets = this.server.sockets.sockets.size;
 
     const notifiedUsers =
       new Set<string>();
@@ -992,6 +1002,7 @@ async emergencyAlert(
         (s as any).userId;
 
       if (!targetUserId) {
+        wsSinIdentidad++;
         continue;
       }
 
@@ -1005,7 +1016,8 @@ async emergencyAlert(
       if (
         !approvedUserIds.has(targetUserId)
       ) {
-        console.log(
+        wsNoAprobados++;
+        this.logger.warn(
           `⛔ emergency_alert bloqueado para usuario no aprobado: ${targetUserId}`
         );
 
@@ -1104,7 +1116,18 @@ async emergencyAlert(
     // ✅ RESPUESTA
     // ============================================================
 
-    void this.audit.record({ actorUid: userId, action: 'emergency_alert', details: { roomId: emergencyRoomId, sockets: socketNotifications, push: pushNotifications } });
+    void this.audit.record({
+      actorUid: userId,
+      action: 'emergency_alert',
+      details: {
+        roomId: emergencyRoomId,
+        sockets: socketNotifications,
+        push: pushNotifications,
+        conectados: totalSockets,
+        sinIdentidad: wsSinIdentidad,
+        noAprobados: wsNoAprobados,
+      },
+    });
 
     return {
       success: true,
