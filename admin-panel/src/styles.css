@@ -245,3 +245,8 @@ nav .nav-link.active { background: var(--surface2); color: var(--text); border-c
   font-weight: 600;
 }
 .list li .ghost-danger:hover { background: var(--accent-soft); }
+
+/* === Login con Google === */
+.google-btn { width: 100%; background: var(--surface2); border: 1px solid var(--border); color: var(--text); font-weight: 700; }
+.google-btn:hover { border-color: var(--border-focus); }
+.login-divider { color: var(--muted2); font-size: 0.78rem; text-align: center; margin: 0.9rem 0 0.4rem; text-transform: uppercase; letter-spacing: 0.06em; }
