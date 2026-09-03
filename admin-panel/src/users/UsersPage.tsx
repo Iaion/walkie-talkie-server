@@ -19,8 +19,16 @@ const STATE_LABELS: Record<string, { label: string; cls: string }> = {
   suspended: { label: 'Suspendido', cls: 'bad' },
 };
 
-const stateBadge = (state: string | null) =>
-  STATE_LABELS[state || ''] || { label: 'Sin verificar', cls: 'off' };
+/** El estado es la verificación de REPARTIDOR. El staff del panel (admin/superadmin) que no
+ *  pasó por ese circuito no está "sin verificar": no le aplica. */
+const stateBadge = (u: { state: string | null; role: string | null }) => {
+  if (!u.state && u.role) return { label: 'No aplica', cls: 'off' };
+  return STATE_LABELS[u.state || ''] || { label: 'Sin verificar', cls: 'off' };
+};
+
+/** Estado efectivo para filtrar: el staff sin verificación no cuenta como "sin verificar". */
+const effectiveState = (u: { state: string | null; role: string | null }) =>
+  u.state || (u.role ? 'staff' : 'pending_verification');
 
 const fmtDate = (iso: string | null) => {
   if (!iso) return '—';
@@ -56,19 +64,14 @@ export function UsersPage() {
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
     return users.filter((u) => {
-      if (state !== 'all') {
-        const s = u.state || 'pending_verification';
-        if (s !== state) return false;
-      }
+      if (state !== 'all' && effectiveState(u) !== state) return false;
       if (!q) return true;
       return `${u.name || ''} ${u.email || ''}`.toLowerCase().includes(q);
     });
   }, [users, query, state]);
 
   const countFor = (value: string) =>
-    value === 'all'
-      ? users.length
-      : users.filter((u) => (u.state || 'pending_verification') === value).length;
+    value === 'all' ? users.length : users.filter((u) => effectiveState(u) === value).length;
 
   return (
     <div className="page">
@@ -133,7 +136,7 @@ export function UsersPage() {
             </thead>
             <tbody>
               {filtered.map((u) => {
-                const b = stateBadge(u.state);
+                const b = stateBadge(u);
                 return (
                   <tr key={u.uid}>
                     <td>
@@ -146,11 +149,9 @@ export function UsersPage() {
                       <span className={`pill ${b.cls}`}>{b.label}</span>
                     </td>
                     <td>
-                      {u.role ? (
-                        <span className={`pill ${u.role === 'superadmin' ? 'warn' : 'off'}`}>{u.role}</span>
-                      ) : (
-                        <span className="cell-sub">—</span>
-                      )}
+                      <span className={`pill ${u.role === 'superadmin' ? 'warn' : 'off'}`}>
+                        {u.role || 'usuario'}
+                      </span>
                     </td>
                     <td className="cell-sub">{fmtDate(u.createdAt)}</td>
                     <td className="cell-sub">{fmtDate(u.lastLoginAt)}</td>
