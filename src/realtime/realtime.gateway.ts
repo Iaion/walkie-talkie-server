@@ -1080,6 +1080,8 @@ async emergencyAlert(
       '🚨 EMERGENCIA',
       `${userName} necesita ayuda`,
       {
+        // 🔥 Necesario para que Android reconozca
+        // que el FCM corresponde a una emergencia
         type: 'emergency',
 
         emergency_user_id:
@@ -1099,28 +1101,12 @@ async emergencyAlert(
 
         emergency_room_id:
           emergencyRoomId,
-
-        vehicle_marca:
-          vehicleData?.brand || '',
-
-        vehicle_modelo:
-          vehicleData?.model || '',
-
-        vehicle_patente:
-          vehicleData?.licensePlate || '',
-
-        vehicle_color:
-          vehicleData?.color || '',
-
-        vehicle_foto:
-          vehicleData?.photoUri || '',
       }
     );
 
 if (ok) {
   pushNotifications++;
-}
-      }
+}}
 
     } catch (e) {
       this.bestEffort(
