@@ -55,7 +55,9 @@ async function startServer(extraEnv = {}, opts = {}) {
   child.stdout.on('data', (d) => { logs += d.toString(); });
   child.stderr.on('data', (d) => { logs += d.toString(); });
 
-  const deadline = Date.now() + 15000;
+  // 40s: con la máquina fría, el boot (NestJS + firebase-admin contra emuladores) puede
+  // superar los 15s originales — era el flake recurrente de socket/misc/restart.test.
+  const deadline = Date.now() + 40000;
   while (Date.now() < deadline) {
     try {
       const res = await fetch(`http://127.0.0.1:${PORT}/health`);

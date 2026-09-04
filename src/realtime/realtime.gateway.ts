@@ -1074,10 +1074,6 @@ async emergencyAlert(
         }
         
         
-        console.log('🚗 DEBUG VEHÍCULO EMERGENCIA:', {
-  userId,
-  vehicleData,
-});
 
 const ok =
   await this.notifications
