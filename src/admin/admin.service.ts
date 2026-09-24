@@ -101,6 +101,8 @@ export class AdminService {
           role: (u.customClaims?.role as string) || null,
           createdAt: u.metadata.creationTime || null,
           lastLoginAt: u.metadata.lastSignInTime || null,
+          appVersion: doc.appVersion || null,
+          appDevice: doc.appDevice || null,
         });
         docs.delete(u.uid);
       }

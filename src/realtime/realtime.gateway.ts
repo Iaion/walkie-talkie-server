@@ -1632,7 +1632,7 @@ async helpReject(
   @SubscribeMessage('register_fcm_token')
   async registerFcmToken(@ConnectedSocket() socket: Socket, @MessageBody() data: Record<string, any> = {}) {
     try {
-      const { userId, fcmToken, deviceId, platform, deviceModel } = data;
+      const { userId, fcmToken, deviceId, platform, deviceModel, appVersion } = data;
       if (!userId || !fcmToken) return { success: false, message: 'userId y fcmToken requeridos' };
       if (this.notSelf(socket, userId)) return this.FORBIDDEN_ACK;
 
@@ -1640,9 +1640,15 @@ async helpReject(
         ? deviceId.trim()
         : `device_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
 
+      // Versión de la app y modelo del teléfono: la app ya los mandaba, el server los tiraba.
+      // Sin esto era imposible saber quién corre un APK viejo (bug de campo del 24/9: los
+      // datos del vehículo "no llegaban" en teléfonos con el parser anterior al 3/9).
+      const safeVersion = typeof appVersion === 'string' && appVersion.trim() ? appVersion.trim() : null;
+      const safeModel = typeof deviceModel === 'string' && deviceModel.trim() ? deviceModel.trim() : null;
+
       const userRef = this.firebase.firestore.collection('users').doc(userId);
       await userRef.collection('fcmTokens').doc(uniqueDeviceId).set({
-        token: String(fcmToken), platform: platform || 'android', deviceModel: deviceModel || null, socketId: socket.id,
+        token: String(fcmToken), platform: platform || 'android', deviceModel: safeModel, appVersion: safeVersion, socketId: socket.id,
         enabled: true,
         lastActiveAt: admin.firestore.FieldValue.serverTimestamp(),
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -1651,6 +1657,8 @@ async helpReject(
       await userRef.set({
         socketIds: admin.firestore.FieldValue.arrayUnion(socket.id),
         lastTokenRefreshAt: admin.firestore.FieldValue.serverTimestamp(),
+        ...(safeVersion && { appVersion: safeVersion, appVersionAt: Date.now() }),
+        ...(safeModel && { appDevice: safeModel }),
       }, { merge: true });
 
       return { success: true, message: 'Token registrado', deviceId: uniqueDeviceId };

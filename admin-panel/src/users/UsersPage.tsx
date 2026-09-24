@@ -130,6 +130,7 @@ export function UsersPage() {
                 <th>Usuario</th>
                 <th>Estado</th>
                 <th>Rol</th>
+                <th>App</th>
                 <th>Registro</th>
                 <th>Último ingreso</th>
               </tr>
@@ -150,6 +151,16 @@ export function UsersPage() {
                     </td>
                     <td>
                       <span className={`pill role-${u.role || 'user'}`}>{u.role || 'usuario'}</span>
+                    </td>
+                    <td>
+                      {u.appVersion ? (
+                        <div className="cell-user">
+                          <strong>{u.appVersion}</strong>
+                          <span className="cell-sub">{u.appDevice || '—'}</span>
+                        </div>
+                      ) : (
+                        <span className="cell-sub">—</span>
+                      )}
                     </td>
                     <td className="cell-sub">{fmtDate(u.createdAt)}</td>
                     <td className="cell-sub">{fmtDate(u.lastLoginAt)}</td>
