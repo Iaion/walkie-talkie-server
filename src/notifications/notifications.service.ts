@@ -69,11 +69,28 @@ export class NotificationsService {
         emergency_longitude: data.emergency_longitude ?? data.longitude ?? '',
         emergency_avatar_url: data.emergency_avatar_url ?? data.avatarUrl ?? '',
         emergency_room_id: data.emergency_room_id ?? data.roomId ?? '',
-        vehicle_foto: data.vehicle_foto ?? data.fotoVehiculoUri ?? '',
-        vehicle_marca: data.vehicle_marca ?? data.marca ?? '',
-        vehicle_modelo: data.vehicle_modelo ?? data.modelo ?? '',
-        vehicle_patente: data.vehicle_patente ?? data.patente ?? '',
-        vehicle_color: data.vehicle_color ?? data.color ?? '',
+       vehicle_type:
+  data.vehicle_type ?? data.vehicleType ?? data.typeVehiculo ?? '',
+
+vehicle_foto:
+  data.vehicle_foto ?? data.fotoVehiculoUri ?? '',
+
+vehicle_marca:
+  data.vehicle_marca ?? data.marca ?? '',
+
+vehicle_modelo:
+  data.vehicle_modelo ?? data.modelo ?? '',
+
+vehicle_patente:
+  data.vehicle_patente ?? data.patente ?? '',
+
+vehicle_frame_serial_number:
+  data.vehicle_frame_serial_number ??
+  data.frameSerialNumber ??
+  '',
+
+vehicle_color:
+  data.vehicle_color ?? data.color ?? '',
       };
       const safeData = Object.fromEntries(
         Object.entries(merged).map(([k, v]) => [k, v == null ? '' : String(v)]),

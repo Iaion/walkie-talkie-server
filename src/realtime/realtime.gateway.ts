@@ -1090,11 +1090,19 @@ const ok =
         emergency_avatar_url: avatarUrl || '',
         emergency_room_id: emergencyRoomId,
 
-        vehicle_marca: vehicleData?.brand ?? '',
-        vehicle_modelo: vehicleData?.model ?? '',
-        vehicle_patente: vehicleData?.licensePlate ?? '',
-        vehicle_color: vehicleData?.color ?? '',
-        vehicle_foto: vehicleData?.photoUri ?? '',
+        vehicle_type: vehicleData?.type ?? '',
+vehicle_marca: vehicleData?.brand ?? '',
+vehicle_modelo: vehicleData?.model ?? '',
+vehicle_patente:
+  vehicleData?.type === 'BICYCLE'
+    ? ''
+    : vehicleData?.licensePlate ?? '',
+vehicle_frame_serial_number:
+  vehicleData?.type === 'BICYCLE'
+    ? vehicleData?.frameSerialNumber ?? ''
+    : '',
+vehicle_color: vehicleData?.color ?? '',
+vehicle_foto: vehicleData?.photoUri ?? '',
       }
     );
 
