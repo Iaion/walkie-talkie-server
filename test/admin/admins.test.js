@@ -119,13 +119,13 @@ describe('Admins — gestión de administradores (superadmin)', () => {
     const { setDoc } = require('../setup/emulator');
     const email = uniqueEmail('vecino');
     const { localId } = await signUpWithEmail(email);
-    await setDoc('users', localId, { fullName: 'Vecino Test', state: 'approved' });
+    await setDoc('users', localId, { fullName: 'Vecino Test', state: 'approved', appVersion: '1.0-beta2', appDevice: 'moto g32' });
 
     const api = bearer(await getAdminIdToken());
     const res = await api('get', '/admin/users');
     expect(res.status).toBe(200);
     const row = res.body.users.find((u) => u.uid === localId);
-    expect(row).toMatchObject({ email, name: 'Vecino Test', state: 'approved', role: null });
+    expect(row).toMatchObject({ email, name: 'Vecino Test', state: 'approved', role: null, appVersion: '1.0-beta2', appDevice: 'moto g32' });
 
     const sinRol = bearer(await getIdToken());
     expect((await sinRol('get', '/admin/users')).status).toBe(403);

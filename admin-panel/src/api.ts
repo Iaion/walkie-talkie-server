@@ -111,6 +111,9 @@ export interface PanelUser {
   role: 'admin' | 'superadmin' | null;
   createdAt: string | null;
   lastLoginAt: string | null;
+  /** Versión del APK y modelo del teléfono (lo reporta la app al registrar notificaciones). */
+  appVersion?: string | null;
+  appDevice?: string | null;
 }
 
 export interface UsersListResponse {

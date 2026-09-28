@@ -13,7 +13,7 @@ vi.mock('../api', () => ({
 const mockedList = vi.mocked(adminApi.listUsers);
 
 const USERS = [
-  { uid: 'U1', email: 'ana@test.local', name: 'Ana García', state: 'approved', role: null, createdAt: '2026-08-01T10:00:00Z', lastLoginAt: '2026-09-01T10:00:00Z' },
+  { uid: 'U1', email: 'ana@test.local', name: 'Ana García', state: 'approved', role: null, createdAt: '2026-08-01T10:00:00Z', lastLoginAt: '2026-09-01T10:00:00Z', appVersion: '1.0-beta2', appDevice: 'moto g32' },
   { uid: 'U2', email: 'beto@test.local', name: 'Beto Díaz', state: 'pending_review', role: null, createdAt: null, lastLoginAt: null },
   { uid: 'U3', email: 'jose@test.local', name: 'Jose Giles', state: null, role: 'superadmin' as const, createdAt: null, lastLoginAt: null },
 ];
@@ -35,6 +35,9 @@ describe('UsersPage', () => {
     expect(screen.getByText('En revisión', { selector: '.pill' })).toBeInTheDocument();
     // El staff sin circuito de repartidor NO figura "Sin verificar": no le aplica
     expect(screen.getByText('No aplica')).toBeInTheDocument();
+    // Versión de la app y teléfono, para detectar APKs desactualizados
+    expect(screen.getByText('1.0-beta2')).toBeInTheDocument();
+    expect(screen.getByText('moto g32')).toBeInTheDocument();
     expect(screen.queryByText('Sin verificar', { selector: '.pill' })).toBeNull();
   });
 
