@@ -196,11 +196,10 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayDisconnect, OnMo
     if (!userId) return { success: false, message: '⚠️ userId vacío' };
     if (this.notSelf(socket, userId)) return this.FORBIDDEN_ACK;
 
-    const safeUsername =
-      (typeof user.username === 'string' && user.username.trim()) ||
-      (typeof user.fullName === 'string' && user.fullName.trim()) ||
-      (typeof user.email === 'string' && user.email.split('@')[0].trim()) ||
-      'Usuario';
+   const safeUsername =
+  (typeof user.username === 'string' && user.username.trim()) ||
+  (typeof user.email === 'string' && user.email.split('@')[0].trim()) ||
+  'Usuario';
 
     (socket as any).userId = userId;
     (socket as any).username = safeUsername;
