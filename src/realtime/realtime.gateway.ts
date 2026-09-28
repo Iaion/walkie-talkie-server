@@ -5,6 +5,7 @@
  * - Eventos migrados del monolito (se van agregando por grupos). Empezamos con user-connected.
  * El valor retornado por cada @SubscribeMessage se envía como ACK al cliente (emitWithAck).
  */
+
 import { Injectable, Logger, OnApplicationBootstrap, OnModuleDestroy } from '@nestjs/common';
 import {
   ConnectedSocket,
@@ -752,6 +753,11 @@ async emergencyAlert(
           year: v.year || null,
           color: v.color || null,
 
+          description:
+            v.description ||
+            v.descripcion ||
+            null,
+
           licensePlate:
             v.licensePlate ||
             v.patente ||
@@ -1091,17 +1097,25 @@ const ok =
         emergency_room_id: emergencyRoomId,
 
         vehicle_type: vehicleData?.type ?? '',
+
 vehicle_marca: vehicleData?.brand ?? '',
+
 vehicle_modelo: vehicleData?.model ?? '',
+
 vehicle_patente:
   vehicleData?.type === 'BICYCLE'
     ? ''
     : vehicleData?.licensePlate ?? '',
+
 vehicle_frame_serial_number:
   vehicleData?.type === 'BICYCLE'
     ? vehicleData?.frameSerialNumber ?? ''
     : '',
+
 vehicle_color: vehicleData?.color ?? '',
+
+vehicle_description: vehicleData?.description ?? '',
+
 vehicle_foto: vehicleData?.photoUri ?? '',
       }
     );

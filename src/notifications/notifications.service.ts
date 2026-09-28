@@ -4,6 +4,7 @@
  * Lee los tokens de la subcolección users/{uid}/fcmTokens (enabled), manda multicast,
  * y deshabilita tokens inválidos. Lo usan chat (send_message) y emergency_alert.
  */
+
 import { Injectable } from '@nestjs/common';
 import * as admin from 'firebase-admin';
 import { FirebaseService } from '../firebase/firebase.service';
@@ -91,6 +92,13 @@ vehicle_frame_serial_number:
 
 vehicle_color:
   data.vehicle_color ?? data.color ?? '',
+
+vehicle_description:
+  data.vehicle_description ??
+  data.vehicleDescription ??
+  data.description ??
+  data.descripcion ??
+  '',
       };
       const safeData = Object.fromEntries(
         Object.entries(merged).map(([k, v]) => [k, v == null ? '' : String(v)]),

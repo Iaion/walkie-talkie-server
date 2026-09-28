@@ -4,6 +4,7 @@
  * monolito (validaciones, códigos de estado, shape de respuesta, isPrimary automático en el
  * primero, soft-delete) — verificado por los tests de caracterización.
  */
+
 import {
   BadRequestException,
   ForbiddenException,
@@ -40,6 +41,7 @@ export class VehiclesService {
       color: v.color,
       licensePlate: v.licensePlate || v.patente,
       photoUri: v.photoUri || v.fotoVehiculoUri,
+      description: v.description || v.descripcion || '',
       isPrimary: v.isPrimary,
       isActive: v.isActive,
       userId: v.userId,
