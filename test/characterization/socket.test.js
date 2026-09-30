@@ -70,10 +70,16 @@ describe('Caracterización Socket.IO — eventos críticos del monolito', () => 
       expect(res).toMatchObject({ success: true, userId: 'U1', username: 'Juan' });
     });
 
-    test('username cae a fallbacks (fullName) si no viene username', async () => {
+    // CAMBIO DELIBERADO (Leandro, 2026-09-28): el nombre REAL (fullName) ya no se usa como
+    // alias. Antes, según qué mandara el cliente, en las salas aparecía a veces el nickname
+    // y a veces el nombre real. Fallbacks vigentes: username → prefijo del email → 'Usuario'.
+    test('username NO cae a fullName: usa el prefijo del email o "Usuario"', async () => {
       const s = await newSocket('U2');
-      const res = await s.emitWithAck('user-connected', { id: 'U2', fullName: 'Ana Pérez' });
-      expect(res).toMatchObject({ success: true, userId: 'U2', username: 'Ana Pérez' });
+      const conEmail = await s.emitWithAck('user-connected', { id: 'U2', fullName: 'Ana Pérez', email: 'anita@test.local' });
+      expect(conEmail).toMatchObject({ success: true, userId: 'U2', username: 'anita' });
+
+      const sinNada = await s.emitWithAck('user-connected', { id: 'U2', fullName: 'Ana Pérez' });
+      expect(sinNada).toMatchObject({ success: true, userId: 'U2', username: 'Usuario' });
     });
   });
 
