@@ -57,7 +57,12 @@ export class NotificationsService {
     try {
       const devices = await this.getActiveFcmTokens(userId);
       const tokens = devices.map((d) => d.token);
-      if (!tokens.length) return false;
+      if (!tokens.length) {
+        console.warn(
+          `⚠️ No hay tokens FCM activos para el usuario ${userId}`,
+        );
+        return false;
+      }
 
       const merged: Record<string, any> = {
         ...data,
@@ -104,11 +109,47 @@ vehicle_description:
         Object.entries(merged).map(([k, v]) => [k, v == null ? '' : String(v)]),
       );
 
+      console.log(`📲 Enviando FCM a usuario ${userId}`);
+      console.log(`📱 Dispositivos encontrados: ${devices.length}`);
+      console.log(`🔑 Tokens encontrados: ${tokens.length}`);
+      console.log(`📦 Tipo de mensaje: ${safeData.type}`);
+      console.log(`🆘 Emergency user: ${safeData.emergency_user_id}`);
+      console.log(`🚗 Vehicle type: ${safeData.vehicle_type}`);
+
       const res = await this.firebase.messaging.sendEachForMulticast({
         tokens,
-        android: { priority: 'high' },
+        android: {
+          priority: 'high',
+        },
         data: safeData,
-        apns: { headers: { 'apns-priority': '10' }, payload: { aps: { 'content-available': 1 } } },
+        apns: {
+          headers: {
+            'apns-priority': '10',
+          },
+          payload: {
+            aps: {
+              'content-available': 1,
+            },
+          },
+        },
+      });
+
+      console.log(
+        `📨 FCM resultado usuario ${userId}: success=${res.successCount}, failure=${res.failureCount}`,
+      );
+
+      res.responses.forEach((response, index) => {
+        if (response.success) {
+          console.log(
+            `✅ FCM enviado correctamente al dispositivo ${devices[index]?.deviceId}`,
+          );
+        } else {
+          console.error(
+            `❌ Error FCM dispositivo ${devices[index]?.deviceId}:`,
+            response.error?.code,
+            response.error?.message,
+          );
+        }
       });
 
       // Deshabilitar tokens inválidos
@@ -127,7 +168,12 @@ vehicle_description:
       if (invalidDeviceIds.length) await this.disableInvalidDevices(userId, invalidDeviceIds);
 
       return res.successCount > 0;
-    } catch {
+    } catch (error) {
+      console.error(
+        `❌ Error general enviando FCM al usuario ${userId}:`,
+        error,
+      );
+
       return false;
     }
   }
