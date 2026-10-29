@@ -54,6 +54,8 @@ export class NotificationsService {
   }
 
   async sendToUserDevices(userId: string, title: string, body: string, data: Record<string, any> = {}): Promise<boolean> {
+    // Firebase no ofrece emulador de FCM. Las pruebas locales nunca envían push a la nube.
+    if (process.env.FIREBASE_AUTH_EMULATOR_HOST) return false;
     try {
       const devices = await this.getActiveFcmTokens(userId);
       const tokens = devices.map((d) => d.token);
@@ -68,7 +70,7 @@ export class NotificationsService {
         ...data,
         title,
         body,
-        timestamp: Date.now(),
+        timestamp: data.timestamp ?? Date.now(),
         emergency_user_id: data.emergency_user_id ?? data.userId ?? '',
         emergency_user_name: data.emergency_user_name ?? data.userName ?? '',
         emergency_latitude: data.emergency_latitude ?? data.latitude ?? '',
@@ -120,6 +122,7 @@ vehicle_description:
         tokens,
         android: {
           priority: 'high',
+          ...(data.type === 'emergency' ? { ttl: 60_000 } : {}),
         },
         data: safeData,
         apns: {

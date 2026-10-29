@@ -42,7 +42,11 @@ describe('Caracterización Socket.IO — eventos críticos del monolito', () => 
     await clearFirestore();
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    // Una desconexión ya no resuelve emergencias: el teardown debe cerrarlas explícitamente.
+    for (const s of sockets) {
+      if (s.connected) await s.timeout(5000).emitWithAck('emergency_resolve', { userId: s.testUid });
+    }
     sockets.forEach((s) => s.close());
     sockets = [];
   });
@@ -50,6 +54,7 @@ describe('Caracterización Socket.IO — eventos críticos del monolito', () => 
   // uid: el id propio que el socket va a emitir (default 'U0' para los tests que fallan por datos faltantes).
   async function newSocket(uid = 'U0') {
     const s = await connect(uid);
+    s.testUid = uid;
     sockets.push(s);
     return s;
   }
@@ -84,6 +89,45 @@ describe('Caracterización Socket.IO — eventos críticos del monolito', () => 
   });
 
   describe('emergency_alert (botón de pánico)', () => {
+    test('A envia y finaliza, B envia y finaliza, A vuelve a enviar sin perder recepcion', async () => {
+      const a = await newSocket('CICLO_A');
+      const b = await newSocket('CICLO_B');
+      for (const [s, uid] of [[a, 'CICLO_A'], [b, 'CICLO_B']]) {
+        await setDoc('users', uid, { state: 'approved' });
+        await s.emitWithAck('user-connected', { id: uid, username: uid });
+      }
+      for (const [sender, receiver, uid] of [[a, b, 'CICLO_A'], [b, a, 'CICLO_B'], [a, b, 'CICLO_A'], [a, b, 'CICLO_A']]) {
+        const received = new Promise((resolve, reject) => {
+          const timer = setTimeout(() => reject(new Error('no llego alerta')), 4000);
+          receiver.once('emergency_alert', data => { clearTimeout(timer); resolve(data); });
+        });
+        const ack = await sender.emitWithAck('emergency_alert', { userId: uid, userName: uid, ...COORDS });
+        expect(ack.success).toBe(true);
+        expect(ack.pushScheduled).toBe(1); // también respalda al destinatario conectado
+        expect(await received).toMatchObject({ userId: uid, status: 'active' });
+        expect((await sender.emitWithAck('emergency_resolve', { userId: uid })).success).toBe(true);
+        const snapshot = await sender.timeout(3000).emitWithAck('sync_emergencies', {});
+        expect(snapshot.emergencies).toHaveLength(0);
+      }
+    });
+
+    test('la sincronizacion no entrega alertas ajenas a usuarios pendientes', async () => {
+      const a = await newSocket('SYNC_A');
+      await a.emitWithAck('emergency_alert', { userId: 'SYNC_A', userName: 'A', ...COORDS });
+      const pending = await newSocket('SYNC_PENDING');
+      const snapshot = await pending.timeout(3000).emitWithAck('sync_emergencies', {});
+      expect(snapshot.emergencies).toEqual([]);
+    });
+
+    test('resolver sin emergencia propia no libera el lock de otra persona', async () => {
+      const a = await newSocket('LOCK_A');
+      await a.emitWithAck('emergency_alert', { userId: 'LOCK_A', userName: 'A', ...COORDS });
+      const b = await newSocket('LOCK_B');
+      await b.emitWithAck('emergency_resolve', { userId: 'LOCK_B' });
+      const ack = await b.emitWithAck('emergency_alert', { userId: 'LOCK_B', userName: 'B', ...COORDS });
+      expect(ack.code).toBe('EMERGENCY_ALREADY_ACTIVE');
+    });
+
     test('sin userId/userName → INVALID_DATA', async () => {
       const s = await newSocket();
       const res = await s.emitWithAck('emergency_alert', { ...COORDS });

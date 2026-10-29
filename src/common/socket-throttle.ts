@@ -20,6 +20,7 @@ export class SocketThrottle {
   private readonly windows = new Map<string, { count: number; start: number }>();
   private readonly windowMs = envInt('SOCKET_RATE_WINDOW_MS', 10_000);
   private readonly limits: Record<string, number> = {
+    sync_emergencies: 20,
     emergency_alert: envInt('SOCKET_RATE_LIMIT_EMERGENCY_ALERT', 30),
     send_message: envInt('SOCKET_RATE_LIMIT_SEND_MESSAGE', 100),
     audio_message: envInt('SOCKET_RATE_LIMIT_AUDIO_MESSAGE', 50),

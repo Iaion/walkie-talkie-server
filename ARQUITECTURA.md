@@ -102,8 +102,9 @@ src/
 - Al **boot**, `RealtimeGateway.onApplicationBootstrap` REHIDRATA el StateStore desde ese espejo
   (alerts + helpers + sala de emergencia) ANTES de aceptar tráfico → un deploy/crash durante un
   robo ya no "desaparece" la emergencia. El lock global ya vivía en Firestore.
-- Durante el **shutdown ordenado** el gateway marca `shuttingDown` para que el disconnect masivo
-  de sockets NO se confunda con "el usuario se fue" (eso limpiaría las emergencias).
+- Perder la última conexión del usuario, cerrar Android o reiniciar el servidor no
+  resuelve su emergencia. `sync_emergencies` permite recuperarla tras reconectar;
+  `emergency_resolve` la cierra explícitamente. La presencia se actualiza por separado.
 - Harness de tests: `startServer()` limpia Firestore antes de bootear (la rehidratación
   contaminaría suites con restos de la anterior); el test de restart usa `clearData:false`.
 

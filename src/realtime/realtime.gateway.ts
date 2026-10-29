@@ -23,6 +23,9 @@ import { FirebaseService } from '../firebase/firebase.service';
 import { NotificationsService } from '../notifications/notifications.service';
 import { StateStore } from './state.store';
 import { EmergencyService } from './emergency.service';
+import { EmergencyRecoveryService } from './emergency-recovery.service';
+import { EmergencyPushService } from './emergency-push.service';
+// size-exception: gateway legacy; recuperación y envío nuevos se extraen a servicios separados.
 import { isDataUrl, isHttpUrl } from '../common/image-utils';
 import { corsOrigins } from '../common/cors';
 import { SocketThrottle, RATE_LIMITED_ACK } from '../common/socket-throttle';
@@ -83,6 +86,8 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayDisconnect, OnMo
     private readonly throttle: SocketThrottle,
     private readonly storage: StorageService,
     private readonly audit: AuditService,
+    private readonly recovery: EmergencyRecoveryService,
+    private readonly emergencyPush: EmergencyPushService,
   ) {}
 
   afterInit(server: Server): void {
@@ -186,6 +191,12 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayDisconnect, OnMo
       if (room.has(sid)) return true;
     }
     return false;
+  }
+
+  @SubscribeMessage('sync_emergencies')
+  async syncEmergencies(@ConnectedSocket() socket: Socket) {
+    if (!this.throttle.allow(socket.id, 'sync_emergencies')) return RATE_LIMITED_ACK;
+    return this.recovery.snapshot((socket as any).user.uid);
   }
 
   @SubscribeMessage('user-connected')
@@ -650,7 +661,6 @@ async emergencyAlert(
       userName,
       latitude,
       longitude,
-      timestamp,
       emergencyType = 'general'
     } = data;
 
@@ -681,6 +691,13 @@ async emergencyAlert(
     }
 
     emergencyRoomId = `emergencia_${userId}`;
+
+    // Reintentar tras perder un ACK nunca cancela ni reemplaza la emergencia en curso.
+    const existingAlert = this.state.emergencyAlerts.get(userId);
+    if (existingAlert) {
+      socket.join(emergencyRoomId);
+      return { success: true, emergencyRoomId, recovered: true, timestamp: existingAlert.timestamp };
+    }
 
     const lockResult = await this.emergency.acquireLock(
       userId,
@@ -799,10 +816,7 @@ async emergencyAlert(
       latitude,
       longitude,
 
-      timestamp:
-        typeof timestamp === 'number'
-          ? timestamp
-          : Date.now(),
+      timestamp: Date.now(), // misma identidad temporal en Socket, FCM y recuperación
 
       socketId: socket.id,
 
@@ -991,8 +1005,6 @@ async emergencyAlert(
     let wsNoAprobados = 0;
     const totalSockets = this.server.sockets.sockets.size;
 
-    const notifiedUsers =
-      new Set<string>();
 
     for (
       const [sid, s]
@@ -1042,95 +1054,17 @@ async emergencyAlert(
 
       socketNotifications++;
 
-      notifiedUsers.add(
-        targetUserId
-      );
     }
 
     // ============================================================
     // 📲 Push FCM
-    // SOLO usuarios aprobados que NO fueron notificados por socket
+    // Todos los aprobados: conexión Socket no equivale a recepción en el celular.
     // ============================================================
 
-    let pushNotifications = 0;
-
-    try {
-      for (
-        const doc
-        of approvedUsersSnap.docs
-      ) {
-        const targetUserId =
-          doc.id;
-
-        // No notificar al creador
-        if (
-          targetUserId === userId
-        ) {
-          continue;
-        }
-
-        // Ya recibió por socket
-        if (
-          notifiedUsers.has(
-            targetUserId
-          )
-        ) {
-          continue;
-        }
-        
-        
-
-const ok =
-  await this.notifications
-    .sendPushNotification(
-      targetUserId,
-      '🚨 EMERGENCIA',
-      `${userName} necesita ayuda`,
-      {
-        type: 'emergency',
-
-        emergency_user_id: userId,
-        emergency_user_name: userName,
-        emergency_latitude: latitude,
-        emergency_longitude: longitude,
-        emergency_avatar_url: avatarUrl || '',
-        emergency_room_id: emergencyRoomId,
-
-        vehicle_type: vehicleData?.type ?? '',
-
-vehicle_marca: vehicleData?.brand ?? '',
-
-vehicle_modelo: vehicleData?.model ?? '',
-
-vehicle_patente:
-  vehicleData?.type === 'BICYCLE'
-    ? ''
-    : vehicleData?.licensePlate ?? '',
-
-vehicle_frame_serial_number:
-  vehicleData?.type === 'BICYCLE'
-    ? vehicleData?.frameSerialNumber ?? ''
-    : '',
-
-vehicle_color: vehicleData?.color ?? '',
-
-vehicle_description: vehicleData?.description ?? '',
-
-vehicle_foto: vehicleData?.photoUri ?? '',
-      }
-    );
-
-if (ok) {
-  pushNotifications++;
-}}
-
-    } catch (e) {
-      this.bestEffort(
-        'persistencia',
-        e
-      );
-    }
-
+    const recipients = approvedUsersSnap.docs.map(doc => doc.id).filter(uid => uid !== userId);
+    void this.emergencyPush.deliver(emergencyData, recipients)
+      .catch(e => this.bestEffort('emergency.push', e));
+    const pushNotifications = 0; // el resultado real se registra en emergency_push_result
     // ============================================================
     // ✅ RESPUESTA
     // ============================================================
@@ -1142,6 +1076,7 @@ if (ok) {
         roomId: emergencyRoomId,
         sockets: socketNotifications,
         push: pushNotifications,
+        pushScheduled: recipients.length,
         conectados: totalSockets,
         sinIdentidad: wsSinIdentidad,
         noAprobados: wsNoAprobados,
@@ -1162,6 +1097,7 @@ if (ok) {
       socketNotifications,
 
       pushNotifications,
+      pushScheduled: recipients.length,
 
       emergencyRoomId,
 
@@ -1495,12 +1431,14 @@ async helpReject(
 
   @SubscribeMessage('emergency_resolve')
   async emergencyResolve(@ConnectedSocket() socket: Socket, @MessageBody() data: Record<string, any> = {}) {
+    let ownsResolution = false;
     try {
       const { userId, reason = 'resolved_by_user' } = data;
       if (!userId) return { success: false, message: 'userId requerido' };
       if (this.notSelf(socket, userId)) return this.FORBIDDEN_ACK;
       if (this.resolveInProgress.has(userId)) return { success: true, message: 'Resolución ya en progreso' };
       this.resolveInProgress.add(userId);
+      ownsResolution = true;
 
       const emergencyRoomId = this.state.emergencyUserRoom.get(userId) || `emergencia_${userId}`;
       const emergencyData = this.state.emergencyAlerts.get(userId);
@@ -1519,7 +1457,7 @@ async helpReject(
       }
 
       try {
-        await this.emergency.releaseLock({ userId, roomId: emergencyRoomId, reason, force: true });
+        await this.emergency.releaseLock({ userId, roomId: emergencyRoomId, reason });
       } catch (e) { this.bestEffort('persistencia', e); }
 
       void this.audit.record({ actorUid: userId, action: 'emergency_resolve', details: { roomId: emergencyRoomId, reason } });
@@ -1560,11 +1498,11 @@ async helpReject(
         ...u.userData, socketCount: u.sockets.size, currentRoom: u.userData.currentRoom || 'general',
       })));
 
-      setTimeout(() => this.resolveInProgress.delete(userId), 2000);
       return { success: true, message: 'Emergencia resuelta correctamente', emergencyRoomId, chatHistoryDeleted: true };
     } catch (e: any) {
-      if (data?.userId) setTimeout(() => this.resolveInProgress.delete(data.userId), 2000);
       return { success: false, message: e.message };
+    } finally {
+      if (ownsResolution) this.resolveInProgress.delete(data.userId);
     }
   }
 
@@ -1771,27 +1709,7 @@ async helpReject(
       isLastConnection = entry.sockets.size === 0;
     }
 
-    // Si tenía emergencia activa y es su última conexión: liberar lock + limpiar (seguridad/vida).
-    // EXCEPTO durante el shutdown: ahí el "disconnect" es del server, no del usuario — la
-    // emergencia debe sobrevivir al restart (rehidratación, Fase E).
-    if (!this.shuttingDown && isLastConnection && this.state.emergencyAlerts.has(userId)) {
-      const emergencyRoomId = this.state.emergencyUserRoom.get(userId) || `emergencia_${userId}`;
-      try {
-        await this.emergency.releaseLock({ userId, roomId: emergencyRoomId, reason: 'user_disconnected_last_socket', force: true });
-      } catch (e) { this.bestEffort('persistencia', e); }
-      this.state.chatRooms.delete(emergencyRoomId);
-      this.state.emergencyUserRoom.delete(userId);
-      this.state.emergencyAlerts.delete(userId);
-      this.state.emergencyHelpers.delete(userId);
-      // Espejo (E1): si la memoria la descarta, Firestore también — si no, la rehidratación
-      // del próximo boot resucitaría una emergencia que el server ya dio por terminada.
-      try {
-        await this.firebase.firestore.collection('emergencies').doc(userId).update({
-          status: 'resolved', isActive: false, endedAt: Date.now(), endReason: 'user_disconnected_last_socket',
-        });
-      } catch (e) { this.bestEffort('disconnect.emergencia.espejo', e); }
-    }
-
+    // Desconectarse NO resuelve una emergencia: se conserva hasta cancelación explícita.
     try {
       const updateData: Record<string, any> = {
         socketIds: admin.firestore.FieldValue.arrayRemove(socket.id),

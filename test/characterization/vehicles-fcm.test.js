@@ -17,6 +17,56 @@ const api = () => {
   return { get: (p) => auth(r.get(p)), post: (p) => auth(r.post(p)), delete: (p) => auth(r.delete(p)) };
 };
 
+describe('Entrega de emergencias por FCM (transporte simulado)', () => {
+  const { NotificationsService } = require('../../dist/notifications/notifications.service');
+  const { EmergencyPushService } = require('../../dist/realtime/emergency-push.service');
+
+  test('conserva la identidad de Socket y limita cuánto tiempo FCM puede retener la alerta', async () => {
+    const previousHost = process.env.FIREBASE_AUTH_EMULATOR_HOST;
+    delete process.env.FIREBASE_AUTH_EMULATOR_HOST;
+    try {
+      const sendEachForMulticast = jest.fn().mockResolvedValue({ successCount: 1, failureCount: 0, responses: [{ success: true }] });
+      const service = new NotificationsService({ messaging: { sendEachForMulticast } });
+      service.getActiveFcmTokens = jest.fn().mockResolvedValue([{ token: 'token-simulado' }]);
+      expect(await service.sendPushNotification('B', 'SOS', 'Ayuda', { type: 'emergency', timestamp: 12345 })).toBe(true);
+      expect(sendEachForMulticast).toHaveBeenCalledWith(expect.objectContaining({
+        android: { priority: 'high', ttl: 60000 },
+        data: expect.objectContaining({ type: 'emergency', timestamp: '12345' }),
+      }));
+    } finally {
+      if (previousHost === undefined) delete process.env.FIREBASE_AUTH_EMULATOR_HOST;
+      else process.env.FIREBASE_AUTH_EMULATOR_HOST = previousHost;
+    }
+  });
+
+  test('en emuladores no intenta enviar notificaciones a la nube', async () => {
+    const previousHost = process.env.FIREBASE_AUTH_EMULATOR_HOST;
+    process.env.FIREBASE_AUTH_EMULATOR_HOST = '127.0.0.1:9099';
+    try {
+      const service = new NotificationsService({});
+      service.getActiveFcmTokens = jest.fn();
+      expect(await service.sendPushNotification('B', 'SOS', 'Ayuda')).toBe(false);
+      expect(service.getActiveFcmTokens).not.toHaveBeenCalled();
+    } finally {
+      if (previousHost === undefined) delete process.env.FIREBASE_AUTH_EMULATOR_HOST;
+      else process.env.FIREBASE_AUTH_EMULATOR_HOST = previousHost;
+    }
+  });
+
+  test('un destinatario fallido no impide avisar al resto y no se audita como entregado', async () => {
+    const notifications = { sendPushNotification: jest.fn()
+      .mockRejectedValueOnce(new Error('FCM no disponible')).mockResolvedValueOnce(true) };
+    const audit = { record: jest.fn().mockResolvedValue(undefined) };
+    await new EmergencyPushService(notifications, audit).deliver(
+      { userId: 'A', userName: 'Ana', timestamp: 12345, roomId: 'emergencia_A' }, ['B', 'C'],
+    );
+    expect(notifications.sendPushNotification).toHaveBeenCalledTimes(2);
+    expect(audit.record).toHaveBeenCalledWith(expect.objectContaining({ details: {
+      roomId: 'emergencia_A', timestamp: 12345, recipients: 2, acceptedByFcm: 1,
+    } }));
+  });
+});
+
 describe('Caracterización REST escritura — vehículos + FCM', () => {
   beforeAll(async () => { await startServer(); const t = await getIdTokenWithUid(); TOKEN = t.token; UID = t.uid; });
   afterAll(stopServer);

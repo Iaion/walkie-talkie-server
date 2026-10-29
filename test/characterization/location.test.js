@@ -43,10 +43,17 @@ describe('Caracterización Socket.IO — ubicación en tiempo real', () => {
   beforeAll(async () => { await startServer(); });
   afterAll(stopServer);
   beforeEach(async () => { await clearFirestore(); });
-  afterEach(() => { sockets.forEach((s) => s.close()); sockets = []; });
+  afterEach(async () => {
+    for (const s of sockets) {
+      if (s.connected) await s.timeout(5000).emitWithAck('emergency_resolve', { userId: s.testUid });
+      s.close();
+    }
+    sockets = [];
+  });
 
   async function newSocket(uid = 'U0') {
     const s = await connect(uid);
+    s.testUid = uid;
     sockets.push(s);
     return s;
   }

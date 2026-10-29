@@ -187,6 +187,26 @@ describe('Caracterización — cierre de cobertura Fase 0.5', () => {
   });
 
   describe('disconnect', () => {
+    test('un cierre del telefono preserva emergencia y lock hasta resolver explicitamente', async () => {
+      const s = await newSocket();
+      await s.emitWithAck('user-connected', { id: UID, username: 'Juan' });
+      const created = await s.emitWithAck('emergency_alert', {
+        userId: UID, userName: 'Juan', latitude: -34.6, longitude: -58.4,
+      });
+      expect(created.success).toBe(true);
+      s.close();
+      await pollUntil(async () => (await getDoc('users', UID))?.isOnline === false);
+      const mirror = await getDoc('emergencies', UID);
+      expect(mirror.isActive).toBe(true);
+      expect((await getDoc('LOCKS', 'active_emergency')).active).toBe(true);
+      const reopened = await newSocket();
+      const snapshot = await reopened.timeout(3000).emitWithAck('sync_emergencies', {});
+      expect(snapshot.emergencies).toEqual(expect.arrayContaining([
+        expect.objectContaining({ userId: UID, status: 'active' }),
+      ]));
+      expect((await reopened.emitWithAck('emergency_resolve', { userId: UID })).success).toBe(true);
+    });
+
     test('al desconectar la última conexión, el usuario queda offline en Firestore', async () => {
       const s = await newSocket();
       await s.emitWithAck('user-connected', { id: UID, username: 'Juan' });

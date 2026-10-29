@@ -8,6 +8,8 @@ import { Module } from '@nestjs/common';
 import { StateStore } from './state.store';
 import { RealtimeGateway } from './realtime.gateway';
 import { EmergencyService } from './emergency.service';
+import { EmergencyRecoveryService } from './emergency-recovery.service';
+import { EmergencyPushService } from './emergency-push.service';
 import { UsersController } from './users.controller';
 import { RoomsController } from './rooms.controller';
 import { EmergenciesController } from './emergencies.controller';
@@ -17,7 +19,7 @@ import { SocketThrottle } from '../common/socket-throttle';
 @Module({
   imports: [NotificationsModule],
   controllers: [UsersController, RoomsController, EmergenciesController],
-  providers: [StateStore, RealtimeGateway, EmergencyService, SocketThrottle],
+  providers: [StateStore, RealtimeGateway, EmergencyService, EmergencyRecoveryService, EmergencyPushService, SocketThrottle],
   exports: [StateStore],
 })
 export class RealtimeModule {}
