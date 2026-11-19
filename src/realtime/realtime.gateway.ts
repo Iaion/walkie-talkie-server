@@ -625,8 +625,10 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayConnection, OnGa
 
       let usersToNotify: string[] = [];
       if (roomId === 'general') {
+        // Sala general: push solo a usuarios APROBADOS que no están conectados (antes iba a
+        // cualquier cuenta sin conexión, aprobada o no).
         const offline = await this.firebase.firestore.collection('users').where('isOnline', '==', false).get();
-        usersToNotify = offline.docs.map((d) => d.id);
+        usersToNotify = offline.docs.filter((d) => d.data()?.state === 'approved').map((d) => d.id);
       } else {
         usersToNotify = this.roomParticipants(roomId);
       }

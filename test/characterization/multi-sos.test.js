@@ -401,6 +401,33 @@ describe('Varias emergencias a la vez', () => {
     await conUno;
   });
 
+  test('GET /users/community lista a los aprobados, en línea primero, sin datos privados', async () => {
+    const conectado = await user('COMU_ON');
+    await setDoc('users', 'COMU_OFF', { state: 'approved', username: 'Offline', lastSeen: 1795000000000, email: 'privado@test.local' });
+    await setDoc('users', 'COMU_PEND', { state: 'pending_review', username: 'Pendiente' });
+    const get = async (uid) => fetch(`${URL}/users/community`, { headers: { Authorization: `Bearer ${await tokenFor(uid)}` } });
+
+    const res = await get('COMU_ON');
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    const mios = body.members.filter((m) => m.id.startsWith('COMU_'));
+    expect(mios.map((m) => m.id)).toEqual(['COMU_ON', 'COMU_OFF']);            // sin el pendiente, en línea primero
+    expect(mios[0]).toMatchObject({ id: 'COMU_ON', username: 'COMU_ON', online: true });
+    expect(mios[1]).toEqual({ id: 'COMU_OFF', username: 'Offline', avatarUrl: null, online: false, lastSeen: 1795000000000 });
+    expect(body.onlineCount).toBeGreaterThanOrEqual(1);
+    expect(JSON.stringify(body)).not.toContain('privado@test.local');
+
+    // Al desconectarse pasa a "desconectado" con su última vez.
+    conectado.close();
+    await sleep(400);
+    await setDoc('users', 'COMU_VE', { state: 'approved', username: 'Ve' });
+    const despues = (await (await get('COMU_VE')).json()).members.find((m) => m.id === 'COMU_ON');
+    expect(despues.online).toBe(false);
+    expect(despues.lastSeen).toBeGreaterThan(0);
+
+    expect((await get('COMU_PEND')).status).toBe(403);
+  });
+
   test('un usuario sin aprobar no puede entrar a la sala de una emergencia ajena', async () => {
     const victima = await user('PRIV_V');
     const curioso = await user('PRIV_X', { approved: false });
