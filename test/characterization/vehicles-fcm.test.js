@@ -5,7 +5,7 @@
  * "usuario no encontrado" devuelve 500 en cleanup/refresh por throw dentro de la transacción).
  */
 const request = require('supertest');
-const { clearFirestore, setDoc } = require('../setup/emulator');
+const { clearFirestore, setDoc, getDoc } = require('../setup/emulator');
 const { startServer, stopServer } = require('../setup/server');
 const { getIdTokenWithUid } = require('../setup/auth');
 
@@ -21,6 +21,8 @@ describe('Entrega de emergencias por FCM (transporte simulado)', () => {
   const { NotificationsService } = require('../../dist/notifications/notifications.service');
   const { EmergencyPushService } = require('../../dist/realtime/emergency-push.service');
 
+  // CAMBIO DELIBERADO (18-nov-2026): el vencimiento pasó de 60 s a 15 min. Con 60 s, un
+  // teléfono dormido o sin red durante ese minuto perdía la alerta para siempre.
   test('conserva la identidad de Socket y limita cuánto tiempo FCM puede retener la alerta', async () => {
     const previousHost = process.env.FIREBASE_AUTH_EMULATOR_HOST;
     delete process.env.FIREBASE_AUTH_EMULATOR_HOST;
@@ -30,7 +32,7 @@ describe('Entrega de emergencias por FCM (transporte simulado)', () => {
       service.getActiveFcmTokens = jest.fn().mockResolvedValue([{ token: 'token-simulado' }]);
       expect(await service.sendPushNotification('B', 'SOS', 'Ayuda', { type: 'emergency', timestamp: 12345 })).toBe(true);
       expect(sendEachForMulticast).toHaveBeenCalledWith(expect.objectContaining({
-        android: { priority: 'high', ttl: 60000 },
+        android: { priority: 'high', ttl: 15 * 60 * 1000 },
         data: expect.objectContaining({ type: 'emergency', timestamp: '12345' }),
       }));
     } finally {
@@ -61,8 +63,10 @@ describe('Entrega de emergencias por FCM (transporte simulado)', () => {
       { userId: 'A', userName: 'Ana', timestamp: 12345, roomId: 'emergencia_A' }, ['B', 'C'],
     );
     expect(notifications.sendPushNotification).toHaveBeenCalledTimes(2);
+    // El que no pudo ser avisado queda identificado en la auditoría.
     expect(audit.record).toHaveBeenCalledWith(expect.objectContaining({ details: {
-      roomId: 'emergencia_A', timestamp: 12345, recipients: 2, acceptedByFcm: 1,
+      roomId: 'emergencia_A', emergencyId: null, timestamp: 12345, recipients: 2, acceptedByFcm: 1,
+      unreachable: ['B'],
     } }));
   });
 });
@@ -186,6 +190,48 @@ describe('Caracterización REST escritura — vehículos + FCM', () => {
       expect(tokens.body.success).toBe(true);
       expect(tokens.body.tokens.fcmTokens).toContain('tok-1');
       expect(tokens.body.tokens.fcmToken).toBe('tok-1');
+    });
+
+    // El registro por HTTP tiene que dejar el token donde lo lee el envío de notificaciones
+    // (users/{uid}/fcmTokens/{deviceId}); antes solo escribía campos que el envío no mira.
+    test('POST /fcm/refresh-token registra el dispositivo y GET /fcm/status lo refleja', async () => {
+      await setDoc('users', UID, { uid: UID, username: 'Juan' });
+
+      const antes = await api().get('/fcm/status?deviceId=dev-9');
+      expect(antes.body).toEqual({ success: true, hasValidToken: false, deviceRegistered: false, validDevices: 0 });
+
+      const refresh = await api().post('/fcm/refresh-token').send({
+        userId: UID, newToken: 'tok-http-1', deviceId: 'dev-9', platform: 'android', deviceModel: 'Pixel', appVersion: '1.0-beta5',
+      });
+      expect(refresh.status).toBe(200);
+      expect(refresh.body).toMatchObject({ success: true, deviceId: 'dev-9' });
+
+      const tokenDoc = await getDoc(`users/${UID}/fcmTokens`, 'dev-9');
+      expect(tokenDoc).toMatchObject({ token: 'tok-http-1', enabled: true, appVersion: '1.0-beta5' });
+
+      const despues = await api().get('/fcm/status?deviceId=dev-9');
+      expect(despues.body).toEqual({ success: true, hasValidToken: true, deviceRegistered: true, validDevices: 1 });
+      const otroDispositivo = await api().get('/fcm/status?deviceId=otro');
+      expect(otroDispositivo.body).toMatchObject({ hasValidToken: true, deviceRegistered: false });
+    });
+
+    test('el token renovado reemplaza al anterior del mismo dispositivo y no deja duplicados activos', async () => {
+      await setDoc('users', UID, { uid: UID, username: 'Juan' });
+      await api().post('/fcm/refresh-token').send({ userId: UID, newToken: 'tok-viejo', deviceId: 'dev-a' });
+      // El mismo teléfono reinstaló la app: deviceId nuevo, y avisa cuál era su token anterior.
+      await api().post('/fcm/refresh-token').send({ userId: UID, newToken: 'tok-nuevo', oldToken: 'tok-viejo', deviceId: 'dev-b' });
+
+      expect((await getDoc(`users/${UID}/fcmTokens`, 'dev-a')).enabled).toBe(false);
+      expect((await getDoc(`users/${UID}/fcmTokens`, 'dev-b'))).toMatchObject({ token: 'tok-nuevo', enabled: true });
+      expect((await api().get('/fcm/status')).body.validDevices).toBe(1);
+    });
+
+    test('POST /fcm/unregister deja al dispositivo sin alertas (cierre de sesión)', async () => {
+      await setDoc('users', UID, { uid: UID, username: 'Juan' });
+      await api().post('/fcm/refresh-token').send({ userId: UID, newToken: 'tok-x', deviceId: 'dev-x' });
+      const res = await api().post('/fcm/unregister').send({ deviceId: 'dev-x' });
+      expect(res.body).toEqual({ success: true });
+      expect((await api().get('/fcm/status?deviceId=dev-x')).body).toMatchObject({ hasValidToken: false, deviceRegistered: false });
     });
 
     test('POST /fcm/cleanup-tokens sin array → 400', async () => {

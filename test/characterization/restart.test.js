@@ -68,7 +68,8 @@ describe('Emergencias sobreviven a un restart del server (Fase E)', () => {
     sockets = [];
     await startServer({}, { clearData: false });
 
-    // 4) La emergencia sigue activa (rehidratada)
+    // 4) La emergencia sigue activa (rehidratada). Las emergencias ajenas solo las ve un aprobado.
+    await setDoc('users', 'OBSERVADOR_R', { state: 'approved' });
     const token = await getIdTokenForUid('OBSERVADOR_R');
     const res = await fetch(`${URL}/emergencies/active`, { headers: { Authorization: `Bearer ${token}` } });
     expect(res.status).toBe(200);

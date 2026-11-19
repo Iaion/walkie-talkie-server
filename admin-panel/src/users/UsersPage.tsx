@@ -30,6 +30,16 @@ const stateBadge = (u: { state: string | null; role: string | null }) => {
 const effectiveState = (u: { state: string | null; role: string | null }) =>
   u.state || (u.role ? 'staff' : 'pending_verification');
 
+/** ¿Le llegan las alertas a este usuario? Solo importa para quien está aprobado. */
+const pushBadge = (u: PanelUser) => {
+  if (u.state !== 'approved') return null;
+  if (u.pushDevices === null || u.pushDevices === undefined) return { label: 'Sin dato', cls: 'off', title: 'No se pudo consultar' };
+  if (u.pushDevices === 0) {
+    return { label: 'No recibe', cls: 'bad', title: 'Sin notificaciones activas: tiene que abrir la app para volver a registrarse' };
+  }
+  return { label: 'Sí', cls: 'ok', title: `${u.pushDevices} dispositivo(s) con notificaciones activas` };
+};
+
 const fmtDate = (iso: string | null) => {
   if (!iso) return '—';
   const d = new Date(iso);
@@ -130,6 +140,7 @@ export function UsersPage() {
                 <th>Usuario</th>
                 <th>Estado</th>
                 <th>Rol</th>
+                <th>Recibe alertas</th>
                 <th>App</th>
                 <th>Registro</th>
                 <th>Último ingreso</th>
@@ -138,6 +149,7 @@ export function UsersPage() {
             <tbody>
               {filtered.map((u) => {
                 const b = stateBadge(u);
+                const push = pushBadge(u);
                 return (
                   <tr key={u.uid}>
                     <td>
@@ -151,6 +163,13 @@ export function UsersPage() {
                     </td>
                     <td>
                       <span className={`pill role-${u.role || 'user'}`}>{u.role || 'usuario'}</span>
+                    </td>
+                    <td>
+                      {push ? (
+                        <span className={`pill ${push.cls}`} title={push.title}>{push.label}</span>
+                      ) : (
+                        <span className="cell-sub">—</span>
+                      )}
                     </td>
                     <td>
                       {u.appVersion ? (

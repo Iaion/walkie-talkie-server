@@ -4,7 +4,7 @@
  * Mismo contrato que el monolito.
  */
 import { Controller, Get } from '@nestjs/common';
-import { StateStore } from './state.store';
+import { StateStore, publicUserData } from './state.store';
 
 @Controller('users')
 export class UsersController {
@@ -12,9 +12,8 @@ export class UsersController {
 
   @Get()
   list() {
-    return Array.from(this.state.connectedUsers.values()).map((u) => ({
-      ...u.userData,
-      socketCount: u.sockets.size,
-    }));
+    return Array.from(this.state.connectedUsers.values())
+      .filter((u) => u.sockets.size > 0)
+      .map((u) => ({ ...publicUserData(u.userData), socketCount: u.sockets.size }));
   }
 }

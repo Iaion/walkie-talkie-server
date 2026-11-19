@@ -114,6 +114,8 @@ export interface PanelUser {
   /** Versión del APK y modelo del teléfono (lo reporta la app al registrar notificaciones). */
   appVersion?: string | null;
   appDevice?: string | null;
+  /** Dispositivos con token de notificación válido. 0 = hoy no recibe alertas; null = no se pudo saber. */
+  pushDevices?: number | null;
 }
 
 export interface UsersListResponse {

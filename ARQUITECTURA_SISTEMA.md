@@ -57,9 +57,16 @@ lee/escribe la base directo).
 
 ### Botón de pánico (núcleo de vida)
 1. App (en sala): toca pánico → `emergency_alert` por socket.
-2. Backend: toma un **lock global** (una emergencia a la vez en esta versión), crea sala de
-   emergencia, hace broadcast a los demás conectados + push FCM a los offline.
-3. Otros: reciben la alerta, confirman ayuda (`help_confirm`), comparten ubicación en tiempo real.
+2. Backend: **un SOS activo por usuario, sin lock global** (desde 18-nov-2026 conviven todos
+   los que hagan falta; las operaciones sobre la emergencia de un mismo usuario corren en serie).
+   Crea la sala `emergencia_<uid>`, avisa por socket a todos los aprobados y además manda push
+   FCM a todos (tener socket no garantiza que el teléfono lo muestre). Si el mismo usuario
+   vuelve a apretar SOS (otro `requestId`), el pedido nuevo reemplaza al anterior.
+3. Otros: reciben la alerta, confirman ayuda (`help_confirm`) o dicen "No puedo" (`help_reject`,
+   reversible), y comparten ubicación en tiempo real. Se puede ayudar en varias a la vez.
+4. Todos los aprobados ven la lista de emergencias activas y las terminadas en la última hora
+   (`sync_emergencies` / `GET /emergencies/feed`). Contrato completo en
+   `alrescate-app/docs/socket-events.md`, sección "contrato vigente (v2)".
 
 ## 4. Mapa del backend (qué hace cada módulo, `src/`)
 
@@ -70,7 +77,8 @@ lee/escribe la base directo).
 | `common/` | `auth.guard` (verifica el ID token), `roles.guard`+`roles.decorator` (rol admin), `public.decorator`, `ownership` (autorización por-usuario), `image-utils`. |
 | `verification/` | Registro+verificación: máquina de estados, `normalize` (antifraude), cruces, submit, cambio de titular, foto privada. |
 | `admin/` | Review del admin: cola, aprobar/rechazar, fotos firmadas, grandfathering. Audit logs. |
-| `realtime/` | Gateway Socket.IO (20+ eventos): chat, ubicación, **núcleo de pánico**; `StateStore` (estado en memoria), `EmergencyService` (lock). |
+| `realtime/` | Gateway Socket.IO (20+ eventos): chat, ubicación, **núcleo de pánico**; `StateStore` (estado en memoria), `EmergencyService` (concurrencia por usuario, historial de la última hora, vencimiento, tope por minuto), `EmergencyRecoveryService` (feed de emergencias). |
+| `diagnostics/` | `POST /diagnostics/crash`: la app reporta su último cierre inesperado (colección `client_crashes`). |
 | `vehicles/` | CRUD de vehículos del repartidor. |
 | `fcm/` | Gestión de tokens de notificaciones push. |
 | `notifications/` | Envío de push FCM. |

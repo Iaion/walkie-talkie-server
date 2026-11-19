@@ -119,13 +119,14 @@ describe('Caracterización Socket.IO — eventos críticos del monolito', () => 
       expect(snapshot.emergencies).toEqual([]);
     });
 
-    test('resolver sin emergencia propia no libera el lock de otra persona', async () => {
+    test('resolver sin emergencia propia no toca la emergencia de otra persona', async () => {
       const a = await newSocket('LOCK_A');
       await a.emitWithAck('emergency_alert', { userId: 'LOCK_A', userName: 'A', ...COORDS });
       const b = await newSocket('LOCK_B');
-      await b.emitWithAck('emergency_resolve', { userId: 'LOCK_B' });
-      const ack = await b.emitWithAck('emergency_alert', { userId: 'LOCK_B', userName: 'B', ...COORDS });
-      expect(ack.code).toBe('EMERGENCY_ALREADY_ACTIVE');
+      const resolve = await b.emitWithAck('emergency_resolve', { userId: 'LOCK_B' });
+      expect(resolve).toMatchObject({ success: true, wasActive: false });
+      const snapshot = await a.timeout(3000).emitWithAck('sync_emergencies', {});
+      expect(snapshot.emergencies).toEqual([expect.objectContaining({ userId: 'LOCK_A', status: 'active' })]);
     });
 
     test('sin userId/userName → INVALID_DATA', async () => {
@@ -146,14 +147,18 @@ describe('Caracterización Socket.IO — eventos críticos del monolito', () => 
       expect(res).toMatchObject({ success: true, emergencyRoomId: 'emergencia_U1' });
     });
 
-    test('segunda emergencia concurrente (otro usuario) → EMERGENCY_ALREADY_ACTIVE (lock global)', async () => {
+    // CAMBIO DELIBERADO (18-nov-2026): se eliminó el lock global. Antes la segunda emergencia
+    // recibía EMERGENCY_ALREADY_ACTIVE; ahora cada usuario tiene la suya y conviven.
+    test('segunda emergencia de OTRO usuario mientras hay una activa → también se acepta', async () => {
       const s1 = await newSocket('U1');
       const r1 = await s1.emitWithAck('emergency_alert', { userId: 'U1', userName: 'Juan', ...COORDS });
       expect(r1).toMatchObject({ success: true });
 
       const s2 = await newSocket('U2');
       const r2 = await s2.emitWithAck('emergency_alert', { userId: 'U2', userName: 'Ana', ...COORDS });
-      expect(r2).toMatchObject({ success: false, code: 'EMERGENCY_ALREADY_ACTIVE' });
+      expect(r2).toMatchObject({ success: true, emergencyRoomId: 'emergencia_U2' });
+      expect(r2.emergencyId).toBeTruthy();
+      expect(r2.emergencyId).not.toBe(r1.emergencyId);
     });
 
     test('tras resolver la emergencia, se puede levantar otra', async () => {
@@ -179,12 +184,24 @@ describe('Caracterización Socket.IO — eventos críticos del monolito', () => 
       expect(res).toEqual({ success: false, message: 'Datos incompletos' });
     });
 
-    test('help_confirm con datos → {success:true}', async () => {
+    // CAMBIO DELIBERADO (18-nov-2026): confirmar ayuda sobre una emergencia que no existe (o que
+    // se canceló un instante antes) ya no devuelve éxito: el ayudante tiene que enterarse.
+    test('help_confirm sin emergencia activa → EMERGENCY_NOT_ACTIVE', async () => {
       const s = await newSocket('H1');
       const res = await s.emitWithAck('help_confirm', {
         emergencyUserId: 'U1', helperId: 'H1', helperName: 'Pedro',
       });
-      expect(res).toEqual({ success: true });
+      expect(res).toMatchObject({ success: false, code: 'EMERGENCY_NOT_ACTIVE' });
+    });
+
+    test('help_confirm con emergencia activa → success y queda como ayudante', async () => {
+      const victim = await newSocket('U1');
+      await victim.emitWithAck('emergency_alert', { userId: 'U1', userName: 'Juan', ...COORDS });
+      const s = await newSocket('H1');
+      const res = await s.emitWithAck('help_confirm', {
+        emergencyUserId: 'U1', helperId: 'H1', helperName: 'Pedro',
+      });
+      expect(res).toMatchObject({ success: true, emergencyRoomId: 'emergencia_U1', helpersCount: 1 });
     });
 
     test('help_confirm de un usuario inexistente → USER_NOT_FOUND', async () => {

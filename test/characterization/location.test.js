@@ -5,7 +5,7 @@
  * en la sala de emergencia reciba las actualizaciones.
  */
 const { io } = require('socket.io-client');
-const { clearFirestore } = require('../setup/emulator');
+const { clearFirestore, setDoc } = require('../setup/emulator');
 const { startServer, stopServer } = require('../setup/server');
 const { getIdTokenForUid } = require('../setup/auth');
 
@@ -112,22 +112,39 @@ describe('Caracterización Socket.IO — ubicación en tiempo real', () => {
       expect(res).toEqual({ success: false, message: 'Solo para salas de emergencia' });
     });
 
-    test('válido → success', async () => {
+    // CAMBIO DELIBERADO (18-nov-2026): sin emergencia activa ya no devuelve éxito ni persiste
+    // ubicaciones huérfanas; el cliente tiene que dejar de rastrear.
+    test('sin emergencia activa → EMERGENCY_NOT_ACTIVE', async () => {
       const s = await newSocket('H1');
       const res = await s.emitWithAck('update_helper_location', { roomId: 'emergencia_U1', helperId: 'H1', ...LOC });
-      expect(res).toEqual({ success: true });
+      expect(res).toMatchObject({ success: false, code: 'EMERGENCY_NOT_ACTIVE' });
     });
 
-    test('broadcast: la víctima en la sala recibe helper_location_updated', async () => {
+    test('usuario sin aprobar no se suma como ayudante por mandar su ubicación', async () => {
+      const victim = await newSocket('U1');
+      await victim.emitWithAck('emergency_alert', { userId: 'U1', userName: 'Juan', latitude: LOC.lat, longitude: LOC.lng });
+      const helper = await newSocket('H1');
+      const res = await helper.emitWithAck('update_helper_location', { roomId: 'emergencia_U1', helperId: 'H1', ...LOC });
+      expect(res).toMatchObject({ success: false, code: 'USER_NOT_APPROVED' });
+    });
+
+    test('broadcast: la víctima recibe helper_location_updated UNA sola vez', async () => {
+      await setDoc('users', 'H1', { state: 'approved' });
       const victim = await newSocket('U1');
       await victim.emitWithAck('emergency_alert', { userId: 'U1', userName: 'Juan', latitude: LOC.lat, longitude: LOC.lng });
 
+      let count = 0;
+      victim.on('helper_location_updated', () => { count++; });
       const received = waitForEvent(victim, 'helper_location_updated');
       const helper = await newSocket('H1');
-      await helper.emitWithAck('update_helper_location', { roomId: 'emergencia_U1', helperId: 'H1', ...LOC });
+      const ack = await helper.emitWithAck('update_helper_location', { roomId: 'emergencia_U1', helperId: 'H1', ...LOC });
+      expect(ack).toEqual({ success: true });
 
       const payload = await received;
       expect(payload).toMatchObject({ roomId: 'emergencia_U1', helperId: 'H1', victimId: 'U1', type: 'helper' });
+      // La víctima está en la sala de la emergencia y en su sala personal: no debe duplicarse.
+      await new Promise((r) => setTimeout(r, 300));
+      expect(count).toBe(1);
     });
   });
 
@@ -138,12 +155,28 @@ describe('Caracterización Socket.IO — ubicación en tiempo real', () => {
       expect(res).toEqual({ success: false, message: 'Datos incompletos' });
     });
 
-    test('válido → success', async () => {
-      const s = await newSocket();
+    test('válido (ayudante aprobado que pide para sí) → success', async () => {
+      await setDoc('users', 'H1', { state: 'approved' });
+      const s = await newSocket('H1');
       const res = await s.emitWithAck('request_victim_location', {
         roomId: 'emergencia_U1', helperId: 'H1', emergencyUserId: 'U1',
       });
       expect(res).toEqual({ success: true });
+    });
+
+    // Capa NUEVA: la ubicación de una víctima no se le entrega a cualquiera.
+    test('pedirla a nombre de otro, o sin estar aprobado → No autorizado', async () => {
+      const ajeno = await newSocket('U7');
+      const spoof = await ajeno.emitWithAck('request_victim_location', {
+        roomId: 'emergencia_U1', helperId: 'H1', emergencyUserId: 'U1',
+      });
+      expect(spoof.success).toBe(false);
+      expect(spoof.message).toMatch(/No autorizado/);
+
+      const sinAprobar = await ajeno.emitWithAck('request_victim_location', {
+        roomId: 'emergencia_U1', helperId: 'U7', emergencyUserId: 'U1',
+      });
+      expect(sinAprobar.success).toBe(false);
     });
   });
 

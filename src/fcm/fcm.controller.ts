@@ -4,7 +4,7 @@
  * @HttpCode(200) en los POST para igualar el contrato del monolito (Nest da 201).
  * AUTORIZACIÓN POR-USUARIO (assertSelf): un usuario solo gestiona sus propios tokens.
  */
-import { Body, Controller, Get, HttpCode, Param, Post, Req } from '@nestjs/common';
+import { Body, Controller, Get, HttpCode, Param, Post, Query, Req } from '@nestjs/common';
 import { FcmService } from './fcm.service';
 import { assertSelf } from '../common/ownership';
 
@@ -30,5 +30,18 @@ export class FcmController {
   refresh(@Req() req: any, @Body() body: Record<string, any>) {
     if (body?.userId) assertSelf(req, body.userId);
     return this.service.refresh(body);
+  }
+
+  /** Estado de notificaciones del usuario autenticado (y del dispositivo, si manda deviceId). */
+  @Get('status')
+  status(@Req() req: any, @Query('deviceId') deviceId?: string) {
+    return this.service.status(req.user.uid, deviceId);
+  }
+
+  /** Cierre de sesión: este dispositivo deja de recibir alertas de esta cuenta. */
+  @Post('unregister')
+  @HttpCode(200)
+  unregister(@Req() req: any, @Body() body: Record<string, any>) {
+    return this.service.unregister(req.user.uid, String(body?.deviceId || '').trim());
   }
 }

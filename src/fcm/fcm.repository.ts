@@ -4,6 +4,7 @@
  * cleanup/refresh. Replica la lógica del monolito (throw "Usuario no encontrado" si no existe).
  */
 import { Injectable } from '@nestjs/common';
+import * as admin from 'firebase-admin';
 import { FirebaseService } from '../firebase/firebase.service';
 
 @Injectable()
@@ -85,5 +86,58 @@ export class FcmRepository {
         lastTokenRefresh: now,
       });
     });
+  }
+
+  private devicesRef(userId: string) {
+    return this.userRef(userId).collection('fcmTokens');
+  }
+
+  /**
+   * Registra el token en `users/{uid}/fcmTokens/{deviceId}`: el ÚNICO lugar que lee el envío
+   * de notificaciones. Antes el registro por HTTP escribía solo en campos del usuario que el
+   * envío no mira, así que un token renovado con la app cerrada no servía para nada.
+   */
+  async upsertDeviceToken(
+    userId: string,
+    d: { deviceId: string; token: string; oldToken?: string; platform?: string; deviceModel?: string | null; appVersion?: string | null },
+  ): Promise<void> {
+    const stamp = admin.firestore.FieldValue.serverTimestamp();
+    const batch = this.firebase.firestore.batch();
+    // El mismo token (o el que este reemplaza) no debe quedar activo bajo otro deviceId del usuario.
+    const existing = await this.devicesRef(userId).get();
+    existing.docs.forEach((doc) => {
+      const t = doc.data()?.token;
+      if (doc.id !== d.deviceId && (t === d.token || (d.oldToken && t === d.oldToken))) {
+        batch.set(doc.ref, { enabled: false, supersededAt: stamp, updatedAt: stamp }, { merge: true });
+      }
+    });
+    batch.set(this.devicesRef(userId).doc(d.deviceId), {
+      token: d.token, platform: d.platform || 'android',
+      deviceModel: d.deviceModel || null, appVersion: d.appVersion || null,
+      enabled: true, source: 'http',
+      lastActiveAt: stamp, updatedAt: stamp, createdAt: stamp,
+    }, { merge: true });
+    batch.set(this.userRef(userId), {
+      lastTokenRefreshAt: stamp,
+      ...(d.appVersion && { appVersion: d.appVersion, appVersionAt: Date.now() }),
+      ...(d.deviceModel && { appDevice: d.deviceModel }),
+    }, { merge: true });
+    await batch.commit();
+  }
+
+  /** Dispositivos con token habilitado (los que pueden recibir alertas). */
+  async activeDevices(userId: string): Promise<{ deviceId: string; token: string }[]> {
+    const snap = await this.devicesRef(userId).where('enabled', '==', true).get();
+    return snap.docs
+      .map((doc) => ({ deviceId: doc.id, token: String(doc.data()?.token || '').trim() }))
+      .filter((x) => x.token.length > 0);
+  }
+
+  /** Da de baja el token de un dispositivo (cierre de sesión). */
+  async disableDevice(userId: string, deviceId: string): Promise<void> {
+    const stamp = admin.firestore.FieldValue.serverTimestamp();
+    await this.devicesRef(userId).doc(deviceId).set(
+      { enabled: false, disabledAt: stamp, updatedAt: stamp, disabledReason: 'logout' }, { merge: true },
+    );
   }
 }

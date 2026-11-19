@@ -24,6 +24,17 @@ export interface ChatRoom {
   messageCount: number;
 }
 
+/**
+ * Datos de un usuario conectado que pueden ver los demás. El email y la ubicación son
+ * privados: antes viajaban a todos los sockets en `connected_users` y `room_users_updated`.
+ * (La ubicación de quien pide ayuda y de quien ayuda sigue yendo por sus eventos propios.)
+ */
+export function publicUserData(userData: Record<string, any>): Record<string, any> {
+  const out: Record<string, any> = { ...userData };
+  for (const k of ['email', 'lat', 'lng', 'lastKnownLocation', 'phone', 'phoneNumber', 'telefono', 'cel']) delete out[k];
+  return out;
+}
+
 @Injectable()
 export class StateStore implements OnModuleInit {
   readonly connectedUsers = new Map<string, ConnectedUser>();
@@ -31,6 +42,10 @@ export class StateStore implements OnModuleInit {
   readonly emergencyHelpers = new Map<string, Set<string>>();
   readonly chatRooms = new Map<string, ChatRoom>();
   readonly emergencyUserRoom = new Map<string, string>();
+  /** víctima → usuarios que respondieron "No puedo" (pueden arrepentirse y confirmar después). */
+  readonly emergencyDeclined = new Map<string, Set<string>>();
+  /** Emergencias terminadas hace menos de una hora (lista "últimos SOS" de la app). */
+  readonly recentEmergencies: any[] = [];
 
   onModuleInit(): void {
     const defaultRooms = [

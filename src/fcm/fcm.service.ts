@@ -10,6 +10,7 @@ import {
   InternalServerErrorException,
   NotFoundException,
 } from '@nestjs/common';
+import { createHash } from 'crypto';
 import { FcmRepository } from './fcm.repository';
 
 @Injectable()
@@ -44,15 +45,42 @@ export class FcmService {
   }
 
   async refresh(body: Record<string, any>) {
-    const { userId, oldToken, newToken, deviceId } = body;
+    const { userId, oldToken, newToken } = body;
     if (!userId || !newToken) {
       throw new BadRequestException({ success: false, message: 'userId y newToken son requeridos' });
     }
+    const token = String(newToken).trim();
+    // Sin deviceId (cliente viejo) se deriva uno estable del token para no duplicar documentos.
+    const deviceId = typeof body.deviceId === 'string' && body.deviceId.trim()
+      ? body.deviceId.trim().slice(0, 128)
+      : `tok_${createHash('sha1').update(token).digest('hex').slice(0, 20)}`;
+    const clean = (v: unknown) => (typeof v === 'string' && v.trim() ? v.trim().slice(0, 80) : null);
     try {
-      await this.repo.refreshToken(userId, { oldToken, newToken, deviceId });
-      return { success: true, message: 'Token actualizado correctamente', updatedAt: Date.now() };
+      await this.repo.refreshToken(userId, { oldToken, newToken: token, deviceId });
+      await this.repo.upsertDeviceToken(userId, {
+        deviceId, token, oldToken: typeof oldToken === 'string' ? oldToken : undefined,
+        platform: clean(body.platform) || 'android', deviceModel: clean(body.deviceModel), appVersion: clean(body.appVersion),
+      });
+      return { success: true, message: 'Token actualizado correctamente', updatedAt: Date.now(), deviceId };
     } catch (err: any) {
       throw new InternalServerErrorException({ success: false, message: err.message });
     }
+  }
+
+  /** ¿Este usuario (y este dispositivo) puede recibir alertas? La app lo consulta al abrir. */
+  async status(userId: string, deviceId?: string) {
+    const devices = await this.repo.activeDevices(userId);
+    return {
+      success: true,
+      hasValidToken: devices.length > 0,
+      deviceRegistered: !!deviceId && devices.some((d) => d.deviceId === deviceId),
+      validDevices: devices.length,
+    };
+  }
+
+  async unregister(userId: string, deviceId: string) {
+    if (!deviceId) throw new BadRequestException({ success: false, message: 'deviceId es requerido' });
+    await this.repo.disableDevice(userId, deviceId);
+    return { success: true };
   }
 }

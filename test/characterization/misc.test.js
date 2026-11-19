@@ -187,7 +187,7 @@ describe('Caracterización — cierre de cobertura Fase 0.5', () => {
   });
 
   describe('disconnect', () => {
-    test('un cierre del telefono preserva emergencia y lock hasta resolver explicitamente', async () => {
+    test('un cierre del telefono preserva la emergencia hasta resolver explicitamente', async () => {
       const s = await newSocket();
       await s.emitWithAck('user-connected', { id: UID, username: 'Juan' });
       const created = await s.emitWithAck('emergency_alert', {
@@ -198,7 +198,6 @@ describe('Caracterización — cierre de cobertura Fase 0.5', () => {
       await pollUntil(async () => (await getDoc('users', UID))?.isOnline === false);
       const mirror = await getDoc('emergencies', UID);
       expect(mirror.isActive).toBe(true);
-      expect((await getDoc('LOCKS', 'active_emergency')).active).toBe(true);
       const reopened = await newSocket();
       const snapshot = await reopened.timeout(3000).emitWithAck('sync_emergencies', {});
       expect(snapshot.emergencies).toEqual(expect.arrayContaining([

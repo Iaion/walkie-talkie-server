@@ -14,6 +14,7 @@ import { ThrottlerModule, ThrottlerGuard } from '@nestjs/throttler';
 import { FirebaseModule } from './firebase/firebase.module';
 import { AuditModule } from './common/audit.module';
 import { HealthController } from './health/health.controller';
+import { DiagnosticsController } from './diagnostics/diagnostics.controller';
 import { AuthGuard } from './common/auth.guard';
 import { VehiclesModule } from './vehicles/vehicles.module';
 import { FcmModule } from './fcm/fcm.module';
@@ -42,7 +43,7 @@ import { UsersModule } from './users/users.module';
     AdminModule,
     UsersModule,
   ],
-  controllers: [HealthController],
+  controllers: [HealthController, DiagnosticsController],
   providers: [
     { provide: APP_GUARD, useClass: AuthGuard },
     { provide: APP_GUARD, useClass: ThrottlerGuard },

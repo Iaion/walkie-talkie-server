@@ -109,6 +109,20 @@ export class AdminService {
       pageToken = page.pageToken;
     } while (pageToken);
 
+    // ¿Cuántos dispositivos de cada usuario pueden recibir alertas hoy? Un aprobado con 0 no se
+    // entera de un SOS salvo que tenga la app abierta: el panel lo tiene que mostrar.
+    for (let i = 0; i < users.length; i += 25) {
+      await Promise.all(users.slice(i, i + 25).map(async (u) => {
+        try {
+          const snap = await this.firebase.firestore
+            .collection('users').doc(String(u.uid)).collection('fcmTokens').where('enabled', '==', true).get();
+          u.pushDevices = snap.docs.filter((d) => String(d.data()?.token || '').trim().length > 0).length;
+        } catch {
+          u.pushDevices = null; // desconocido: no afirmar que no recibe
+        }
+      }));
+    }
+
     users.sort((a, b) => String(a.name || a.email || '').localeCompare(String(b.name || b.email || '')));
     return { success: true, users, total: users.length };
   }

@@ -14,6 +14,11 @@ interface Device {
   token: string;
 }
 
+/** Cuánto guarda FCM una alerta de emergencia para un teléfono dormido o sin red. */
+const EMERGENCY_PUSH_TTL_MS = Number(process.env.EMERGENCY_PUSH_TTL_MS) > 0
+  ? Number(process.env.EMERGENCY_PUSH_TTL_MS)
+  : 15 * 60 * 1000;
+
 @Injectable()
 export class NotificationsService {
   constructor(private readonly firebase: FirebaseService) {}
@@ -122,7 +127,10 @@ vehicle_description:
         tokens,
         android: {
           priority: 'high',
-          ...(data.type === 'emergency' ? { ttl: 60_000 } : {}),
+          // Antes vencía a los 60 s: si el teléfono estaba dormido o sin red ese minuto, FCM
+          // descartaba la alerta. Una emergencia sigue siendo útil varios minutos después.
+          // También vencen los avisos que solo sirven mientras la emergencia está fresca.
+          ...(['emergency', 'emergency_ended', 'help_confirmed'].includes(data.type) ? { ttl: EMERGENCY_PUSH_TTL_MS } : {}),
         },
         data: safeData,
         apns: {

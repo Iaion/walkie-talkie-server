@@ -101,7 +101,14 @@ src/
   se escriben al disparar la alerta, al confirmar/rechazar ayudantes y al resolver/desconectar.
 - Al **boot**, `RealtimeGateway.onApplicationBootstrap` REHIDRATA el StateStore desde ese espejo
   (alerts + helpers + sala de emergencia) ANTES de aceptar tráfico → un deploy/crash durante un
-  robo ya no "desaparece" la emergencia. El lock global ya vivía en Firestore.
+  robo ya no "desaparece" la emergencia. También se rehidratan los ayudantes con su nombre,
+  los "No puedo" y el `requestId` (un reintento tras el reinicio recupera, no duplica), y el
+  historial de la última hora desde `emergency_history`.
+- **No hay lock global** (se eliminó el 18-nov-2026): cada usuario tiene a lo sumo una emergencia
+  activa y conviven todas las necesarias. La exclusión es por usuario y en memoria
+  (`EmergencyService.runExclusive`), válida mientras el server sea single-instance; con más de
+  una instancia hay que moverla a un lock distribuido.
+- Una emergencia sin señales de la víctima por `EMERGENCY_IDLE_TTL_MS` (3 h) vence sola.
 - Perder la última conexión del usuario, cerrar Android o reiniciar el servidor no
   resuelve su emergencia. `sync_emergencies` permite recuperarla tras reconectar;
   `emergency_resolve` la cierra explícitamente. La presencia se actualiza por separado.

@@ -45,6 +45,9 @@ async function startServer(extraEnv = {}, opts = {}) {
     FIREBASE_AUTH_EMULATOR_HOST: '127.0.0.1:9099',
     FIREBASE_STORAGE_EMULATOR_HOST: '127.0.0.1:9199',
     PORT: String(PORT),
+    // Las suites reutilizan los mismos uids muchas veces por minuto: el tope por usuario de
+    // emergencias nuevas se prueba en su propia suite (sos-limits.test.js), no acá.
+    EMERGENCY_MAX_PER_MINUTE: '1000',
     ...extraEnv,
   };
 
